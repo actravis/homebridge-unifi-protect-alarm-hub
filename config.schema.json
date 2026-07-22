@@ -1,0 +1,134 @@
+{
+  "pluginAlias": "UnifiProtectAlarmHub",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "**Quick setup**\n1. In UniFi OS → **Settings → Control Plane → Integrations**, create an **API Key** and paste it below.\n2. Enter your console's address (the same one you use for the UniFi web app).\n3. *(Optional, for arm/disarm)* In **Protect → Alarm Manager**, create webhook-triggered alarms with an **Arm** or **Disarm** action, and paste each **Trigger ID** below.\n4. Save & restart. Your zones, hub and outputs are discovered automatically.",
+  "footerDisplay": "Outputs and the emergency input are read-only (UniFi does not yet allow controlling them via the API). See the [README](https://github.com/actravis/homebridge-unifi-protect-alarm-hub) for details.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "UniFi Protect Alarm Hub",
+        "description": "Name shown for this platform in Homebridge logs."
+      },
+      "host": {
+        "title": "UniFi Console Address",
+        "type": "string",
+        "required": true,
+        "placeholder": "192.168.1.1",
+        "format": "hostname",
+        "description": "IP or hostname of your UDM / Cloud Key / NVR — the same address you use for the UniFi web app."
+      },
+      "apiKey": {
+        "title": "API Key",
+        "type": "string",
+        "required": true,
+        "description": "Create it in UniFi OS → Settings → Control Plane → Integrations, then paste it here."
+      },
+      "securityName": {
+        "title": "Alarm tile name",
+        "type": "string",
+        "default": "Security System",
+        "description": "Name for the alarm accessory in HomeKit (e.g. \"Security System\" or \"Security\")."
+      },
+      "armAwayTriggerId": {
+        "title": "\"Away\" arm — webhook Trigger ID",
+        "type": "string",
+        "description": "In Alarm Manager create an alarm: Trigger = Webhook, Action = Arm → Away. Paste its Trigger ID here. Leave blank if you don't use Away.",
+        "pattern": "^$|^[0-9a-fA-F-]{8,}$"
+      },
+      "armNightTriggerId": {
+        "title": "\"Night\" arm — webhook Trigger ID",
+        "type": "string",
+        "description": "Same, but Action = Arm → Night. Leave blank if you don't use Night.",
+        "pattern": "^$|^[0-9a-fA-F-]{8,}$"
+      },
+      "disarmTriggerId": {
+        "title": "Disarm — webhook Trigger ID",
+        "type": "string",
+        "description": "Same, but Action = Disarm. Leave all three blank and the alarm tile shows status but can't be changed from HomeKit.",
+        "pattern": "^$|^[0-9a-fA-F-]{8,}$"
+      },
+      "glassBreakAs": {
+        "title": "Show glass-break sensors as",
+        "type": "string",
+        "default": "motion",
+        "oneOf": [
+          { "title": "Motion sensor (recommended)", "enum": ["motion"] },
+          { "title": "Contact sensor", "enum": ["contact"] }
+        ],
+        "description": "HomeKit has no native glass-break type."
+      },
+      "exposeOutputs": {
+        "title": "Expose alarm-hub outputs",
+        "type": "boolean",
+        "default": true,
+        "description": "Shows outputs (e.g. the Beeper) as read-only sensors. UniFi does not yet allow controlling them from HomeKit."
+      },
+      "exposeEmergencyInput": {
+        "title": "Expose emergency input",
+        "type": "boolean",
+        "default": true,
+        "description": "Shows the emergency terminal as a read-only sensor."
+      },
+      "sirenOutputChannels": {
+        "title": "Siren output channel(s)",
+        "type": "string",
+        "placeholder": "e.g. 1",
+        "description": "Which output channel(s) mean a real alarm, for the \"triggered\" state (comma-separated, 1-indexed to match UniFi). Leave blank to treat any active output as triggered.",
+        "pattern": "^\\s*$|^\\s*\\d+(\\s*,\\s*\\d+)*\\s*$"
+      },
+      "refreshInterval": {
+        "title": "Fallback refresh interval (seconds)",
+        "type": "integer",
+        "default": 10,
+        "minimum": 2,
+        "description": "How often to re-check state when realtime updates are quiet. Lower is snappier but hits the console harder."
+      },
+      "useRealtime": {
+        "title": "Use realtime updates",
+        "type": "boolean",
+        "default": true,
+        "description": "Recommended. Uses the console's push feed for ~1–2s updates, falling back to the interval above."
+      },
+      "trustSelfSignedCert": {
+        "title": "Trust console certificate",
+        "type": "boolean",
+        "default": true,
+        "description": "UniFi consoles use self-signed certificates. When on, the plugin trusts this specific console. Leave on unless you've installed your own valid certificate."
+      },
+      "certificateSha256": {
+        "title": "Pin certificate (SHA-256)",
+        "type": "string",
+        "description": "Optional, most secure. Paste the console's certificate SHA-256 fingerprint (hex, colons optional) to pin it. When set, only that exact certificate is accepted and the setting above is ignored.",
+        "pattern": "^$|^[0-9a-fA-F:]{47,95}$"
+      }
+    }
+  },
+  "layout": [
+    { "type": "fieldset", "title": "Connection", "expandable": false, "items": ["host", "apiKey"] },
+    {
+      "type": "fieldset",
+      "title": "Arm / Disarm (optional)",
+      "expandable": true,
+      "expanded": true,
+      "items": ["securityName", "armAwayTriggerId", "armNightTriggerId", "disarmTriggerId"]
+    },
+    {
+      "type": "fieldset",
+      "title": "Sensors",
+      "expandable": true,
+      "expanded": false,
+      "items": ["glassBreakAs", "exposeOutputs", "exposeEmergencyInput", "sirenOutputChannels"]
+    },
+    {
+      "type": "fieldset",
+      "title": "Advanced",
+      "expandable": true,
+      "expanded": false,
+      "items": ["refreshInterval", "useRealtime", "trustSelfSignedCert", "certificateSha256", "name"]
+    }
+  ]
+}

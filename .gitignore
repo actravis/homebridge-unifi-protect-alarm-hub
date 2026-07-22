@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+*.tgz
+
+# Spike — THROWAWAY. Its output contains device names, zone labels, and MACs
+# (effectively a map of the home) and must never be committed. Delete the whole
+# spike/ folder before publishing the plugin.
+spike/output/
+spike/**/*.log
+
+# Local Homebridge test instance (contains the API key + paired state)
+hb-test/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local orientation file (git-ignored globally too; never commit)
+CLAUDE.md
+
+# Local Claude Code settings (personal, not shared)
+.claude/settings.local.json

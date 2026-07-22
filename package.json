@@ -1,0 +1,60 @@
+{
+  "name": "homebridge-unifi-protect-alarm-hub",
+  "displayName": "UniFi Protect Alarm Hub",
+  "version": "0.1.0",
+  "description": "HomeKit arm/disarm and sensor status for the UniFi Protect Alarm Hub, via the official UniFi Integration API.",
+  "author": "Andrew Travis",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/actravis/homebridge-unifi-protect-alarm-hub.git"
+  },
+  "bugs": {
+    "url": "https://github.com/actravis/homebridge-unifi-protect-alarm-hub/issues"
+  },
+  "homepage": "https://github.com/actravis/homebridge-unifi-protect-alarm-hub#readme",
+  "engines": {
+    "node": ">=18.17.0",
+    "homebridge": ">=1.8.0 || >=2.0.0-beta.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "clean": "rm -rf dist",
+    "lint": "eslint src",
+    "test": "npm run build && node --test",
+    "prepublishOnly": "npm run clean && npm run lint && npm run build"
+  },
+  "files": [
+    "dist",
+    "config.schema.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "homebridge-plugin",
+    "unifi",
+    "unifi-protect",
+    "protect",
+    "alarm",
+    "alarm-hub",
+    "security-system",
+    "arm",
+    "disarm",
+    "contact-sensor",
+    "homekit"
+  ],
+  "dependencies": {
+    "undici": "^6.21.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^20.12.0",
+    "eslint": "^9.0.0",
+    "homebridge": "^1.8.0",
+    "typescript": "^5.4.0",
+    "typescript-eslint": "^8.0.0"
+  }
+}
