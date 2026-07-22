@@ -1,7 +1,7 @@
 {
   "name": "homebridge-unifi-protect-alarm-hub",
   "displayName": "UniFi Protect Alarm Hub",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "HomeKit arm/disarm and sensor status for the UniFi Protect Alarm Hub, via the official UniFi Integration API.",
   "author": "Andrew Travis",
   "license": "MIT",

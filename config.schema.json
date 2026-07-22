@@ -6,6 +6,7 @@
   "footerDisplay": "Outputs and the emergency input are read-only (UniFi does not yet allow controlling them via the API). See the [README](https://github.com/actravis/homebridge-unifi-protect-alarm-hub) for details.",
   "schema": {
     "type": "object",
+    "required": ["host", "apiKey"],
     "properties": {
       "name": {
         "title": "Name",
@@ -16,7 +17,6 @@
       "host": {
         "title": "UniFi Console Address",
         "type": "string",
-        "required": true,
         "placeholder": "192.168.1.1",
         "format": "hostname",
         "description": "IP or hostname of your UDM / Cloud Key / NVR — the same address you use for the UniFi web app."
@@ -24,7 +24,6 @@
       "apiKey": {
         "title": "API Key",
         "type": "string",
-        "required": true,
         "description": "Create it in UniFi OS → Settings → Control Plane → Integrations, then paste it here."
       },
       "securityName": {
