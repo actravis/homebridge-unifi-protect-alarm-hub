@@ -1,5 +1,8 @@
 # homebridge-unifi-protect-alarm-hub
 
+[![verified-by-homebridge](https://img.shields.io/badge/_-verified-blueviolet?color=%23491F59&style=flat&logoColor=%23FFFFFF&logo=homebridge)](https://github.com/homebridge/homebridge/wiki/Verified-Plugins)
+[![npm version](https://img.shields.io/npm/v/homebridge-unifi-protect-alarm-hub)](https://www.npmjs.com/package/homebridge-unifi-protect-alarm-hub)
+
 Expose your **UniFi Protect Alarm Hub** to Apple HomeKit — arm/disarm the security
 system and see the status of every contact, glass-break and motion zone, using the
 **official UniFi Protect Integration API** (API key + Alarm Manager webhooks).
