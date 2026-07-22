@@ -48,11 +48,14 @@ export class ProtectClient {
 
   private buildConnect(opts: ProtectClientOptions) {
     const pinned = opts.certificateSha256?.replace(/[^a-f0-9]/gi, '').toLowerCase();
-    // When pinning, skip CA validation (self-signed) and verify the fingerprint instead.
-    const base = buildConnector({ rejectUnauthorized: pinned ? false : opts.trustSelfSignedCert === false });
     if (!pinned) {
-      return base;
+      return buildConnector({ rejectUnauthorized: opts.trustSelfSignedCert === false });
     }
+    // Pinning: skip CA validation and verify the fingerprint ourselves on every handshake.
+    // maxCachedSessions:0 disables TLS session resumption — on a resumed session
+    // getPeerCertificate() returns an empty object, which would fail the fingerprint check
+    // on every reused connection (only the first, full handshake would pass).
+    const base = buildConnector({ rejectUnauthorized: false, maxCachedSessions: 0 });
     const connect: typeof base = (options, callback) =>
       base(options, (err, socket) => {
         if (err || !socket) {
