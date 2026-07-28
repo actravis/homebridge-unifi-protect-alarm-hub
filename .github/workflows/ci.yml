@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repo, so the token gets read-only access. Without
+# this, a compromised dependency running in a postinstall script would inherit a write token.
+permissions:
+  contents: read
+
+# Superseded runs on the same branch are pointless; cancel them rather than queue them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# `npm ci --omit=optional` throughout: the only optional dependency is ffmpeg-for-homebridge,
+# whose postinstall downloads a large platform binary. Nothing under test spawns ffmpeg, and
+# omitting it also exercises resolveFfmpegPath's fall back to a system ffmpeg.
+
+jobs:
+  test:
+    name: Test on Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor is package.json's `engines.node`; the rest are the LTS lines Homebridge
+        # users actually run on.
+        node: ['18.17', '20', '22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci --omit=optional
+
+      # `npm test` runs `tsc` first (the tests import from dist/), so this covers the build too.
+      - run: npm test
+
+  lint:
+    # Lint runs on one modern Node only: eslint 10 and typescript-eslint 8 both require a newer
+    # runtime than the plugin itself does, and the linter's opinion doesn't vary by Node version.
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci --omit=optional
+      - run: npm run lint
+
+  homebridge-v2:
+    # `engines.homebridge` claims support for the v2 beta while devDependencies pin v1.8, so
+    # nothing ever type-checks against v2's typings. Informational until v2 ships: a failure
+    # here means that compatibility claim needs revisiting, not that main is broken.
+    name: Type-check against Homebridge v2 beta
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci --omit=optional
+      - run: npm install --no-save --omit=optional homebridge@beta
+      - run: npx tsc --noEmit
+
+  audit:
+    # This plugin runs inside Homebridge with the console API key in reach, so a vulnerable
+    # transitive dependency is a real exposure rather than a formality. Production deps only —
+    # a dev-tool advisory should not block a release.
+    name: Audit production dependencies
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm audit --omit=dev --audit-level=high
