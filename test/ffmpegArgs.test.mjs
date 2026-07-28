@@ -33,6 +33,12 @@ const base = {
   mtu: 1378,
 };
 
+// ffmpeg reads stdin for keyboard control, and the delegate spawns it with stdin ignored (an
+// immediate EOF). Verified fine on the bundled build; this makes it explicit for other builds.
+test('buildVideoArgs: disables ffmpeg stdin handling', () => {
+  assert.match(buildVideoArgs({ ...base }).join(' '), /-nostdin/);
+});
+
 test('buildVideoArgs: common RTSPS input + SRTP output flags are present', () => {
   const a = buildVideoArgs({ ...base }).join(' ');
   assert.match(a, /-rtsp_transport tcp/);

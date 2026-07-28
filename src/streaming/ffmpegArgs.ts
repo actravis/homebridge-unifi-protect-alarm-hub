@@ -131,6 +131,11 @@ export function buildVideoArgs(o: VideoArgsOptions): string[] {
   const args = [
     // Drop the version/configuration banner — pure noise that dwarfs the useful diagnostics.
     '-hide_banner',
+    // The delegate spawns ffmpeg with stdin ignored, which hands it an immediate EOF. The
+    // bundled build tolerates that (verified against real hardware), but ffmpeg reads stdin for
+    // keyboard control by default and users may be on any system build, so say so explicitly
+    // rather than rely on every build behaving the same way.
+    '-nostdin',
     // Confine the input to RTSP(S) and its transports, so a bad URL can't reach other demuxers.
     '-protocol_whitelist', 'rtsp,rtsps,tls,tcp,udp,crypto',
     '-rtsp_transport', 'tcp',
