@@ -69,7 +69,7 @@ test('every property is reachable from the layout', () => {
 test('the published tarball carries everything Homebridge needs', () => {
   // `files` is an allow-list: anything missing here simply is not in the tarball, and the
   // failure only shows up for users who installed from npm.
-  for (const entry of ['dist', 'config.schema.json', 'README.md', 'LICENSE']) {
+  for (const entry of ['dist', 'config.schema.json', 'CHANGELOG.md', 'README.md', 'LICENSE']) {
     assert.ok(pkg.files.includes(entry), `package.json "files" is missing ${entry}`);
   }
   assert.equal(pkg.main, 'dist/index.js');

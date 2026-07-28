@@ -2,7 +2,7 @@
   "name": "homebridge-unifi-protect-integration",
   "displayName": "UniFi Protect (Integration API)",
   "version": "0.2.0",
-  "description": "HomeKit for UniFi Protect over the official Integration API \u2014 Alarm Hub arm/disarm and sensors today, cameras and more on the roadmap. Security-first: revocable API key, no reverse-engineering.",
+  "description": "HomeKit for UniFi Protect over the official Integration API — Alarm Hub arm/disarm and sensors today, cameras and more on the roadmap. Security-first: revocable API key, no reverse-engineering.",
   "author": "Andrew Travis",
   "license": "MIT",
   "type": "commonjs",
@@ -36,6 +36,7 @@
   "files": [
     "dist",
     "config.schema.json",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE"
   ],
