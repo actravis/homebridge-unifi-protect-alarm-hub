@@ -31,8 +31,12 @@ plugin. The two coexist fine.
 ## What works today
 
 - **Alarm Hub → HomeKit Security System** — Away / Night / Off, fully two-way.
-  - Correct state even when armed from a **fob, the app, or a keypad** (the active profile
-    is recognised from the hub's per-zone fingerprint).
+  - Recognises which profile is active when the system is armed from a **fob, the app, or a
+    keypad**. The Integration API never reports the active profile, so the plugin identifies it
+    by fingerprinting which zones the hub has made live. It learns that fingerprint the first
+    time you arm each mode *from HomeKit* — so arm Away once and Night once from the Home app,
+    and external arms are labelled correctly from then on. Until a mode has been learned, an
+    externally-armed system shows as **Away**.
   - Shows **triggered** when the alarm sounds (optionally restricted to specific siren
     output channel(s) so entry/exit chirps aren't mistaken for an alarm).
 - **Automatic zone discovery** — every enabled hub terminal appears as a Contact or Motion
