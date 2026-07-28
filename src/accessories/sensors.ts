@@ -1,8 +1,7 @@
 import type { PlatformAccessory, Service } from 'homebridge';
-import type { UnifiAlarmHubPlatform } from '../platform';
+import type { UnifiProtectPlatform } from '../platform';
 import type { AccessoryHandler, AlarmHub } from '../types';
-
-export type ZoneKind = 'contact' | 'motion';
+import type { ZoneKind } from '../zones';
 
 function online(hub: AlarmHub): boolean {
   return hub.state === 'CONNECTED';
@@ -19,7 +18,7 @@ export class ZoneAccessory implements AccessoryHandler {
   private lastName?: string;
 
   constructor(
-    private readonly platform: UnifiAlarmHubPlatform,
+    private readonly platform: UnifiProtectPlatform,
     accessory: PlatformAccessory,
     private readonly channel: string,
     private readonly kind: ZoneKind,
@@ -62,6 +61,12 @@ export class ZoneAccessory implements AccessoryHandler {
       hubTampered(hub) ? C.StatusTampered.TAMPERED : C.StatusTampered.NOT_TAMPERED,
     );
   }
+
+  markStale(): void {
+    const C = this.platform.Characteristic;
+    this.service.updateCharacteristic(C.StatusActive, false);
+    this.service.updateCharacteristic(C.StatusFault, C.StatusFault.GENERAL_FAULT);
+  }
 }
 
 type ReadonlySource = { kind: 'output'; channel: string } | { kind: 'emergency' };
@@ -72,7 +77,7 @@ export class ReadonlyContactAccessory implements AccessoryHandler {
   private lastName?: string;
 
   constructor(
-    private readonly platform: UnifiAlarmHubPlatform,
+    private readonly platform: UnifiProtectPlatform,
     accessory: PlatformAccessory,
     private readonly source: ReadonlySource,
     hubMac: string,
@@ -102,6 +107,10 @@ export class ReadonlyContactAccessory implements AccessoryHandler {
     );
     this.service.updateCharacteristic(C.StatusActive, online(hub));
   }
+
+  markStale(): void {
+    this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, false);
+  }
 }
 
 /** The alarm hub itself: enclosure tamper + backup-battery status + reachability. */
@@ -110,7 +119,7 @@ export class HubAccessory implements AccessoryHandler {
   private readonly battery: Service;
   private lastName?: string;
 
-  constructor(private readonly platform: UnifiAlarmHubPlatform, accessory: PlatformAccessory, hubMac: string) {
+  constructor(private readonly platform: UnifiProtectPlatform, accessory: PlatformAccessory, hubMac: string) {
     const { Service } = platform;
     platform.applyInfo(accessory, `${hubMac}-hub`);
     this.tamper = accessory.getService(Service.ContactSensor) ?? accessory.addService(Service.ContactSensor);
@@ -143,5 +152,9 @@ export class HubAccessory implements AccessoryHandler {
     );
     this.battery.updateCharacteristic(C.BatteryLevel, batteryOk ? 100 : 10);
     this.battery.updateCharacteristic(C.ChargingState, C.ChargingState.NOT_CHARGING);
+  }
+
+  markStale(): void {
+    this.tamper.updateCharacteristic(this.platform.Characteristic.StatusActive, false);
   }
 }

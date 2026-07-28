@@ -1,0 +1,521 @@
+// End-to-end coverage of platform.ts — the glue the pure modules can't reach: reconciling
+// accessories against a hub snapshot, camera discovery/pruning, routing realtime events to the
+// right handler, outage handling, and the poll cadence. Driven through a fake Homebridge API,
+// a fake ProtectClient and controllable timers, so nothing here touches a console or a clock.
+
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+
+import { ProtectApiError } from '../dist/client/protectClient.js';
+import { UnifiProtectPlatform } from '../dist/platform.js';
+import { Characteristic as C, Service } from './helpers/hap-mock.mjs';
+import { fakeApi, fakeClient, fakeClock, flush, generateUuid, makeLog } from './helpers/api-mock.mjs';
+
+const HUB_MAC = 'AA:BB:CC';
+
+/** A hub payload with one enabled contact zone, unless a test says otherwise. */
+const hub = (alarmHub = { input: { 0: { enable: 'on', inputType: 'ENTRY', name: 'Front Door' } } }) => ({
+  id: 'hub-1',
+  modelKey: 'linkstation',
+  name: 'Alarm Hub Kit',
+  mac: HUB_MAC,
+  state: 'CONNECTED',
+  isAlarmHub: true,
+  alarmHub,
+});
+
+const camera = (over = {}) => ({ id: 'cam-1', modelKey: 'camera', name: 'Front Yard', featureFlags: {}, ...over });
+
+/**
+ * Build a started platform: construct, fire 'didFinishLaunching', and let the first refresh and
+ * camera sync settle. Returns everything a test needs to poke at it.
+ */
+async function startPlatform(config = {}, clientState = {}) {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  const client = fakeClient(clientState);
+  const platform = new UnifiProtectPlatform(
+    log,
+    { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key', ...config },
+    api,
+    { createClient: () => client, ...clock.deps },
+  );
+  api.emit('didFinishLaunching');
+  await flush();
+  return { platform, api, log, clock, client, state: client.state };
+}
+
+const names = (accessories) => accessories.map((a) => a.displayName).sort();
+const logged = (log, level) => log.entries.filter((e) => e.level === level).map((e) => e.msg);
+
+// --- Alarm reconcile ---------------------------------------------------------
+
+test('registers the planned accessory set on the first successful refresh', async () => {
+  const { api } = await startPlatform({}, { hubs: [hub()] });
+  assert.deepEqual(names(api.registered), ['Alarm Hub Kit', 'Emergency Input', 'Front Door', 'Security System']);
+  assert.equal(api.unregistered.length, 0);
+});
+
+test('a zone renamed in UniFi is renamed in HomeKit, not re-registered', async () => {
+  const { api, state, clock } = await startPlatform({}, { hubs: [hub()] });
+  const before = api.registered.length;
+
+  state.hubs = [hub({ input: { 0: { enable: 'on', inputType: 'ENTRY', name: 'Side Door' } } })];
+  clock.alarmInterval().fn(); // next poll
+  await flush();
+
+  assert.equal(api.registered.length, before, 'a rename must not create a second accessory');
+  assert.deepEqual(names(api.updated), ['Side Door']);
+});
+
+test('disabling a terminal in UniFi prunes its accessory', async () => {
+  const { api, state, clock } = await startPlatform({}, { hubs: [hub()] });
+
+  state.hubs = [hub({ input: { 0: { enable: 'off', inputType: 'ENTRY', name: 'Front Door' } } })];
+  clock.alarmInterval().fn();
+  await flush();
+
+  assert.deepEqual(names(api.unregistered), ['Front Door']);
+});
+
+// A hub payload that arrives without its input channels is a partial read, not 23 deleted
+// sensors. Pruning on one would wipe the user's whole zone set — and their automations with it.
+test('an incomplete hub payload is skipped, never treated as "everything was removed"', async () => {
+  const { api, state, clock, log } = await startPlatform({}, { hubs: [hub()] });
+
+  state.hubs = [hub({})]; // no `input` at all
+  clock.alarmInterval().fn();
+  await flush();
+
+  assert.equal(api.unregistered.length, 0);
+  assert.ok(logged(log, 'debug').some((m) => /[Ii]ncomplete hub payload/.test(m)));
+});
+
+test('no alarm hub on the console is reported, not crashed on', async () => {
+  const { api, log } = await startPlatform({}, { hubs: [] });
+  assert.equal(api.registered.length, 0);
+  assert.ok(logged(log, 'warn').some((m) => /No alarm hub/.test(m)));
+});
+
+test('a second alarm hub is warned about exactly once', async () => {
+  const second = { ...hub(), id: 'hub-2', mac: 'DD:EE:FF' };
+  const { log, clock } = await startPlatform({}, { hubs: [hub(), second] });
+  clock.alarmInterval().fn();
+  await flush();
+  assert.equal(logged(log, 'warn').filter((m) => /2 alarm hubs/.test(m)).length, 1);
+});
+
+// --- Outage handling ---------------------------------------------------------
+
+test('an auth failure is reported once, not on every poll', async () => {
+  const err = new ProtectApiError('HTTP 401 for /alarm-hubs', 401);
+  const { log, clock } = await startPlatform({}, { hubs: [], hubsError: err });
+  for (let i = 0; i < 3; i++) {
+    clock.alarmInterval().fn();
+    await flush();
+  }
+  const authErrors = logged(log, 'error').filter((m) => /Authentication failed/.test(m));
+  assert.equal(authErrors.length, 1, `expected one auth error, got ${authErrors.length}`);
+});
+
+test('a sustained outage marks accessories stale, and recovery clears it', async () => {
+  const { state, clock, api, log } = await startPlatform({}, { hubs: [hub()] });
+  const zone = api.registered.find((a) => a.displayName === 'Front Door');
+  assert.equal(zone.getService(Service.ContactSensor).value(C.StatusActive), true);
+
+  state.hubsError = new Error('ECONNREFUSED');
+  for (let i = 0; i < 3; i++) {
+    clock.alarmInterval().fn();
+    await flush();
+  }
+
+  assert.equal(zone.getService(Service.ContactSensor).value(C.StatusActive), false);
+  assert.ok(logged(log, 'warn').some((m) => /unreachable for a while/.test(m)));
+
+  state.hubsError = undefined;
+  clock.alarmInterval().fn();
+  await flush();
+
+  assert.equal(zone.getService(Service.ContactSensor).value(C.StatusActive), true);
+  assert.ok(logged(log, 'info').some((m) => /Reconnected/.test(m)));
+});
+
+test('two failures are not enough to mark accessories stale', async () => {
+  const { state, clock, api } = await startPlatform({}, { hubs: [hub()] });
+  const zone = api.registered.find((a) => a.displayName === 'Front Door');
+  state.hubsError = new Error('blip');
+  for (let i = 0; i < 2; i++) {
+    clock.alarmInterval().fn();
+    await flush();
+  }
+  assert.equal(zone.getService(Service.ContactSensor).value(C.StatusActive), true);
+});
+
+// --- Poll cadence ------------------------------------------------------------
+
+test('the poll backs off while the realtime feed is up, and speeds back up when it drops', async () => {
+  const { state, clock } = await startPlatform({}, { hubs: [hub()] });
+  assert.equal(clock.alarmInterval().ms, 10_000, 'starts at the configured cadence');
+
+  state.devices.hooks.onStatus(true);
+  assert.equal(clock.alarmInterval().ms, 60_000, 'realtime up → backstop cadence');
+
+  state.devices.hooks.onStatus(false);
+  assert.equal(clock.alarmInterval().ms, 10_000, 'realtime down → configured cadence');
+});
+
+test('a realtime drop also triggers an immediate refresh', async () => {
+  const { state, clock } = await startPlatform({}, { hubs: [hub()] });
+  state.devices.hooks.onStatus(true);
+  const before = state.calls.getAlarmHubs;
+
+  state.devices.hooks.onStatus(false);
+  clock.runTimeouts(); // the coalescing window
+  await flush();
+
+  assert.ok(state.calls.getAlarmHubs > before, 'state may have changed while the feed was down');
+});
+
+test('a configured interval slower than the backstop is left alone', async () => {
+  // 180s, not 300s: the fake clock tells the two intervals apart by period, and 300s is the
+  // camera re-discovery one.
+  const { state, clock } = await startPlatform({ refreshInterval: 180 }, { hubs: [hub()] });
+  state.devices.hooks.onStatus(true);
+  assert.equal(clock.alarmInterval().ms, 180_000);
+});
+
+// --- Cameras -----------------------------------------------------------------
+
+test('cameras and their smart-detect sensors are registered', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person', 'package'] } })] },
+  );
+  const registered = names(api.registered);
+  assert.ok(registered.includes('Front Yard'));
+  assert.ok(registered.includes('Front Yard Person'));
+  assert.ok(registered.includes('Front Yard Package'));
+});
+
+test('a camera removed from Protect is pruned, and the alarm side is untouched', async () => {
+  const { api, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  assert.ok(names(api.registered).includes('Front Yard'));
+
+  state.cameras = [];
+  clock.cameraInterval().fn(); // camera re-discovery
+  await flush();
+
+  assert.deepEqual(names(api.unregistered), ['Front Yard']);
+});
+
+// A pruned camera can still own a live ffmpeg transcode and a pending motion safety-clear.
+// Once its map entry is gone nothing can reach them again, so the process would survive until
+// Homebridge restarts. (Reaching into the handler map is deliberate: `shutdown` is the contract
+// under test and there is no public surface that reports it.)
+test('pruning a camera shuts its handler down before dropping it', async () => {
+  const { platform, api, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
+  );
+  const camUuid = api.registered.find((a) => a.displayName === 'Front Yard').UUID;
+  const objUuid = api.registered.find((a) => a.displayName === 'Front Yard Person').UUID;
+  const stopped = [];
+  for (const [uuid, map] of [[camUuid, platform.cameraHandlers], [objUuid, platform.objectHandlers]]) {
+    const handler = map.get(uuid);
+    const real = handler.shutdown.bind(handler);
+    handler.shutdown = () => {
+      stopped.push(uuid);
+      real();
+    };
+  }
+
+  state.cameras = [];
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.deepEqual(stopped.sort(), [camUuid, objUuid].sort());
+});
+
+test('a camera renamed in Protect renames its services and its object sensors', async () => {
+  const { api, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
+  );
+  const cam = api.registered.find((a) => a.displayName === 'Front Yard');
+  const person = api.registered.find((a) => a.displayName === 'Front Yard Person');
+
+  state.cameras = [camera({ name: 'Driveway', featureFlags: { smartDetectTypes: ['person'] } })];
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.equal(cam.displayName, 'Driveway');
+  // The service label matters as much as the accessory name: HomeKit reads both, and leaving
+  // the old one there is how a renamed camera keeps showing its old name in the Home app.
+  assert.equal(cam.getService(Service.MotionSensor).value(C.Name), 'Driveway');
+  assert.equal(person.displayName, 'Driveway Person');
+  assert.equal(person.getService(Service.MotionSensor).value(C.Name), 'Driveway Person');
+  assert.equal(api.unregistered.length, 0, 'a rename must not re-create the accessories');
+});
+
+test('requestRefresh coalesces a burst of realtime deltas into one fetch', async () => {
+  const { state, clock } = await startPlatform({}, { hubs: [hub()] });
+  const before = state.calls.getAlarmHubs;
+
+  for (let i = 0; i < 5; i++) {
+    state.devices.onChange();
+  }
+  clock.runTimeouts();
+  await flush();
+
+  assert.equal(state.calls.getAlarmHubs, before + 1, 'five deltas must not mean five requests');
+});
+
+// The two reconcilers walk the same accessory map. Without the domain tag, whichever ran last
+// would delete everything the other owns.
+test('camera discovery never prunes alarm accessories, and vice versa', async () => {
+  const { api, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  clock.cameraInterval().fn(); // camera pass
+  clock.alarmInterval().fn(); // alarm pass
+  await flush();
+  assert.equal(api.unregistered.length, 0);
+});
+
+test('camera discovery failure warns once and recovers loudly', async () => {
+  const { log, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [], camerasError: new Error('timeout') },
+  );
+  assert.equal(logged(log, 'warn').filter((m) => /Camera discovery failed/.test(m)).length, 1);
+
+  clock.cameraInterval().fn();
+  await flush();
+  assert.equal(logged(log, 'warn').filter((m) => /Camera discovery failed/.test(m)).length, 1, 'still once');
+
+  state.camerasError = undefined;
+  clock.cameraInterval().fn();
+  await flush();
+  assert.ok(logged(log, 'info').some((m) => /Camera discovery recovered/.test(m)));
+});
+
+test('a disconnected camera keeps its accessory but is marked unavailable', async () => {
+  const { api, log, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
+  );
+  const cam = api.registered.find((a) => a.displayName === 'Front Yard');
+  const person = api.registered.find((a) => a.displayName === 'Front Yard Person');
+
+  state.cameras = [camera({ state: 'DISCONNECTED', featureFlags: { smartDetectTypes: ['person'] } })];
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.equal(api.unregistered.length, 0, 'an offline camera must not be pruned');
+  assert.equal(cam.getService(Service.MotionSensor).value(C.StatusActive), false);
+  assert.equal(person.getService(Service.MotionSensor).value(C.StatusActive), false);
+  assert.ok(logged(log, 'warn').some((m) => /Front Yard.*disconnected/.test(m)));
+});
+
+test('detection types switched off in Protect are called out once', async () => {
+  const { log, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    {
+      hubs: [hub()],
+      cameras: [
+        camera({
+          featureFlags: { smartDetectTypes: ['person', 'package'] },
+          smartDetectSettings: { objectTypes: ['person'] },
+        }),
+      ],
+    },
+  );
+  const notices = logged(log, 'info').filter((m) => /package.*turned off in Protect/.test(m));
+  assert.equal(notices.length, 1);
+
+  clock.cameraInterval().fn();
+  await flush();
+  assert.equal(logged(log, 'info').filter((m) => /turned off in Protect/.test(m)).length, 1, 'once, not per pass');
+});
+
+// --- Event routing -----------------------------------------------------------
+
+test('a motion event reaches the camera it belongs to', async () => {
+  const { api, state } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  const cam = api.registered.find((a) => a.displayName === 'Front Yard');
+
+  state.events.onEvent({ type: 'add', item: { type: 'motion', device: 'cam-1' } });
+  assert.equal(cam.getService(Service.MotionSensor).value(C.MotionDetected), true);
+
+  state.events.onEvent({ type: 'update', item: { type: 'motion', device: 'cam-1', end: 123 } });
+  assert.equal(cam.getService(Service.MotionSensor).value(C.MotionDetected), false);
+});
+
+test('a smart detection reaches its own object sensor, not the camera', async () => {
+  const { api, state } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
+  );
+  const cam = api.registered.find((a) => a.displayName === 'Front Yard');
+  const person = api.registered.find((a) => a.displayName === 'Front Yard Person');
+
+  state.events.onEvent({ item: { type: 'smartDetectZone', device: 'cam-1', smartDetectTypes: ['person'] } });
+
+  assert.equal(person.getService(Service.MotionSensor).value(C.MotionDetected), true);
+  assert.notEqual(cam.getService(Service.MotionSensor).value(C.MotionDetected), true);
+});
+
+test('a ring from a camera we did not flag as a doorbell warns once with the fix', async () => {
+  const { state, log } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  state.events.onEvent({ item: { type: 'ring', device: 'cam-1' } });
+  state.events.onEvent({ item: { type: 'ring', device: 'cam-1' } });
+
+  const warns = logged(log, 'warn').filter((m) => /doorbellDeviceIds/.test(m));
+  assert.equal(warns.length, 1);
+});
+
+test('an event for an unknown camera is warned about once, not silently dropped', async () => {
+  const { state, log } = await startPlatform({ exposeCameraStreams: false }, { hubs: [hub()], cameras: [camera()] });
+  state.events.onEvent({ item: { type: 'motion', device: 'ghost-cam' } });
+  state.events.onEvent({ item: { type: 'motion', device: 'ghost-cam' } });
+  assert.equal(logged(log, 'warn').filter((m) => /ghost-cam/.test(m)).length, 1);
+});
+
+// A detection we expect but never see (the standing example is package detection) is
+// indistinguishable from one Protect never sent — unless the undecodable payloads are captured.
+test('an event we decode nothing from is logged once per type, with its payload', async () => {
+  const { state, log } = await startPlatform({ exposeCameraStreams: false }, { hubs: [hub()], cameras: [camera()] });
+  state.events.onEvent({ item: { type: 'alarmHubEntryOpened', device: 'hub-1' } });
+  state.events.onEvent({ item: { type: 'alarmHubEntryOpened', device: 'hub-1' } });
+  state.events.onEvent({ item: { type: 'somethingBrandNew', device: 'cam-1', metadata: { a: 1 } } });
+
+  const notes = logged(log, 'debug').filter((m) => /no camera detection decoded/.test(m));
+  assert.equal(notes.length, 2, 'once per type');
+  assert.ok(notes.some((m) => /somethingBrandNew/.test(m) && /"a":1/.test(m)), 'payload captured');
+});
+
+// The alarm hub's own events share the camera feed, and its entry events carry the keypad PIN
+// used to disarm. Dumping the payload verbatim would write that PIN into a log people paste
+// into bug reports.
+test('an unhandled alarm event is logged without its keypad PIN', async () => {
+  const { state, log } = await startPlatform({ exposeCameraStreams: false }, { hubs: [hub()], cameras: [camera()] });
+
+  state.events.onEvent({
+    item: {
+      type: 'alarmHubEntryOpened',
+      device: 'hub-1',
+      metadata: { deviceName: 'Front Door', status: 'opened', pin: '4821' },
+    },
+  });
+
+  const all = log.entries.map((e) => e.msg).join('\n');
+  assert.ok(!all.includes('4821'), 'the keypad PIN reached the log');
+  assert.ok(all.includes('<redacted>'), 'the field should still be shown as present but hidden');
+});
+
+test('discovery and event routing agree on the accessory id', async () => {
+  // The one thing that silently breaks every detection: the two sides deriving different UUIDs.
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
+  );
+  const cam = api.registered.find((a) => a.displayName === 'Front Yard');
+  const person = api.registered.find((a) => a.displayName === 'Front Yard Person');
+  assert.equal(cam.UUID, generateUuid('cam-1:camera'));
+  assert.equal(person.UUID, generateUuid('cam-1:object:person'));
+});
+
+// --- Config gates + lifecycle ------------------------------------------------
+
+test('missing credentials leave the plugin idle instead of half-started', async () => {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  new UnifiProtectPlatform(log, { platform: 'UnifiProtectIntegration' }, api, {
+    createClient: () => {
+      throw new Error('should not build a client without credentials');
+    },
+    ...clock.deps,
+  });
+  api.emit('didFinishLaunching');
+  await flush();
+  assert.ok(logged(log, 'error').some((m) => /Missing "host" or "apiKey"/.test(m)));
+  assert.equal(api.registered.length, 0);
+});
+
+test('exposeAlarm:false exposes cameras only and never polls the hub', async () => {
+  const { api, state, clock } = await startPlatform(
+    { exposeAlarm: false, exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  assert.deepEqual(names(api.registered), ['Front Yard']);
+  assert.equal(state.calls.getAlarmHubs, 0);
+  assert.equal(clock.intervals.filter((i) => i.ms === 10_000).length, 0, 'no alarm poll timer');
+});
+
+test('exposeCameras:false skips camera discovery and its subscription entirely', async () => {
+  const { api, state } = await startPlatform({ exposeCameras: false }, { hubs: [hub()], cameras: [camera()] });
+  assert.ok(!names(api.registered).includes('Front Yard'));
+  assert.equal(state.calls.getCameras, 0);
+  assert.equal(state.events, undefined, 'no events subscription without cameras');
+});
+
+// Without realtime, cameras used to vanish entirely — discovery lived inside the realtime branch.
+test('useRealtime:false still exposes cameras, just without live detections', async () => {
+  const { api, state, log } = await startPlatform(
+    { useRealtime: false, exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  assert.ok(names(api.registered).includes('Front Yard'));
+  assert.equal(state.devices, undefined);
+  assert.equal(state.events, undefined);
+  assert.ok(logged(log, 'info').some((m) => /Realtime is off/.test(m)));
+});
+
+test('shutdown clears both timers, disposes the feeds, and closes the client', async () => {
+  const { api, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  api.emit('shutdown');
+  await flush();
+
+  assert.ok(clock.intervals.every((i) => i.cleared), 'no timer may outlive the platform');
+  assert.equal(state.devices.disposed, true);
+  assert.equal(state.events.disposed, true);
+  assert.equal(state.closed, true);
+});
+
+test('restored cached accessories are reused rather than registered again', async () => {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  const client = fakeClient({ hubs: [hub()] });
+  const platform = new UnifiProtectPlatform(
+    log,
+    { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key' },
+    api,
+    { createClient: () => client, ...clock.deps },
+  );
+  // Homebridge replays the cached accessories before didFinishLaunching.
+  const cached = new api.platformAccessory('Front Door', generateUuid(`${HUB_MAC}:zone:0:contact`), 10);
+  cached.context.domain = 'alarm';
+  platform.configureAccessory(cached);
+
+  api.emit('didFinishLaunching');
+  await flush();
+
+  assert.ok(!names(api.registered).includes('Front Door'), 'the cached zone was reused');
+  assert.equal(api.unregistered.length, 0);
+});

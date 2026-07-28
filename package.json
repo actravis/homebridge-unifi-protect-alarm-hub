@@ -1,8 +1,8 @@
 {
-  "name": "homebridge-unifi-protect-alarm-hub",
-  "displayName": "UniFi Protect Alarm Hub",
-  "version": "0.1.4",
-  "description": "HomeKit arm/disarm and sensor status for the UniFi Protect Alarm Hub, via the official UniFi Integration API.",
+  "name": "homebridge-unifi-protect-integration",
+  "displayName": "UniFi Protect (Integration API)",
+  "version": "0.2.0",
+  "description": "HomeKit for UniFi Protect over the official Integration API \u2014 Alarm Hub arm/disarm and sensors today, cameras and more on the roadmap. Security-first: revocable API key, no reverse-engineering.",
   "author": "Andrew Travis",
   "license": "MIT",
   "type": "commonjs",
@@ -29,9 +29,9 @@
     "build": "tsc",
     "prepare": "npm run build",
     "clean": "rm -rf dist",
-    "lint": "eslint src",
-    "test": "npm run build && node --test",
-    "prepublishOnly": "npm run clean && npm run lint && npm run build"
+    "lint": "eslint src test",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepublishOnly": "npm run clean && npm run lint && npm test"
   },
   "files": [
     "dist",
@@ -44,21 +44,31 @@
     "unifi",
     "unifi-protect",
     "protect",
+    "ubiquiti",
+    "udm",
+    "integration-api",
     "alarm",
     "alarm-hub",
     "security-system",
     "arm",
     "disarm",
+    "camera",
+    "doorbell",
+    "motion",
+    "smart-detect",
     "contact-sensor",
     "homekit"
   ],
   "dependencies": {
     "undici": "^6.21.0"
   },
+  "optionalDependencies": {
+    "ffmpeg-for-homebridge": "^2.2.2"
+  },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
     "@types/node": "^20.12.0",
-    "eslint": "^9.0.0",
+    "eslint": "^10.8.0",
     "homebridge": "^1.8.0",
     "typescript": "^5.4.0",
     "typescript-eslint": "^8.0.0"

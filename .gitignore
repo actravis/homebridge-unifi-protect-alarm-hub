@@ -13,8 +13,10 @@ build/
 spike/output/
 spike/**/*.log
 
-# Local Homebridge test instance (contains the API key + paired state)
-hb-test/
+# Local Homebridge test instances (contain the API key + paired state).
+# Glob, not a single path: debugging tends to spawn extra data dirs
+# (hb-test-cams/, hb-test-cams-bare/, …) and every one of them holds the key.
+hb-test*/
 
 # Logs
 *.log
@@ -26,6 +28,13 @@ yarn-error.log*
 .env.*
 *.pem
 *.key
+*.crt
+*.p12
+*.pfx
+.npmrc
+# A hand-dropped Homebridge config at the repo root holds the API key. The hb-test*/ rule
+# above only covers directories, so name the bare file explicitly.
+/config.json
 
 # Editor / OS
 .DS_Store
@@ -38,3 +47,6 @@ CLAUDE.md
 
 # Local Claude Code settings (personal, not shared)
 .claude/settings.local.json
+
+# Camera probe (throwaway, same as alarm spike) — never commit
+spike/

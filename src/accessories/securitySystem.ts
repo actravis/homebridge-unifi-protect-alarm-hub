@@ -1,5 +1,5 @@
 import type { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
-import type { UnifiAlarmHubPlatform } from '../platform';
+import type { UnifiProtectPlatform } from '../platform';
 import type { AccessoryHandler, AlarmHub } from '../types';
 import { computeFingerprint, isArmed, isTriggered } from '../armState';
 
@@ -24,7 +24,7 @@ export class SecuritySystemAccessory implements AccessoryHandler {
   private lastName?: string;
 
   constructor(
-    private readonly platform: UnifiAlarmHubPlatform,
+    private readonly platform: UnifiProtectPlatform,
     private readonly accessory: PlatformAccessory,
     hubMac: string,
   ) {
@@ -33,14 +33,19 @@ export class SecuritySystemAccessory implements AccessoryHandler {
     this.service =
       accessory.getService(Service.SecuritySystem) ?? accessory.addService(Service.SecuritySystem);
 
-    this.learned = (accessory.context.armProfiles as Record<string, number>) ?? {};
+    // Null-prototype: the keys are fingerprints derived from console-supplied channel names, so
+    // a channel called `constructor`/`__proto__` would otherwise make a lookup return something
+    // off Object.prototype and write it straight to a HomeKit characteristic.
+    this.learned = Object.assign(Object.create(null) as Record<string, number>, accessory.context.armProfiles);
     this.validTargets = new Set(this.computeValidTargets());
-    this.target = Characteristic.SecuritySystemTargetState.DISARM;
+    // Clamped, not a bare DISARM: with only an "away" trigger configured, validTargets is
+    // [AWAY_ARM] and seeding DISARM would itself be the illegal value the seed exists to avoid.
+    this.target = this.clampTarget(Characteristic.SecuritySystemTargetState.DISARM);
     this.current = Characteristic.SecuritySystemCurrentState.DISARMED;
 
     const targetChar = this.service.getCharacteristic(Characteristic.SecuritySystemTargetState);
-    // Seed a valid value (Disarm) before restricting validValues, or HAP warns that the
-    // characteristic's default (0 / Stay) isn't in the list.
+    // Seed a valid value before restricting validValues, or HAP warns that the characteristic's
+    // default (0 / Stay) isn't in the list.
     targetChar.updateValue(this.target);
     targetChar
       .setProps({ validValues: [...this.validTargets] })
@@ -67,13 +72,21 @@ export class SecuritySystemAccessory implements AccessoryHandler {
     return values.length ? values : [T.DISARM];
   }
 
-  /** Keep a reported target within the values HomeKit accepts (avoids illegal-value warnings). */
+  /**
+   * Keep a reported target within the values HomeKit accepts (avoids illegal-value warnings).
+   * Every fallback must itself be in `validTargets` — returning a bare DISARM used to be illegal
+   * in a night-only setup, which is exactly the warning this exists to prevent.
+   */
   private clampTarget(target: number): number {
     const T = this.platform.Characteristic.SecuritySystemTargetState;
-    if (this.validTargets.has(target)) {
-      return target;
+    for (const candidate of [target, T.AWAY_ARM, T.DISARM]) {
+      if (this.validTargets.has(candidate)) {
+        return candidate;
+      }
     }
-    return this.validTargets.has(T.AWAY_ARM) ? T.AWAY_ARM : T.DISARM;
+    // computeValidTargets never returns an empty set, so the first entry is always there; the
+    // `??` only satisfies the compiler, and DISARM is the same safe default it guarantees.
+    return [...this.validTargets][0] ?? T.DISARM;
   }
 
   private triggerIdFor(target: number): string | undefined {
@@ -153,16 +166,27 @@ export class SecuritySystemAccessory implements AccessoryHandler {
       this.current = C.SecuritySystemCurrentState.DISARMED;
       // Don't clobber the user's selection while an arm is still taking effect (exit delay).
       if (this.pendingLearn === null) {
-        this.target = C.SecuritySystemTargetState.DISARM;
+        // Clamped, like every other write to `target`. With only an arm trigger configured
+        // (say night-only), DISARM is not in validValues, and writing it here made HAP log
+        // "value 3 is not in valid values" on every single refresh while disarmed.
+        this.target = this.clampTarget(C.SecuritySystemTargetState.DISARM);
       }
     } else {
       // Arm-mode current/target enum values coincide (AWAY_ARM=1, NIGHT_ARM=2).
-      const profile = this.learned[computeFingerprint(hub)] ?? C.SecuritySystemTargetState.AWAY_ARM;
+      const remembered = this.learned[computeFingerprint(hub)];
+      const profile = typeof remembered === 'number' ? remembered : C.SecuritySystemTargetState.AWAY_ARM;
       this.current = profile;
       this.target = this.clampTarget(profile);
     }
 
     this.service.updateCharacteristic(C.SecuritySystemCurrentState, this.current);
     this.service.updateCharacteristic(C.SecuritySystemTargetState, this.target);
+    // A successful update means the console is reachable — clear any stale-state fault.
+    this.service.updateCharacteristic(C.StatusFault, C.StatusFault.NO_FAULT);
+  }
+
+  markStale(): void {
+    const C = this.platform.Characteristic;
+    this.service.updateCharacteristic(C.StatusFault, C.StatusFault.GENERAL_FAULT);
   }
 }

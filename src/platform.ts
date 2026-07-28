@@ -7,11 +7,17 @@ import type {
   Service,
 } from 'homebridge';
 
-import { PLATFORM_NAME, PLUGIN_NAME, type UapahConfig } from './settings';
-import { ProtectApiError, ProtectClient } from './client/protectClient';
-import type { AccessoryHandler, AlarmHub } from './types';
+import { PLATFORM_NAME, PLUGIN_NAME, type ProtectConfig } from './settings';
+import { ProtectApiError, ProtectClient, type ProtectClientOptions } from './client/protectClient';
+import type { AccessoryHandler, AlarmHub, ProtectEvent } from './types';
 import { SecuritySystemAccessory } from './accessories/securitySystem';
-import { HubAccessory, ReadonlyContactAccessory, ZoneAccessory, type ZoneKind } from './accessories/sensors';
+import { HubAccessory, ReadonlyContactAccessory, ZoneAccessory } from './accessories/sensors';
+import { CameraAccessory, ObjectSensorAccessory } from './accessories/camera';
+import { planAccessories, type PlannedAccessory } from './discovery';
+import { basePollSeconds, effectivePollSeconds } from './pollPolicy';
+import { cameraKey, objectSensorKey, objectSensorName, planCameraAccessories } from './cameraDiscovery';
+import { decodeCameraEvent } from './cameraEvents';
+import { redactPayload } from './util';
 
 interface AccessorySpec {
   uuid: string;
@@ -20,7 +26,42 @@ interface AccessorySpec {
   make: (accessory: PlatformAccessory) => AccessoryHandler;
 }
 
-export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
+/**
+ * Consecutive failed refreshes before we mark accessories unavailable — long enough to ride
+ * out brief blips (≈30s at the default 10s interval), short enough not to trust stale state.
+ */
+const STALE_AFTER_FAILURES = 3;
+
+/**
+ * How often to re-run camera discovery.
+ *
+ * Cameras used to be discovered only at startup and on an events-socket reconnect, so a camera
+ * added, renamed, or unplugged in Protect could go unnoticed for hours. This is one request per
+ * interval for the whole plugin, so it is cheap even against the console's ~10 req/s budget.
+ */
+const CAMERA_DISCOVERY_SECONDS = 300;
+
+/**
+ * The I/O boundaries the platform owns, injectable so discovery, reconcile and the poll
+ * cadence can be unit-tested without a console or real timers — the same pattern
+ * {@link ProtectClient}'s `deps` uses. Homebridge never passes this; production gets
+ * {@link REAL_PLATFORM_DEPS}.
+ */
+export interface PlatformDeps {
+  createClient: (opts: ProtectClientOptions) => ProtectClient;
+  setInterval: (fn: () => void, ms: number) => NodeJS.Timeout;
+  clearInterval: (handle: NodeJS.Timeout) => void;
+  setTimeout: (fn: () => void, ms: number) => NodeJS.Timeout;
+}
+
+const REAL_PLATFORM_DEPS: PlatformDeps = {
+  createClient: (opts) => new ProtectClient(opts),
+  setInterval: (fn, ms) => setInterval(fn, ms),
+  clearInterval: (handle) => clearInterval(handle),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+};
+
+export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   readonly Service: typeof Service;
   readonly Characteristic: typeof Characteristic;
   readonly client?: ProtectClient;
@@ -29,9 +70,29 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
 
   private readonly accessories = new Map<string, PlatformAccessory>();
   private readonly handlers = new Map<string, AccessoryHandler>();
+  private readonly cameraHandlers = new Map<string, CameraAccessory>();
+  private readonly objectHandlers = new Map<string, ObjectSensorAccessory>();
+  private disposeEvents?: () => void;
+  private syncingCameras = false;
+  private resyncCameras = false;
+  private cameraDiscoveryOk = true;
   private readonly warnedTypes = new Set<string>();
+  private readonly warnedRingDevices = new Set<string>();
+  private readonly warnedDisabledDetections = new Set<string>();
+  /** Event types we've already reported as undecodable, so the log stays one line per type. */
+  private readonly seenUnhandledEvents = new Set<string>();
+  /** Detections that decoded but had no handler, keyed device:kind — warned once each. */
+  private readonly warnedUnrouted = new Set<string>();
+  /** Cameras currently reported offline, so the log records transitions rather than every pass. */
+  private readonly offlineCameras = new Set<string>();
+  private cameraTimer?: NodeJS.Timeout;
   private firmware?: string;
   private refreshTimer?: NodeJS.Timeout;
+  /** Configured poll cadence, before the realtime-healthy back-off is applied. */
+  private pollSeconds = 0;
+  /** Cadence the current timer is running at, so we only rebuild it when it actually changes. */
+  private activePollSeconds?: number;
+  private realtimeConnected = false;
   private disposeRealtime?: () => void;
   private refreshQueued = false;
   private refreshing = false;
@@ -39,11 +100,15 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
   private warnedMultiHub = false;
   private lastRefreshOk = true;
   private authErrorLogged = false;
+  private consecutiveFailures = 0;
+  /** Set on Homebridge shutdown; every async path checks it before touching the accessory API. */
+  private stopped = false;
 
   constructor(
     readonly log: Logging,
-    readonly config: UapahConfig,
+    readonly config: ProtectConfig,
     readonly api: API,
+    private readonly deps: PlatformDeps = REAL_PLATFORM_DEPS,
   ) {
     this.Service = api.hap.Service;
     this.Characteristic = api.hap.Characteristic;
@@ -61,12 +126,20 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    this.client = new ProtectClient({
-      host: config.host,
-      apiKey: config.apiKey,
-      trustSelfSignedCert: config.trustSelfSignedCert !== false,
-      certificateSha256: config.certificateSha256,
-    });
+    const idleTimeout = Number(config.realtimeIdleTimeout);
+    try {
+      this.client = this.deps.createClient({
+        host: config.host,
+        apiKey: config.apiKey,
+        trustSelfSignedCert: config.trustSelfSignedCert !== false,
+        certificateSha256: config.certificateSha256,
+        realtimeIdleTimeoutMs: Number.isFinite(idleTimeout) && idleTimeout > 0 ? idleTimeout * 1000 : undefined,
+      });
+    } catch (err) {
+      // e.g. a malformed certificate pin. Stay idle rather than run with weaker TLS than asked for.
+      this.log.error(`${(err as Error).message} Plugin is idle.`);
+      return;
+    }
 
     if (!config.certificateSha256 && config.trustSelfSignedCert !== false) {
       this.log.info('Trusting the console\'s self-signed certificate without pinning; set "certificateSha256" to pin it.');
@@ -86,13 +159,13 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
     this.accessories.set(accessory.UUID, accessory);
   }
 
-  applyInfo(accessory: PlatformAccessory, serial: string): void {
+  applyInfo(accessory: PlatformAccessory, serial: string, model = 'UniFi Protect Alarm Hub'): void {
     const { Service, Characteristic } = this;
     const info =
       accessory.getService(Service.AccessoryInformation) ?? accessory.addService(Service.AccessoryInformation);
     info
       .setCharacteristic(Characteristic.Manufacturer, 'Ubiquiti')
-      .setCharacteristic(Characteristic.Model, 'UniFi Protect Alarm Hub')
+      .setCharacteristic(Characteristic.Model, model)
       .setCharacteristic(Characteristic.SerialNumber, serial)
       .setCharacteristic(Characteristic.FirmwareRevision, this.firmware ?? '0.0.0');
   }
@@ -103,7 +176,7 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
       return;
     }
     this.refreshQueued = true;
-    setTimeout(() => {
+    this.deps.setTimeout(() => {
       this.refreshQueued = false;
       this.tick();
     }, 400);
@@ -114,32 +187,117 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
     if (!this.client) {
       return;
     }
+    const alarmEnabled = this.config.exposeAlarm !== false;
     try {
-      const raw = Number(this.config.refreshInterval);
-      const seconds = Number.isFinite(raw) && raw > 0 ? Math.max(2, raw) : 10;
-      this.refreshTimer = setInterval(() => this.tick(), seconds * 1000);
+      if (alarmEnabled) {
+        this.pollSeconds = basePollSeconds(this.config.refreshInterval);
+        this.applyPollInterval();
+      } else {
+        this.log.info('Alarm accessories disabled (exposeAlarm=false); exposing cameras only.');
+      }
 
       if (this.config.useRealtime !== false) {
-        this.disposeRealtime = this.client.subscribeDevices(
-          () => this.requestRefresh(),
-          (level, msg) => this.log[level](`[realtime] ${msg}`),
-        );
+        // The device feed drives the alarm poll; only subscribe when the alarm domain is on.
+        if (alarmEnabled) {
+          this.disposeRealtime = this.client.subscribeDevices(
+            () => this.requestRefresh(),
+            (level, msg) => this.log[level](`[realtime] ${msg}`),
+            {
+              // On reconnect, state may have changed during the gap — resync immediately.
+              onReconnect: () => this.requestRefresh(),
+              // While the feed is up the poll is only a backstop, so slow it right down; a drop
+              // restores the configured cadence, which is what actually keeps state fresh then.
+              onStatus: (connected) => this.setRealtimeConnected(connected),
+            },
+          );
+        }
+
+        if (this.config.exposeCameras !== false) {
+          this.disposeEvents = this.client.subscribeEvents(
+            (event) => this.routeEvent(event),
+            (level, msg) => this.log[level](`[events] ${msg}`),
+            // Detections during the gap are lost; re-discover cameras on recovery.
+            { onReconnect: () => void this.syncCameras() },
+          );
+        }
       }
-      if (this.sirenChannels.size) {
+      // Discover cameras regardless of the realtime setting. This used to live inside the
+      // realtime branch, so `useRealtime: false` silently produced no camera accessories at
+      // all. Without realtime the accessories still work; they just don't get live detections.
+      if (this.config.exposeCameras !== false) {
+        if (this.config.useRealtime === false) {
+          this.log.info('Realtime is off: cameras are exposed but motion/doorbell events will not fire.');
+        }
+        void this.syncCameras();
+        // Detections arrive over the events socket, but a camera being added, renamed, or going
+        // offline does not — that only shows up in a discovery pass.
+        this.cameraTimer = this.deps.setInterval(() => void this.syncCameras(), CAMERA_DISCOVERY_SECONDS * 1000);
+      }
+      if (alarmEnabled && this.sirenChannels.size) {
         const shown = [...this.sirenChannels].map((c) => Number(c) + 1).join(', ');
         this.log.info(`Treating output channel(s) ${shown} as the alarm siren.`);
       }
     } catch (err) {
       this.log.error(`Startup failed: ${(err as Error).message}`);
     }
-    this.tick();
+    if (alarmEnabled) {
+      this.tick();
+    }
+  }
+
+  /**
+   * Track the realtime device feed's health and re-cadence the poll around it.
+   *
+   * A drop also triggers an immediate refresh: pushes stopped arriving at some unknown point
+   * before we noticed, so the first thing the slow path owes the user is current state.
+   */
+  private setRealtimeConnected(connected: boolean): void {
+    if (this.realtimeConnected === connected) {
+      return;
+    }
+    this.realtimeConnected = connected;
+    this.applyPollInterval();
+    if (!connected) {
+      this.requestRefresh();
+    }
+  }
+
+  /** (Re)arm the poll timer at the cadence the current realtime health calls for. */
+  private applyPollInterval(): void {
+    if (this.pollSeconds <= 0) {
+      return; // alarm domain disabled — there is nothing to poll
+    }
+    const seconds = effectivePollSeconds(this.pollSeconds, this.realtimeConnected);
+    if (seconds === this.activePollSeconds) {
+      return;
+    }
+    this.activePollSeconds = seconds;
+    if (this.refreshTimer) {
+      this.deps.clearInterval(this.refreshTimer);
+    }
+    this.refreshTimer = this.deps.setInterval(() => this.tick(), seconds * 1000);
+    this.log.debug(`Alarm poll interval now ${seconds}s (realtime ${this.realtimeConnected ? 'up' : 'down'}).`);
   }
 
   private stop(): void {
+    // A refresh or camera sync may be mid-await right now. Without this flag it would resume
+    // after shutdown and register accessories against an API that is already tearing down.
+    this.stopped = true;
     if (this.refreshTimer) {
-      clearInterval(this.refreshTimer);
+      this.deps.clearInterval(this.refreshTimer);
+    }
+    if (this.cameraTimer) {
+      this.deps.clearInterval(this.cameraTimer);
     }
     this.disposeRealtime?.();
+    this.disposeEvents?.();
+    // Node does NOT kill child processes on exit: without this, every live ffmpeg transcode
+    // survives a Homebridge restart, keeps its sockets, and accumulates on each restart.
+    // Each shutdown is isolated, or one throwing handler would skip the rest AND the client
+    // close below — turning a cosmetic failure into leaked processes and sockets.
+    for (const uuid of [...this.cameraHandlers.keys(), ...this.objectHandlers.keys()]) {
+      this.shutdownCameraHandler(uuid);
+    }
     void this.client?.close();
   }
 
@@ -181,7 +339,7 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
   }
 
   private async refresh(): Promise<void> {
-    if (!this.client) {
+    if (!this.client || this.stopped || this.config.exposeAlarm === false) {
       return;
     }
     await this.ensureFirmware();
@@ -193,11 +351,15 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
       this.reportFailure(err);
       return;
     }
+    if (this.stopped) {
+      return; // shut down while we were awaiting the console
+    }
     if (!this.lastRefreshOk) {
       this.log.info('Reconnected to the UniFi console.');
     }
     this.lastRefreshOk = true;
     this.authErrorLogged = false;
+    this.consecutiveFailures = 0;
 
     const hub = hubs.find((h) => h.isAlarmHub) ?? hubs[0];
     if (!hub) {
@@ -235,71 +397,79 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
       this.log.debug(`Refresh failed: ${message}`);
     }
     this.lastRefreshOk = false;
+    this.consecutiveFailures++;
+    // After a sustained outage, stop presenting confidently-stale state in HomeKit (fires once).
+    if (this.consecutiveFailures === STALE_AFTER_FAILURES) {
+      this.log.warn('UniFi console unreachable for a while; marking accessories unavailable until it returns.');
+      this.markAllStale();
+    }
+  }
+
+  /**
+   * Flag every accessory as unreliable during a sustained console outage.
+   * Known limitation: if Homebridge starts while the console is already down, no handlers
+   * exist yet (they're created on the first successful sync), so restored/cached accessories
+   * keep showing their last HomeKit state until the console is first reached.
+   */
+  private markAllStale(): void {
+    for (const handler of this.handlers.values()) {
+      try {
+        handler.markStale?.();
+      } catch (err) {
+        this.log.debug(`markStale failed: ${(err as Error).message}`);
+      }
+    }
   }
 
   private sync(hub: AlarmHub): void {
     const { Categories } = this.api.hap;
     const mac = hub.mac ?? hub.id;
     const uuid = (key: string): string => this.api.hap.uuid.generate(`${mac}:${key}`);
-    const specs: AccessorySpec[] = [];
 
-    specs.push({
-      uuid: uuid('security'),
-      name: this.config.securityName?.trim() || 'Security System',
-      category: Categories.SECURITY_SYSTEM,
-      make: (a) => new SecuritySystemAccessory(this, a, mac),
-    });
-    specs.push({
-      uuid: uuid('hub'),
-      name: hub.name,
-      category: Categories.SENSOR,
-      make: (a) => new HubAccessory(this, a, mac),
-    });
-
-    for (const [channel, input] of Object.entries(hub.alarmHub?.input ?? {})) {
-      if (input.enable !== 'on' || !input.inputType) {
-        continue; // only enabled, typed terminals — new sensors appear automatically
-      }
-      const kind = this.zoneKind(input.inputType);
-      specs.push({
-        // Kind is part of the identity so a terminal's type change re-creates cleanly.
-        uuid: uuid(`zone:${channel}:${kind}`),
-        name: input.name ?? `${input.inputType} ${Number(channel) + 1}`,
-        category: Categories.SENSOR,
-        make: (a) => new ZoneAccessory(this, a, channel, kind, mac),
-      });
-    }
-
-    if (this.config.exposeOutputs !== false) {
-      for (const [channel, output] of Object.entries(hub.alarmHub?.output ?? {})) {
-        if (output.enable !== 'on') {
-          continue;
-        }
-        specs.push({
-          uuid: uuid(`output:${channel}`),
-          name: output.name ?? `Output ${Number(channel) + 1}`,
-          category: Categories.SENSOR,
-          make: (a) => new ReadonlyContactAccessory(this, a, { kind: 'output', channel }, mac),
-        });
+    // The "what should exist" decision is pure and unit-tested (see discovery.ts); here we
+    // just map each plan to a real accessory + reconcile against what's currently registered.
+    const { accessories, unknownTypes } = planAccessories(hub, this.config);
+    for (const type of unknownTypes) {
+      if (!this.warnedTypes.has(type)) {
+        this.warnedTypes.add(type);
+        this.log.info(`Unknown sensor type "${type}" — exposing as a contact sensor. Please report this.`);
       }
     }
 
-    if (this.config.exposeEmergencyInput !== false) {
-      specs.push({
-        uuid: uuid('emergency'),
-        name: 'Emergency Input',
-        category: Categories.SENSOR,
-        make: (a) => new ReadonlyContactAccessory(this, a, { kind: 'emergency' }, mac),
-      });
-    }
-
+    const specs: AccessorySpec[] = accessories.map((p) => ({
+      uuid: uuid(p.key),
+      name: p.name,
+      category: p.category === 'security' ? Categories.SECURITY_SYSTEM : Categories.SENSOR,
+      make: this.makeFor(p, mac),
+    }));
     this.reconcile(specs, hub);
+  }
+
+  /** Build the accessory-handler factory for a planned accessory. */
+  private makeFor(plan: PlannedAccessory, mac: string): (accessory: PlatformAccessory) => AccessoryHandler {
+    switch (plan.kind) {
+      case 'security':
+        return (a) => new SecuritySystemAccessory(this, a, mac);
+      case 'hub':
+        return (a) => new HubAccessory(this, a, mac);
+      case 'zone':
+        return (a) => new ZoneAccessory(this, a, plan.channel!, plan.zoneKind!, mac);
+      case 'output':
+        return (a) => new ReadonlyContactAccessory(this, a, { kind: 'output', channel: plan.channel! }, mac);
+      case 'emergency':
+        return (a) => new ReadonlyContactAccessory(this, a, { kind: 'emergency' }, mac);
+    }
   }
 
   private reconcile(specs: AccessorySpec[], hub: AlarmHub): void {
     const desired = new Set(specs.map((s) => s.uuid));
 
     for (const [id, accessory] of this.accessories) {
+      // Only prune alarm-domain accessories; cameras are managed by syncCameras. (Accessories
+      // cached before the camera feature existed have no domain → treat them as alarm.)
+      if ((accessory.context.domain ?? 'alarm') !== 'alarm') {
+        continue;
+      }
       if (!desired.has(id)) {
         this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
         this.accessories.delete(id);
@@ -312,6 +482,7 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
       let accessory = this.accessories.get(spec.uuid);
       if (!accessory) {
         accessory = new this.api.platformAccessory(spec.name, spec.uuid, spec.category);
+        accessory.context.domain = 'alarm';
         this.accessories.set(spec.uuid, accessory);
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
         this.log.info(`Added accessory "${spec.name}".`);
@@ -333,20 +504,272 @@ export class UnifiAlarmHubPlatform implements DynamicPlatformPlugin {
     }
   }
 
-  private zoneKind(inputType: string): ZoneKind {
-    switch (inputType) {
-      case 'MOTION':
-        return 'motion';
-      case 'GLASS_BREAK':
-        return this.config.glassBreakAs === 'contact' ? 'contact' : 'motion';
-      case 'ENTRY':
-        return 'contact';
-      default:
-        if (!this.warnedTypes.has(inputType)) {
-          this.warnedTypes.add(inputType);
-          this.log.info(`Unknown sensor type "${inputType}" — exposing as a contact sensor. Please report this.`);
-        }
-        return 'contact';
+  // ---- Cameras (event-driven; separate from the alarm-hub poll/reconcile) ----
+
+  /** Discover cameras and create/prune their accessories (overall motion, doorbell, object sensors). */
+  private async syncCameras(): Promise<void> {
+    if (!this.client || this.stopped || this.config.exposeCameras === false) {
+      return;
     }
+    if (this.syncingCameras) {
+      // Queue instead of dropping: a resync requested during a slow sync (e.g. the events
+      // socket reconnected while the first discovery was still retrying) must still happen,
+      // or we stay stale until the next reconnect — which may be hours away.
+      this.resyncCameras = true;
+      return;
+    }
+    this.syncingCameras = true;
+    try {
+      do {
+        this.resyncCameras = false;
+        await this.syncCamerasOnce();
+      } while (this.resyncCameras);
+    } catch (err) {
+      // Fire-and-forget callers (start/reconnect) can't catch — swallow so it can't crash.
+      this.log.debug(`Camera sync error: ${(err as Error).message}`);
+    } finally {
+      this.syncingCameras = false;
+    }
+  }
+
+  private async syncCamerasOnce(): Promise<void> {
+    const client = this.client;
+    if (!client) {
+      return;
+    }
+    let cameras;
+    try {
+      cameras = await client.getCameras();
+    } catch (err) {
+      // Surface the first failure: a user whose cameras never appear should not have to switch
+      // on debug logging to find out why. Subsequent failures stay quiet until it recovers.
+      if (this.cameraDiscoveryOk) {
+        this.cameraDiscoveryOk = false;
+        this.log.warn(`Camera discovery failed: ${(err as Error).message}. Will keep retrying.`);
+      } else {
+        this.log.debug(`Camera discovery failed: ${(err as Error).message}`);
+      }
+      return;
+    }
+    if (this.stopped) {
+      return; // shut down while we were awaiting the console
+    }
+    if (!this.cameraDiscoveryOk) {
+      this.cameraDiscoveryOk = true;
+      this.log.info('Camera discovery recovered.');
+    }
+
+    const { Categories, uuid } = this.api.hap;
+    const streaming = this.config.exposeCameraStreams !== false;
+    const desired = new Set<string>();
+
+    for (const plan of planCameraAccessories(cameras, this.config)) {
+      const camId = uuid.generate(cameraKey(plan.deviceId));
+      desired.add(camId);
+      this.reportCameraReachability(plan.deviceId, plan.name, plan.online);
+      // A supported-but-switched-off detection type can never fire; say so once, or the user is
+      // left staring at a sensor that looks broken when it is actually just disabled in Protect.
+      if (plan.disabledObjectTypes.length && !this.warnedDisabledDetections.has(plan.deviceId)) {
+        this.warnedDisabledDetections.add(plan.deviceId);
+        this.log.info(
+          `"${plan.name}": ${plan.disabledObjectTypes.join(', ')} detection is turned off in Protect, ` +
+            'so those sensors will never trigger. Enable it in Protect > camera > Smart Detections.',
+        );
+      }
+      if (!this.cameraHandlers.has(camId)) {
+        const opts = {
+          name: plan.name,
+          serial: plan.deviceId,
+          isDoorbell: plan.isDoorbell,
+          doorbellTrigger: this.config.exposeDoorbellTriggers === true,
+          streaming,
+          source: client,
+        };
+        // Cameras are bridged like everything else: they appear automatically with the bridge,
+        // are cached/restored across restarts, and prune normally. (Publishing them as external
+        // accessories — which costs the user a manual add each — was tried and is NOT required;
+        // HomeKit streams a bridged camera fine. Verified end to end on real hardware.)
+        const category = streaming
+          ? opts.isDoorbell
+            ? Categories.VIDEO_DOORBELL
+            : Categories.CAMERA
+          : Categories.SENSOR;
+        const accessory = this.acquireAccessory(camId, plan.name, category);
+        this.cameraHandlers.set(camId, new CameraAccessory(this, accessory, opts));
+      } else if (this.renameAccessory(camId, plan.name)) {
+        // Renamed in Protect. The service label has to follow the accessory name, or HomeKit
+        // keeps showing the old one — the alarm-side handlers do this on every refresh.
+        this.cameraHandlers.get(camId)?.setName(plan.name);
+      }
+      this.cameraHandlers.get(camId)?.setOnline(plan.online);
+      for (const type of plan.objectTypes) {
+        const objId = uuid.generate(objectSensorKey(plan.deviceId, type));
+        desired.add(objId);
+        const name = objectSensorName(plan.name, type);
+        if (!this.objectHandlers.has(objId)) {
+          const accessory = this.acquireAccessory(objId, name, Categories.SENSOR);
+          this.objectHandlers.set(objId, new ObjectSensorAccessory(this, accessory, { name, serial: `${plan.deviceId}:${type}` }));
+        } else if (this.renameAccessory(objId, name)) {
+          // These names are derived from the camera's, so a camera rename renames them all.
+          this.objectHandlers.get(objId)?.setName(name);
+        }
+        this.objectHandlers.get(objId)?.setOnline(plan.online);
+      }
+    }
+
+    // Prune camera-domain accessories that are no longer present.
+    for (const [id, accessory] of this.accessories) {
+      if (accessory.context.domain === 'camera' && !desired.has(id)) {
+        // Shut the handler down BEFORE dropping it: a pruned camera can have a live ffmpeg
+        // transcode and a pending motion safety-clear, and once the map entry is gone nothing
+        // can ever reach them again — the process would survive until Homebridge restarts.
+        this.shutdownCameraHandler(id);
+        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.accessories.delete(id);
+        this.cameraHandlers.delete(id);
+        this.objectHandlers.delete(id);
+        this.log.info(`Removed camera accessory "${accessory.displayName}".`);
+      }
+    }
+    // Forget per-device warning/reachability state for cameras that no longer exist, so these
+    // sets track the live camera list rather than everything ever seen.
+    const liveDevices = new Set(cameras.map((c) => c.id));
+    for (const set of [this.offlineCameras, this.warnedDisabledDetections, this.warnedRingDevices]) {
+      for (const deviceId of set) {
+        if (!liveDevices.has(deviceId)) {
+          set.delete(deviceId);
+        }
+      }
+    }
+  }
+
+  /** Stop a camera or object-sensor handler's background work, whichever kind it is. */
+  private shutdownCameraHandler(uuid: string): void {
+    try {
+      this.cameraHandlers.get(uuid)?.shutdown();
+      this.objectHandlers.get(uuid)?.shutdown();
+    } catch (err) {
+      this.log.debug(`Camera shutdown failed: ${(err as Error).message}`);
+    }
+  }
+
+  /** Log a camera going offline/online, once per transition rather than once per discovery pass. */
+  private reportCameraReachability(deviceId: string, name: string, online: boolean): void {
+    if (online === !this.offlineCameras.has(deviceId)) {
+      return;
+    }
+    if (online) {
+      this.offlineCameras.delete(deviceId);
+      this.log.info(`Camera "${name}" is back online.`);
+    } else {
+      this.offlineCameras.add(deviceId);
+      this.log.warn(`Camera "${name}" is disconnected in Protect; marking it unavailable in HomeKit.`);
+    }
+  }
+
+  /**
+   * Follow a rename made in Protect through to the HomeKit accessory.
+   * Returns true if it actually changed, so the caller can also relabel the services.
+   */
+  private renameAccessory(uuid: string, name: string): boolean {
+    const accessory = this.accessories.get(uuid);
+    if (!accessory || accessory.displayName === name) {
+      return false;
+    }
+    const previous = accessory.displayName;
+    accessory.displayName = name;
+    this.api.updatePlatformAccessories([accessory]);
+    this.log.info(`Renamed accessory "${previous}" to "${name}".`);
+    return true;
+  }
+
+  /** Get-or-create a registered accessory tagged as camera-domain. */
+  private acquireAccessory(uuid: string, name: string, category: number): PlatformAccessory {
+    let accessory = this.accessories.get(uuid);
+    if (!accessory) {
+      accessory = new this.api.platformAccessory(name, uuid, category);
+      accessory.context.domain = 'camera';
+      this.accessories.set(uuid, accessory);
+      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      this.log.info(`Added accessory "${name}".`);
+    } else {
+      accessory.context.domain = 'camera'; // ensure a restored cached accessory is tagged
+      // Category is baked into the cached accessory. Turning `exposeCameraStreams` on for a
+      // camera that was first discovered as a plain sensor would otherwise leave it showing a
+      // sensor tile forever, because reuse skipped the constructor that sets this.
+      if (accessory.category !== category) {
+        accessory.category = category;
+        this.api.updatePlatformAccessories([accessory]);
+      }
+    }
+    return accessory;
+  }
+
+  /** Route a realtime event to the matching camera / object-sensor handler. */
+  private routeEvent(event: ProtectEvent): void {
+    // Decode once. This runs for every frame on the events feed, including the alarm hub's own
+    // events, so it is the one genuinely hot path in the plugin.
+    const detections = decodeCameraEvent(event);
+    if (detections.length === 0) {
+      this.noteUnhandledEvent(event);
+      return;
+    }
+    for (const d of detections) {
+      this.log.debug(`[camera] ${d.kind} ${d.active ? 'start' : 'end'} on ${d.deviceId}`);
+      if (d.kind === 'motion' || d.kind === 'ring') {
+        const handler = this.cameraHandlers.get(this.api.hap.uuid.generate(cameraKey(d.deviceId)));
+        if (!handler) {
+          this.noteUnroutedDetection(`${d.deviceId}:${d.kind}`, `${d.kind} from unknown camera ${d.deviceId}`);
+          continue;
+        }
+        // A ring from a camera we didn't detect as a doorbell would be silently dropped —
+        // warn once so the user can add it to "doorbellDeviceIds".
+        if (d.kind === 'ring' && d.active && !handler.canRing && !this.warnedRingDevices.has(d.deviceId)) {
+          this.warnedRingDevices.add(d.deviceId);
+          this.log.warn(`Ring from a camera not detected as a doorbell (${d.deviceId}); add it to "doorbellDeviceIds" to expose a doorbell.`);
+        }
+        handler.applyDetection(d.kind, d.active);
+      } else {
+        const objectHandler = this.objectHandlers.get(this.api.hap.uuid.generate(objectSensorKey(d.deviceId, d.kind)));
+        if (!objectHandler) {
+          this.noteUnroutedDetection(
+            `${d.deviceId}:${d.kind}`,
+            `"${d.kind}" detection from ${d.deviceId} has no sensor — the camera does not advertise that ` +
+              'detection type. Restart Homebridge if you just enabled it in Protect.',
+          );
+          continue;
+        }
+        objectHandler.applyDetection(d.active);
+      }
+    }
+  }
+
+  /**
+   * Record a camera event we produced nothing from — once per type, with the payload.
+   *
+   * Most are the alarm hub's own events sharing this feed, hence debug rather than warn. The
+   * point is diagnostic: a detection the user expects but never sees in HomeKit is otherwise
+   * indistinguishable from one Protect never sent, and this captures the real shape either way.
+   *
+   * The payload goes through `redactPayload` because these events are not ours and we do not
+   * control what they contain — alarm-hub entry events, which arrive on this very feed, carry
+   * the keypad PIN in `metadata.pin`, and debug logs end up in bug reports.
+   */
+  private noteUnhandledEvent(event: ProtectEvent): void {
+    const type = event.item?.type;
+    if (!type || this.seenUnhandledEvents.has(type)) {
+      return;
+    }
+    this.seenUnhandledEvents.add(type);
+    this.log.debug(`[events] no camera detection decoded from "${type}": ${redactPayload(event.item)}`);
+  }
+
+  /** A detection that decoded fine but has nowhere to go — a real gap, so warn (once). */
+  private noteUnroutedDetection(key: string, message: string): void {
+    if (this.warnedUnrouted.has(key)) {
+      return;
+    }
+    this.warnedUnrouted.add(key);
+    this.log.warn(message);
   }
 }

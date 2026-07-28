@@ -1,6 +1,7 @@
-// Typed shapes for the subset of the UniFi Protect Integration API we consume.
-// Reverse-engineered from a UDM-Pro on Protect 7.1.87. All fields
-// are optional/defensive because this is an undocumented, evolving API.
+// Typed shapes for the subset of the official UniFi Protect Integration API we consume.
+// Modelled from live responses on a UDM-Pro running Protect 7.1.87: the API is supported and
+// stable, but its schema is only partly documented, so every field here is optional and read
+// defensively — a firmware update that adds, renames, or omits one must not break the plugin.
 
 export type OnOff = 'on' | 'off';
 
@@ -60,4 +61,80 @@ export interface AlarmHub {
 /** Every accessory handler refreshes itself from the latest hub snapshot. */
 export interface AccessoryHandler {
   update(hub: AlarmHub, name: string): void;
+  /**
+   * Mark the accessory as unreliable when the console has been unreachable for a while, so
+   * HomeKit doesn't keep showing confidently-stale state (e.g. a door as "closed" when we
+   * can't actually tell). The next successful `update` restores real values.
+   */
+  markStale?(): void;
+}
+
+// ---- Cameras (official Integration API) ----
+// The `/cameras` object is metadata + settings only — no stream or channel information. Live
+// video comes from the separate RTSPS endpoint, and live detections from the events WebSocket;
+// see `RtspsStreams` and `ProtectEvent` below.
+
+/** Fields every Protect device carries; `Camera` extends it. */
+export interface ProtectDevice {
+  id: string;
+  modelKey: string;
+  name?: string;
+  mac?: string;
+  /** CONNECTED | ... (device reachability). */
+  state?: string;
+}
+
+export interface CameraFeatureFlags {
+  /** Object detections this camera supports: person | vehicle | animal | package. */
+  smartDetectTypes?: string[];
+  /** Audio detections: alrmSmoke | alrmCmonx | alrmBabyCry | alrmSpeak. */
+  smartDetectAudioTypes?: string[];
+  videoModes?: string[];
+  hasHdr?: boolean;
+  hasMic?: boolean;
+  hasSpeaker?: boolean;
+  hasLedStatus?: boolean;
+  supportFullHdSnapshot?: boolean;
+}
+
+export interface Camera extends ProtectDevice {
+  isMicEnabled?: boolean;
+  micVolume?: number;
+  videoMode?: string;
+  hdrType?: string;
+  hasPackageCamera?: boolean;
+  lcdMessage?: { type?: string; text?: string; resetAt?: number | null };
+  ledSettings?: { isEnabled?: boolean };
+  /** Which detections are currently enabled on the camera (subset of featureFlags). */
+  smartDetectSettings?: { objectTypes?: string[]; audioTypes?: string[] };
+  featureFlags?: CameraFeatureFlags;
+}
+
+/** RTSPS stream URLs by quality, from GET/POST /cameras/{id}/rtsps-stream. */
+export interface RtspsStreams {
+  high?: string;
+  medium?: string;
+  low?: string;
+  package?: string;
+}
+
+/**
+ * A semantic event from the `/subscribe/events` WebSocket — far richer than the thin
+ * `/subscribe/devices` deltas. `item.type` is the event kind (motion, smartDetectZone,
+ * ring, alarmHubEntryOpened, …); `item.device` is the source device id; smart detections
+ * carry `item.smartDetectTypes`.
+ */
+export interface ProtectEvent {
+  /** "add" | "update" */
+  type?: string;
+  item?: {
+    id?: string;
+    modelKey?: string;
+    type?: string;
+    start?: number;
+    end?: number;
+    device?: string;
+    smartDetectTypes?: string[];
+    metadata?: Record<string, unknown>;
+  };
 }

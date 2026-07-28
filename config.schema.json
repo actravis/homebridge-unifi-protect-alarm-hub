@@ -1,5 +1,5 @@
 {
-  "pluginAlias": "UnifiProtectAlarmHub",
+  "pluginAlias": "UnifiProtectIntegration",
   "pluginType": "platform",
   "singular": true,
   "headerDisplay": "**Quick setup**\n1. In UniFi OS → **Settings → Control Plane → Integrations**, create an **API Key** and paste it below.\n2. Enter your console's address (the same one you use for the UniFi web app).\n3. *(Optional, for arm/disarm)* In **Protect → Alarm Manager**, create webhook-triggered alarms with an **Arm** or **Disarm** action, and paste each **Trigger ID** below.\n4. Save & restart. Your zones, hub and outputs are discovered automatically.",
@@ -11,7 +11,7 @@
       "name": {
         "title": "Name",
         "type": "string",
-        "default": "UniFi Protect Alarm Hub",
+        "default": "UniFi Protect",
         "description": "Name shown for this platform in Homebridge logs."
       },
       "host": {
@@ -24,7 +24,8 @@
       "apiKey": {
         "title": "API Key",
         "type": "string",
-        "description": "Create it in UniFi OS → Settings → Control Plane → Integrations, then paste it here."
+        "format": "password",
+        "description": "Create it in UniFi OS → Settings → Control Plane → Integrations, then paste it here. This key grants console-wide access — treat it like a password."
       },
       "securityName": {
         "title": "Alarm tile name",
@@ -50,13 +51,25 @@
         "description": "Same, but Action = Disarm. Leave all three blank and the alarm tile shows status but can't be changed from HomeKit.",
         "pattern": "^$|^[0-9a-fA-F-]{8,}$"
       },
+      "exposeAlarm": {
+        "title": "Expose alarm accessories",
+        "type": "boolean",
+        "default": true,
+        "description": "Master switch for the alarm domain (security system, hub, zones, outputs, emergency input). Turn off to expose cameras only. Note: disabling does not remove accessories already added to HomeKit."
+      },
       "glassBreakAs": {
         "title": "Show glass-break sensors as",
         "type": "string",
         "default": "motion",
         "oneOf": [
-          { "title": "Motion sensor (recommended)", "enum": ["motion"] },
-          { "title": "Contact sensor", "enum": ["contact"] }
+          {
+            "title": "Motion sensor (recommended)",
+            "enum": ["motion"]
+          },
+          {
+            "title": "Contact sensor",
+            "enum": ["contact"]
+          }
         ],
         "description": "HomeKit has no native glass-break type."
       },
@@ -79,18 +92,58 @@
         "description": "Which output channel(s) mean a real alarm, for the \"triggered\" state (comma-separated, 1-indexed to match UniFi). Leave blank to treat any active output as triggered.",
         "pattern": "^\\s*$|^\\s*\\d+(\\s*,\\s*\\d+)*\\s*$"
       },
+      "exposeCameras": {
+        "title": "Expose cameras",
+        "type": "boolean",
+        "default": true,
+        "description": "Create a motion sensor (and a doorbell for doorbell cameras) per camera, driven by the realtime feed. If you also run another UniFi Protect plugin, disable its motion/doorbell to avoid duplicates."
+      },
+      "exposeObjectSensors": {
+        "title": "Expose smart-detection sensors",
+        "type": "boolean",
+        "default": true,
+        "description": "Add a separate motion sensor per smart-detect type each camera supports (person, vehicle, animal, package) for use in automations."
+      },
+      "exposeDoorbellTriggers": {
+        "title": "Add doorbell-trigger switches",
+        "type": "boolean",
+        "default": false,
+        "description": "Add a \"Doorbell Trigger\" switch to every camera. Flip it from an automation to ring the doorbell — e.g. when your driveway camera detects a vehicle. Any camera becomes ringable (gains a doorbell notification)."
+      },
+      "doorbellDeviceIds": {
+        "title": "Force these cameras to be doorbells",
+        "type": "array",
+        "items": {
+          "title": "Camera device ID",
+          "type": "string"
+        },
+        "description": "Optional. Doorbells are detected automatically; add a camera's device ID here if one is missed (the log names the ID when a ring arrives from a camera not detected as a doorbell)."
+      },
+      "exposeCameraStreams": {
+        "title": "Show cameras as HomeKit cameras",
+        "type": "boolean",
+        "default": true,
+        "description": "Attach a HomeKit camera to each camera: live video, snapshots, and snapshots in motion/doorbell notifications. Video is transcoded from the camera's RTSPS stream by ffmpeg. Camera audio is not streamed yet. Turn this off to expose cameras as motion sensors only (no ffmpeg, no video)."
+      },
       "refreshInterval": {
         "title": "Fallback refresh interval (seconds)",
         "type": "integer",
         "default": 10,
         "minimum": 2,
-        "description": "How often to re-check state when realtime updates are quiet. Lower is snappier but hits the console harder."
+        "description": "How often to re-check alarm state. While the realtime push feed is connected this is automatically backed off to 60 seconds (or this value, whichever is longer), since every change already arrives as a push; the full rate resumes if the feed drops. Only lower it if you run with realtime updates turned off."
       },
       "useRealtime": {
         "title": "Use realtime updates",
         "type": "boolean",
         "default": true,
         "description": "Recommended. Uses the console's push feed for ~1–2s updates, falling back to the interval above."
+      },
+      "realtimeIdleTimeout": {
+        "title": "Realtime idle timeout (seconds, 0 = off)",
+        "type": "integer",
+        "default": 0,
+        "minimum": 0,
+        "description": "Advanced. Force a reconnect if the realtime feed is silent this long. Off by default: this API sends no keepalives, so silence usually just means nothing happened, and dead connections are already caught by TCP keepalive. Only enable if your system has reliably frequent events and you want an extra backstop."
       },
       "trustSelfSignedCert": {
         "title": "Trust console certificate",
@@ -101,33 +154,72 @@
       "certificateSha256": {
         "title": "Pin certificate (SHA-256)",
         "type": "string",
-        "description": "Optional, most secure. Paste the console's certificate SHA-256 fingerprint (hex, colons optional) to pin it. When set, only that exact certificate is accepted and the setting above is ignored.",
-        "pattern": "^$|^[0-9a-fA-F:]{47,95}$"
+        "description": "Optional, most secure. Paste the console's certificate SHA-256 fingerprint (64 hex characters, colons optional) to pin it. When set, only that exact certificate is accepted and the setting above is ignored. A malformed value stops the plugin rather than silently falling back to no pinning.",
+        "pattern": "^$|^([0-9a-fA-F]{2}:){31}[0-9a-fA-F]{2}$|^[0-9a-fA-F]{64}$"
       }
     }
   },
   "layout": [
-    { "type": "fieldset", "title": "Connection", "expandable": false, "items": ["host", "apiKey"] },
+    {
+      "type": "fieldset",
+      "title": "Connection",
+      "expandable": false,
+      "items": [
+        "host",
+        "apiKey"
+      ]
+    },
     {
       "type": "fieldset",
       "title": "Arm / Disarm (optional)",
       "expandable": true,
       "expanded": true,
-      "items": ["securityName", "armAwayTriggerId", "armNightTriggerId", "disarmTriggerId"]
+      "items": [
+        "securityName",
+        "armAwayTriggerId",
+        "armNightTriggerId",
+        "disarmTriggerId"
+      ]
     },
     {
       "type": "fieldset",
       "title": "Sensors",
       "expandable": true,
       "expanded": false,
-      "items": ["glassBreakAs", "exposeOutputs", "exposeEmergencyInput", "sirenOutputChannels"]
+      "items": [
+        "exposeAlarm",
+        "glassBreakAs",
+        "exposeOutputs",
+        "exposeEmergencyInput",
+        "sirenOutputChannels"
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Cameras",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        "exposeCameras",
+        "exposeObjectSensors",
+        "exposeDoorbellTriggers",
+        "exposeCameraStreams",
+        "doorbellDeviceIds"
+      ]
     },
     {
       "type": "fieldset",
       "title": "Advanced",
       "expandable": true,
       "expanded": false,
-      "items": ["refreshInterval", "useRealtime", "trustSelfSignedCert", "certificateSha256", "name"]
+      "items": [
+        "refreshInterval",
+        "useRealtime",
+        "realtimeIdleTimeout",
+        "trustSelfSignedCert",
+        "certificateSha256",
+        "name"
+      ]
     }
   ]
 }
