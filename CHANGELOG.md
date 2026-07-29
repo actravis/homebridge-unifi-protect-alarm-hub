@@ -30,7 +30,17 @@ side gained a substantial round of reliability and security work.
   up within a few minutes, with no restart.
 - **Offline cameras are marked unavailable** rather than left serving a stale picture, and stop
   being polled for snapshots — one unreachable camera used to be enough to overload the console.
-- New options: `exposeCameras`, `exposeObjectSensors`, `exposeCameraStreams`,
+- **Camera audio in the live stream (experimental, off by default).** Enable with
+  `exposeCameraAudio`. The plugin probes ffmpeg at startup by actually running the encoder and
+  picks the best codec HomeKit accepts — AAC-ELD where available, otherwise Opus — and logs which
+  it chose, or falls back to video-only if neither works.
+- **Smoke and CO alarm sensors (experimental, off by default).** Protect's cameras can recognise a
+  sounding smoke or CO alarm; those detections now become **native** HomeKit `SmokeSensor` and
+  `CarbonMonoxideSensor` accessories rather than generic motion sensors, so a sounding alarm is a
+  first-class automation trigger and can raise a Home hub critical notification. Only detections
+  you have enabled in Protect are exposed. Enable with `exposeAudioSensors`.
+- New options: `exposeCameras`, `exposeObjectSensors`, `exposeAudioSensors`, `exposeCameraStreams`,
+  `exposeCameraAudio`,
   `exposeDoorbellTriggers`, `doorbellDeviceIds`, `exposeAlarm` (for a cameras-only setup), and
   `realtimeIdleTimeout`.
 - ffmpeg is supplied automatically via the optional `ffmpeg-for-homebridge` dependency, falling
@@ -41,6 +51,16 @@ side gained a substantial round of reliability and security work.
 - **The security tile no longer reports an illegal state.** With only an arm trigger configured
   and no disarm trigger, every refresh while disarmed wrote a target value outside the tile's
   allowed set, producing a repeated HomeKit warning.
+- **Smart audio detections were being dropped entirely.** Protect names these events
+  `smartAudioDetect`, which did not match the `smartDetect` prefix the decoder tested for, so
+  every smoke and CO alarm detection was discarded silently. The decoder now matches the whole
+  `smart*` family and reads whatever detection types the payload carries, so a variant Protect
+  adds in future arrives working rather than absent.
+- **Camera audio timestamps stay monotonic.** The RTSP source intermittently delivers an audio
+  packet whose timestamp precedes the previous one; measured on an HEVC camera, 2 of 5 stream starts
+  logged "Non-monotonic DTS" and the muxer silently rewrote the timestamp, which risks audio drifting
+  out of sync over a long viewing session. An `aresample` filter now realigns the audio timeline
+  instead. Zero occurrences across 8 subsequent runs, with no change in audio delivered.
 - **A dropped realtime connection reconnects once, not twice.** A single drop emits both `error`
   and `close`, and each was starting its own reconnect loop — two connections racing to reopen,
   which the console's rate limiter then punished.
@@ -56,6 +76,11 @@ side gained a substantial round of reliability and security work.
   UI still showed a pin configured. It now refuses to start with a clear error.
 - **TLS verification defaults to on** inside the API client. The plugin always passed an explicit
   value, so behaviour is unchanged — but the unsafe default is gone.
+- **Detection-type lookups are no longer vulnerable to prototype pollution.** Detection and zone
+  type names come from the console and were used as plain-object keys, so a type named `constructor`
+  or `toString` resolved to a function off `Object.prototype`. Camera discovery iterates that result,
+  meaning a single such name would abort discovery and leave **no cameras at all**; the accessory
+  labeller would have used a function's source text as a HomeKit name. Both tables are now Maps.
 - **Arm-profile memory is no longer vulnerable to prototype pollution.** The learned profile map
   is keyed by fingerprints derived from console-supplied channel data; a zone named `__proto__`
   or `constructor` could previously make a lookup return an inherited value and write it
@@ -67,6 +92,11 @@ side gained a substantial round of reliability and security work.
 
 ### Changed
 
+- **Frame rate is capped, not targeted.** HomeKit's requested fps is a maximum, but `-r` treated it
+  as a goal: against a 24fps camera ffmpeg invented six frames a second to reach 30, costing 25%
+  extra encoding and making motion judder because the duplicates landed at irregular intervals. The
+  `-fpsmax` flag this uses only exists in ffmpeg 5.1+, so support is probed at runtime and the flag
+  omitted on older builds — where an unknown option is a hard error that would fail every stream.
 - **The fallback poll backs off while the realtime feed is connected**, from every 10s to every
   60s, returning to the configured rate the moment the feed drops. With the push feed up every
   change already arrives in ~1–2s, so this removes roughly 8,600 redundant requests a day

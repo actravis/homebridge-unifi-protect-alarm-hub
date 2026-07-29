@@ -104,6 +104,12 @@
         "default": true,
         "description": "Add a separate motion sensor per smart-detect type each camera supports (person, vehicle, animal, package) for use in automations."
       },
+      "exposeAudioSensors": {
+        "title": "Expose smoke / CO alarm sensors (experimental)",
+        "type": "boolean",
+        "default": false,
+        "description": "Adds a native HomeKit smoke and/or carbon-monoxide sensor per camera, driven by Protect’s audio detection — it reports that the camera HEARD an alarm, and is not a detector itself. Useful because a sounding alarm then becomes a HomeKit trigger (lights on, notifications). Only detections you have enabled in Protect are exposed. Experimental: the event shape has not yet been confirmed on real hardware, so if your alarm sounds and the sensor stays clear, please report it with debug logging on."
+      },
       "exposeDoorbellTriggers": {
         "title": "Add doorbell-trigger switches",
         "type": "boolean",
@@ -124,6 +130,12 @@
         "type": "boolean",
         "default": true,
         "description": "Attach a HomeKit camera to each camera: live video, snapshots, and snapshots in motion/doorbell notifications. Video is transcoded from the camera's RTSPS stream by ffmpeg. Camera audio is not streamed yet. Turn this off to expose cameras as motion sensors only (no ffmpeg, no video)."
+      },
+      "exposeCameraAudio": {
+        "title": "Stream camera audio (experimental)",
+        "type": "boolean",
+        "default": false,
+        "description": "Include the camera microphone in the live stream. Needs an ffmpeg that can encode a codec HomeKit accepts — AAC-ELD (libfdk_aac) or Opus (libopus); the bundled ffmpeg provides Opus. The plugin tests this at startup and logs which codec it chose, or falls back to video-only if neither works. Experimental: audio changes how iOS negotiates the stream, so if live view stops working, turn this off first."
       },
       "refreshInterval": {
         "title": "Fallback refresh interval (seconds)",
@@ -202,8 +214,10 @@
       "items": [
         "exposeCameras",
         "exposeObjectSensors",
+        "exposeAudioSensors",
         "exposeDoorbellTriggers",
         "exposeCameraStreams",
+        "exposeCameraAudio",
         "doorbellDeviceIds"
       ]
     },

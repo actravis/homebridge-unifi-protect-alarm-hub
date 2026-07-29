@@ -6,13 +6,20 @@ import {
   buildVideoArgs,
   effectiveBitrateKbps,
   encodeSrtpParams,
+  opusFrameDuration,
   pickRtspsUrl,
   selectStreamQuality,
 } from '../dist/streaming/ffmpegArgs.js';
 
-test('selectStreamQuality maps requested width to a substream', () => {
+// Substream choice is a latency/CPU trade-off settled by measurement, not by pixel counting.
+// `medium` matches HomeKit's 720p request exactly and is ~4.4x cheaper to decode, but every
+// substream has a 5s keyframe interval and only the primary stream serves a cached keyframe on
+// connect. Time to first packet, 5 runs each: high 1370-1683ms consistently; medium 1364-1390ms
+// three times and 5611/5677ms twice. A predictable join beats a cheaper decode.
+test('selectStreamQuality prefers the substream that joins predictably fast', () => {
   assert.equal(selectStreamQuality(1920), 'high');
-  assert.equal(selectStreamQuality(1280), 'high');
+  assert.equal(selectStreamQuality(1280), 'high', 'medium matches 720p but risks a 4s GOP wait');
+  // Below 720p the request is far under native, so a smaller source costs nothing in latency terms.
   assert.equal(selectStreamQuality(1024), 'medium');
   assert.equal(selectStreamQuality(640), 'medium');
   assert.equal(selectStreamQuality(480), 'low');
@@ -66,8 +73,18 @@ test('buildVideoArgs: sets encoder, scale, bitrate caps and forced keyframes', (
   assert.match(a, /-b:v 800k/);
   assert.match(a, /-maxrate 800k/);
   assert.match(a, /-bufsize 1600k/);
-  assert.match(a, /-r 30/);
+  assert.match(a, /-fpsmax 30/);
   assert.match(a, /-force_key_frames expr:gte\(t,n_forced\*1\)/); // HomeKit fast-join
+});
+
+// REGRESSION: `-r 30` treats HomeKit's MAXIMUM fps as a target, so a 24fps camera got 6 invented
+// frames per second — 25% wasted encoding, and judder because duplicates land at irregular
+// intervals. Measured in a live log: `dup` climbing to 97 over 15s on a 24fps camera while a
+// 30fps camera held at 2. `-fpsmax` caps without upsampling.
+test('buildVideoArgs: caps fps without duplicating frames on a slower camera', () => {
+  const a = buildVideoArgs({ ...base }).join(' ');
+  assert.match(a, /-fpsmax 30/);
+  assert.doesNotMatch(a, /(^| )-r 30/, '-r would upsample a 24fps source to 30fps');
 });
 
 // REGRESSION GUARD — the bug that made live view never render. `-tune zerolatency` turns on
@@ -181,4 +198,87 @@ test('pickRtspsUrl rejects non-RTSPS values from the API', () => {
   assert.equal(pickRtspsUrl({ high: 42 }, 'high'), undefined);
   // A plain rtsp:// URL is still acceptable.
   assert.equal(pickRtspsUrl({ high: 'rtsp://10.0.0.1:7447/k' }, 'high'), 'rtsp://10.0.0.1:7447/k');
+});
+
+// --- Audio output ------------------------------------------------------------
+
+const audio = (over = {}) => ({
+  encoder: 'libopus', sampleRateHz: 16000, bitrateKbps: 24,
+  payloadType: 110, ssrc: 222, srtpParams: 'AUDIOSRTP', port: 50002, ...over,
+});
+
+test('buildVideoArgs: video-only strips the source audio', () => {
+  const a = buildVideoArgs({ ...base }).join(' ');
+  assert.match(a, /-an/);
+  assert.doesNotMatch(a, /libopus|libfdk_aac/);
+  assert.equal(a.match(/-f rtp/g).length, 1, 'exactly one output');
+});
+
+test('buildVideoArgs: audio adds a SECOND SRTP output with its own keys and SSRC', () => {
+  const a = buildVideoArgs({ ...base, audio: audio() }).join(' ');
+  assert.doesNotMatch(a, /-an/, 'audio must not be stripped when we intend to send it');
+  assert.equal(a.match(/-f rtp/g).length, 2, 'video + audio outputs');
+  assert.match(a, /-codec:a libopus/);
+  assert.match(a, /-payload_type 110 -ssrc 222/);
+  assert.match(a, /-srtp_out_params AUDIOSRTP/);
+  // HomeKit treats the streams independently, so audio has its own port and small packets.
+  assert.match(a, /srtp:\/\/10\.0\.0\.2:50002\?rtcpport=50002&pkt_size=188/);
+  assert.match(a, /-ac 1/, 'HomeKit camera audio is mono');
+  assert.match(a, /-ar 16000/);
+});
+
+// Some Protect cameras publish no audio track. A non-optional map makes ffmpeg exit at once,
+// killing the VIDEO stream over a missing microphone.
+// The RTSP source intermittently delivers an audio packet whose timestamp precedes the previous
+// one; measured on an HEVC camera, 2 of 5 stream starts logged "Non-monotonic DTS" and the muxer
+// silently rewrote the timestamp. aresample realigns by filling/trimming instead. `first_pts=0` is
+// deliberately absent: zeroing only the audio stream's start would create a lip-sync offset.
+test('buildVideoArgs: keeps the audio timeline monotonic', () => {
+  const a = buildVideoArgs({ ...base, audio: audio() }).join(' ');
+  assert.match(a, /-filter:a aresample=async=1(?![\d])/);
+  assert.doesNotMatch(a, /first_pts/);
+});
+
+test('buildVideoArgs: no audio filter on a video-only stream', () => {
+  assert.doesNotMatch(buildVideoArgs({ ...base }).join(' '), /-filter:a/);
+});
+
+test('buildVideoArgs: the audio mapping is optional so a mic-less camera still streams video', () => {
+  assert.match(buildVideoArgs({ ...base, audio: audio() }).join(' '), /-map 0:a:0\?/);
+});
+
+// Cameras publish several streams (observed live: two audio tracks then the video at index 2), so
+// each output must select explicitly or ffmpeg's defaults put audio into the video output.
+test('buildVideoArgs: each output selects its stream explicitly', () => {
+  const a = buildVideoArgs({ ...base, audio: audio() }).join(' ');
+  assert.match(a, /-map 0:v:0/);
+  assert.match(a, /-map 0:a:0\?/);
+});
+
+test('buildVideoArgs: AAC-ELD asks for the ELD profile specifically', () => {
+  const a = buildVideoArgs({ ...base, audio: audio({ encoder: 'libfdk_aac' }) }).join(' ');
+  assert.match(a, /-codec:a libfdk_aac/);
+  assert.match(a, /-profile:a aac_eld/, 'plain AAC is not a codec HomeKit accepts');
+  assert.doesNotMatch(a, /-application lowdelay/, 'that is an Opus option');
+});
+
+// REGRESSION: HomeKit commonly asks for packet_time 30, which libopus rejects outright ("Invalid
+// frame duration: 30") — and that failure kills the whole process, video included. Caught against
+// real hardware, not in review.
+test('opusFrameDuration snaps to a duration libopus accepts, never rounding up', () => {
+  assert.equal(opusFrameDuration(30), 20, "HomeKit's usual request must be snapped down");
+  assert.equal(opusFrameDuration(20), 20);
+  assert.equal(opusFrameDuration(60), 60);
+  assert.equal(opusFrameDuration(45), 40);
+  assert.equal(opusFrameDuration(undefined), 20);
+  assert.equal(opusFrameDuration(1), 2.5, 'below the minimum, clamp up to the smallest legal value');
+  for (const ms of [1, 7, 20, 30, 45, 55, 60, 100, 1000]) {
+    assert.ok([2.5, 5, 10, 20, 40, 60].includes(opusFrameDuration(ms)), `illegal duration for ${ms}`);
+  }
+});
+
+test('buildVideoArgs: Opus frame duration is always a legal value', () => {
+  const a = buildVideoArgs({ ...base, audio: audio({ packetTimeMs: 30 }) }).join(' ');
+  assert.match(a, /-frame_duration 20/);
+  assert.doesNotMatch(a, /-frame_duration 30/);
 });

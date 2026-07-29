@@ -66,3 +66,37 @@ test('resolveFfmpegPath returns a usable path whether or not the bundle is insta
   assert.ok(path.length > 0);
   assert.ok(path === 'ffmpeg' || path.includes('ffmpeg'), `unexpected ffmpeg path: ${path}`);
 });
+
+// --- Audio declaration -------------------------------------------------------
+// The controller ADVERTISES a codec and the delegate SENDS it. If they disagree in the direction
+// of "advertised but never sent", iOS waits for audio that never arrives and refuses to render the
+// VIDEO either — so this is the one invariant worth asserting explicitly.
+
+const withAudio = (codec) => buildCameraController(hap, 'd', codec).config.streamingOptions.audio;
+
+test('no audio is advertised when no codec was probed', () => {
+  assert.equal(withAudio(undefined), undefined, 'advertising audio we cannot send breaks video');
+});
+
+test('a probed codec is advertised with the parameters the delegate can deliver', () => {
+  const audio = withAudio({ encoder: 'libopus', hapCodec: 'OPUS' });
+  assert.ok(audio, 'a probed codec must be advertised or iOS never sends audio parameters');
+  assert.equal(audio.codecs.length, 1);
+  assert.equal(audio.codecs[0].type, 'OPUS');
+  assert.equal(audio.codecs[0].audioChannels, 1, 'HomeKit camera audio is mono');
+  // Only rates the encoder was verified against on real hardware.
+  assert.deepEqual(audio.codecs[0].samplerate, [16, 24]);
+});
+
+test('AAC-ELD is advertised under its HAP name, not the ffmpeg encoder name', () => {
+  const audio = withAudio({ encoder: 'libfdk_aac', hapCodec: 'AAC-eld' });
+  assert.equal(audio.codecs[0].type, 'AAC-eld');
+  // A common slip: advertising "libfdk_aac", which HomeKit does not recognise.
+  assert.doesNotMatch(JSON.stringify(audio), /libfdk|libopus/);
+});
+
+// twoWayAudio is what enables talkback; it must stay off until the reverse path exists, or the
+// Home app offers a microphone button that does nothing.
+test('two-way audio is not claimed while talkback is unimplemented', () => {
+  assert.notEqual(withAudio({ encoder: 'libopus', hapCodec: 'OPUS' })?.twoWayAudio, true);
+});

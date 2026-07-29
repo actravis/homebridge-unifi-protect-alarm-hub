@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { CameraAccessory, ObjectSensorAccessory } from '../dist/accessories/camera.js';
+import { AlarmSensorAccessory, CameraAccessory, ObjectSensorAccessory } from '../dist/accessories/camera.js';
 import { Service, Characteristic as C, FakeAccessory, makePlatform } from './helpers/hap-mock.mjs';
 
 /** Fake timers that record scheduled callbacks so tests can fire the safety-clear on demand. */
@@ -204,4 +204,57 @@ test('ObjectSensorAccessory: detection drives MotionDetected and safety-clears',
   assert.equal(svc.value(C.MotionDetected), true);
   t.fireLast();
   assert.equal(svc.value(C.MotionDetected), false);
+});
+
+// --- Audio alarm sensors -----------------------------------------------------
+// Smoke/CO use their NATIVE HomeKit services rather than motion sensors, because only those are
+// first-class automation triggers and earn a Home hub critical notification.
+
+test('AlarmSensorAccessory: smoke uses SmokeSensor with the right enum values', () => {
+  const t = fakeTimers();
+  const acc = new FakeAccessory('Front Door Smoke Alarm', 'u', 0);
+  const s = new AlarmSensorAccessory(
+    makePlatform(), acc, { name: 'Front Door Smoke Alarm', serial: 'AA:smoke', kind: 'smoke' }, t);
+  const svc = acc.getService(Service.SmokeSensor);
+  assert.ok(svc, 'a native SmokeSensor service is created');
+  assert.equal(acc.getService(Service.MotionSensor), undefined, 'not a motion sensor');
+  assert.equal(svc.value(C.SmokeDetected), C.SmokeDetected.SMOKE_NOT_DETECTED);
+
+  s.applyDetection(true);
+  assert.equal(svc.value(C.SmokeDetected), C.SmokeDetected.SMOKE_DETECTED);
+  s.applyDetection(false);
+  assert.equal(svc.value(C.SmokeDetected), C.SmokeDetected.SMOKE_NOT_DETECTED);
+});
+
+test('AlarmSensorAccessory: CO uses CarbonMonoxideSensor', () => {
+  const t = fakeTimers();
+  const acc = new FakeAccessory('Front Door CO Alarm', 'u', 0);
+  const s = new AlarmSensorAccessory(
+    makePlatform(), acc, { name: 'Front Door CO Alarm', serial: 'AA:co', kind: 'carbonMonoxide' }, t);
+  const svc = acc.getService(Service.CarbonMonoxideSensor);
+  assert.ok(svc);
+  assert.equal(acc.getService(Service.SmokeSensor), undefined);
+  s.applyDetection(true);
+  assert.equal(svc.value(C.CarbonMonoxideDetected), C.CarbonMonoxideDetected.CO_LEVELS_ABNORMAL);
+});
+
+// A latched alarm sensor would keep re-firing automations forever if the end event were lost.
+test('AlarmSensorAccessory: auto-clears if the end event never arrives', () => {
+  const t = fakeTimers();
+  const acc = new FakeAccessory('Smoke', 'u', 0);
+  const s = new AlarmSensorAccessory(makePlatform(), acc, { name: 'Smoke', serial: 'AA', kind: 'smoke' }, t);
+  s.applyDetection(true);
+  t.fireLast();
+  assert.equal(acc.getService(Service.SmokeSensor).value(C.SmokeDetected), C.SmokeDetected.SMOKE_NOT_DETECTED);
+});
+
+test('AlarmSensorAccessory: an offline camera deactivates and clears the sensor', () => {
+  const t = fakeTimers();
+  const acc = new FakeAccessory('Smoke', 'u', 0);
+  const s = new AlarmSensorAccessory(makePlatform(), acc, { name: 'Smoke', serial: 'AA', kind: 'smoke' }, t);
+  const svc = acc.getService(Service.SmokeSensor);
+  s.applyDetection(true);
+  s.setOnline(false);
+  assert.equal(svc.value(C.StatusActive), false);
+  assert.equal(svc.value(C.SmokeDetected), C.SmokeDetected.SMOKE_NOT_DETECTED);
 });

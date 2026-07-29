@@ -45,7 +45,34 @@ export function effectiveBitrateKbps(requestedKbps: number, width: number): numb
   return Math.max(requestedKbps, floor);
 }
 
-/** Pick which RTSPS substream to pull for a HomeKit-requested width. */
+/**
+ * Pick which RTSPS substream to pull for a HomeKit-requested width.
+ *
+ * Prefers the LARGER stream even when a smaller one matches the request exactly, because Protect's
+ * substreams differ in how fast they can be joined — and join time is what a user actually feels.
+ *
+ * Measured geometry:
+ *
+ *   camera type       high              medium           low
+ *   16:9 (2688x1512)  2688x1512 @24     1280x720 @24     640x360 @24
+ *   4:3  doorbell     1600x1200 @30      960x720 @30     480x360 @15
+ *
+ * `medium` looks like the obvious choice for HomeKit's usual 1280x720 request, and it is ~4.4x
+ * cheaper to decode. It was tried, and it cost four seconds of latency: every substream has a
+ * 5-second keyframe interval, and ffmpeg cannot emit anything until it decodes one. Time to first
+ * SRTP packet, five runs each on the same camera:
+ *
+ *   high    1370  1400  1420  1428  1683 ms   — always fast
+ *   medium  1364  1370  1390  5611  5677 ms   — a coin flip on waiting a whole GOP
+ *
+ * Protect evidently serves a cached keyframe when you open the primary stream (it is the one being
+ * recorded) but not on the substreams, so `medium` means waiting for the next natural IDR. Paying
+ * CPU for a predictable ~1.4s join is the right trade; the way to claw the CPU back is hardware
+ * encoding, not a cheaper source.
+ *
+ * Below 720p the smaller substreams are still worth using: the request is already far below the
+ * native resolution, so nothing is gained by decoding the full-size frame.
+ */
 export function selectStreamQuality(requestedWidth: number): StreamQuality {
   if (requestedWidth >= 1280) {
     return 'high';
@@ -72,6 +99,25 @@ export function selectStreamQuality(requestedWidth: number): StreamQuality {
  */
 export function buildScaleFilter(width: number, height: number): string {
   return `scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`;
+}
+
+/** Everything needed to emit HomeKit's audio stream alongside the video one. */
+export interface AudioArgsOptions {
+  /** ffmpeg encoder chosen by probing this ffmpeg build (see audioCodec.ts). */
+  encoder: 'libfdk_aac' | 'libopus';
+  /** HomeKit's negotiated sample rate, in Hz (it reports kHz; the delegate multiplies). */
+  sampleRateHz: number;
+  bitrateKbps: number;
+  /** RTP payload type HomeKit negotiated for audio. */
+  payloadType: number;
+  ssrc: number;
+  /** Base64 of the AUDIO master key + salt — distinct from the video stream's. */
+  srtpParams: string;
+  /** HomeKit's audio port on the phone, and the port we advertised for its RTCP. */
+  port: number;
+  localRtcpPort?: number;
+  /** Frame duration HomeKit asked for, in ms. */
+  packetTimeMs?: number;
 }
 
 export interface VideoArgsOptions {
@@ -102,10 +148,38 @@ export interface VideoArgsOptions {
   mtu: number;
   /** Video encoder for transcoding (e.g. 'h264_videotoolbox'); defaults to software libx264. */
   encoder?: string;
+  /**
+   * Emit `-fpsmax` to cap the frame rate. False for an ffmpeg that predates it (< 5.1), where the
+   * flag is a hard error; the source's own rate then passes through, which is the desired result
+   * for every Protect camera anyway. See ffmpegFeatures.ts.
+   */
+  capFps?: boolean;
+  /** Present only when camera audio is enabled AND this ffmpeg can encode a HomeKit codec. */
+  audio?: AudioArgsOptions;
 }
 
 /** Give up on a silent RTSP source after this long (ffmpeg wants microseconds). */
 const RTSP_IO_TIMEOUT_US = 10_000_000;
+
+/** RTP payload size for the audio stream. HomeKit expects small audio packets. */
+const AUDIO_PKT_SIZE = 188;
+
+/**
+ * Frame durations libopus will accept, in ms. HomeKit's `packet_time` is NOT drawn from this set —
+ * it commonly asks for 30ms, which libopus rejects outright ("Invalid frame duration: 30"), and
+ * that failure kills the whole ffmpeg process, taking the video stream down with the audio.
+ */
+const OPUS_FRAME_DURATIONS = [2.5, 5, 10, 20, 40, 60];
+
+/**
+ * Snap HomeKit's requested packet time to a duration libopus supports, never rounding UP: a
+ * longer frame than requested would add latency HomeKit did not budget for.
+ */
+export function opusFrameDuration(requestedMs: number | undefined): number {
+  const wanted = requestedMs ?? 20;
+  const allowed = OPUS_FRAME_DURATIONS.filter((d) => d <= wanted);
+  return allowed.length ? Math.max(...allowed) : OPUS_FRAME_DURATIONS[0]!;
+}
 
 /** HAP H264Profile enum (0/1/2) → ffmpeg `-profile:v` name. */
 const H264_PROFILE_NAMES = ['baseline', 'main', 'high'];
@@ -121,11 +195,12 @@ const H264_LEVEL_NAMES = ['3.1', '3.2', '4.0'];
  * ffmpeg has opened the stream. Adding it means probing the source first, so it stays a
  * follow-up rather than an unreachable branch here.
  *
- * Video-only by design for now. HomeKit negotiates an audio codec regardless (hap-nodejs fakes
- * one when `streamingOptions.audio` is omitted) and renders video fine without audio packets —
- * verified against the canonical hap-nodejs example camera, which is also video-only. Adding
- * camera audio later means shipping three things together: the `streamingOptions.audio` codec,
- * an `audio` block in the PrepareStreamResponse, and a second AAC-ELD SRTP output here.
+ * Audio is emitted as a SECOND SRTP output when `o.audio` is present, with its own port, SSRC
+ * and SRTP keys — HomeKit treats the two streams as independent. Audio only works if all three
+ * of these ship together: the codec declared in `streamingOptions.audio`, an `audio` block in the
+ * PrepareStreamResponse, and this output. Declaring a codec and then sending no packets makes iOS
+ * wait for audio and refuse to render the VIDEO too, so `o.audio` must be absent unless the other
+ * two are also in place.
  */
 export function buildVideoArgs(o: VideoArgsOptions): string[] {
   const args = [
@@ -145,24 +220,50 @@ export function buildVideoArgs(o: VideoArgsOptions): string[] {
     // demuxer rejects outright ("Option not found"), which fails every stream. Verified live.
     '-timeout', String(RTSP_IO_TIMEOUT_US),
     '-i', o.rtspsUrl,
-    '-an', '-sn', '-dn',
+    // Never carry subtitle or data streams through; they have no HomeKit representation.
+    '-sn', '-dn',
   ];
+
+  // Video output. `-map` becomes necessary once there is a second output: without it ffmpeg's
+  // default stream selection would put the camera's audio track into the video output too.
+  args.push('-map', '0:v:0');
+  if (!o.audio) {
+    args.push('-an'); // video-only: drop the source's audio rather than transcode it for nothing
+  }
 
   args.push(
     '-codec:v', o.encoder ?? 'libx264',
     '-pix_fmt', 'yuv420p',
     '-color_range', 'mpeg',
-    '-r', String(o.fps),
+    // `-fpsmax`, NOT `-r`. HomeKit's fps is a MAXIMUM, and `-r` treats it as a target: against a
+    // 24fps camera it duplicates frames to reach 30 (observed live: `dup` climbing steadily, ~6
+    // duplicates a second). That costs 25% more encoding work than the source contains AND makes
+    // motion judder, because the duplicates land at irregular intervals. Capping instead passes
+    // the source's own cadence through untouched and only intervenes if a camera exceeds the rate.
+    // HomeKit's fps is a MAXIMUM, and `-r` treats it as a target: on a 24fps camera ffmpeg
+    // duplicated six frames a second to reach 30, which wasted a quarter of the encoding work and
+    // made motion judder because the duplicates landed at irregular intervals.
+    ...(o.capFps === false ? [] : ['-fpsmax', String(o.fps)]),
     // `superfast`, NOT `ultrafast`: ultrafast hard-disables CABAC/8x8dct and forces a
     // Constrained Baseline stream regardless of `-profile:v`, so it cannot satisfy the High
-    // profile HomeKit negotiates. superfast keeps both, at ~the same throughput
-    // (measured ~32x vs ~33x realtime).
+    // profile HomeKit negotiates.
+    //
+    // Software encoding is deliberate, not a fallback. Hardware encoding was measured on Apple
+    // Silicon against a real 20s camera clip, transcoding flat out to 720p:
+    //
+    //   libx264 -preset superfast   25.3x realtime   5.83 CPU-seconds
+    //   h264_videotoolbox           11.2x realtime   3.84 CPU-seconds
+    //   h264_videotoolbox -realtime  4.8x realtime   4.16 CPU-seconds
+    //
+    // libx264 is more than twice as fast in throughput and needs ~0.29 of one core to sustain a
+    // live stream, against ~0.19 for VideoToolbox — a saving too small to justify an encoder whose
+    // bitstream has never been shown to render on iOS, given how much time a non-rendering stream
+    // has cost this project before. 25x headroom means CPU is not the constraint.
     '-preset', 'superfast',
-    // Deliberately NOT `-tune zerolatency`. It enables x264 sliced-threads (one slice-NAL per
-    // CPU core per frame) and iOS silently refuses to display the result — this was the cause
-    // of a long-running "stream never renders / Not Responding" bug, bisected flag by flag.
-    // The part actually worth keeping from zerolatency is "no B-frames" (B-frame reordering
-    // makes iOS show only keyframes, i.e. an ~8s stutter), so set that directly.
+    // Deliberately NOT `-tune zerolatency`. It enables x264 sliced-threads (one slice-NAL per CPU
+    // core per frame) and iOS silently refuses to display the result — the cause of a long-running
+    // "stream never renders" bug, bisected flag by flag. The part worth keeping from it is "no
+    // B-frames" (reordering makes iOS show only keyframes, an ~8s stutter), so set that directly.
     '-bf', '0',
     // Emit an IDR (with SPS/PPS) every second so a HomeKit client joining mid-GOP starts
     // decoding promptly instead of waiting out libx264's default ~250-frame keyframe interval.
@@ -185,5 +286,45 @@ export function buildVideoArgs(o: VideoArgsOptions): string[] {
     '-srtp_out_params', o.srtpParams,
     `srtp://${o.address}:${o.videoPort}?${localRtcp}rtcpport=${o.videoPort}&pkt_size=${o.mtu}`,
   );
+
+  if (o.audio) {
+    const a = o.audio;
+    const audioRtcp = a.localRtcpPort ? `localrtcpport=${a.localRtcpPort}&` : '';
+    args.push(
+      // `0:a:0?` — the trailing question mark makes the mapping OPTIONAL. Some Protect cameras
+      // publish no audio track at all, and a non-optional map would make ffmpeg exit immediately,
+      // taking the video stream down with it over a missing microphone.
+      '-map', '0:a:0?',
+      // Keep the audio timeline monotonic. The RTSP source occasionally hands ffmpeg a packet
+      // whose timestamp precedes the previous one — measured on an HEVC camera, 2 of 5 stream
+      // starts produced "Queue input is backward in time" and "Non-monotonic DTS", which the
+      // muxer papers over by rewriting the timestamp. `async=1` lets the resampler fill or trim
+      // to realign instead, which eliminated it across every run at no cost in audio packets.
+      //
+      // Deliberately NOT `first_pts=0`: forcing the audio stream to start at zero while video
+      // keeps its own timestamps would introduce a lip-sync offset to fix a warning.
+      '-filter:a', 'aresample=async=1',
+      '-codec:a', a.encoder,
+      '-ac', '1', // HomeKit camera audio is mono
+      '-ar', String(a.sampleRateHz),
+      '-b:a', `${a.bitrateKbps}k`,
+    );
+    if (a.encoder === 'libfdk_aac') {
+      // AAC-ELD is a distinct profile, not just AAC at low latency; iOS negotiates it by name.
+      args.push('-profile:a', 'aac_eld');
+    } else {
+      // Opus fallback: ask for the low-delay mode and match HomeKit's requested frame duration,
+      // or the decoder and encoder disagree about packet boundaries.
+      args.push('-application', 'lowdelay', '-frame_duration', String(opusFrameDuration(a.packetTimeMs)));
+    }
+    args.push(
+      '-payload_type', String(a.payloadType),
+      '-ssrc', String(a.ssrc),
+      '-f', 'rtp',
+      '-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80',
+      '-srtp_out_params', a.srtpParams,
+      `srtp://${o.address}:${a.port}?${audioRtcp}rtcpport=${a.port}&pkt_size=${AUDIO_PKT_SIZE}`,
+    );
+  }
   return args;
 }

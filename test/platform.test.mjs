@@ -519,3 +519,91 @@ test('restored cached accessories are reused rather than registered again', asyn
   assert.ok(!names(api.registered).includes('Front Door'), 'the cached zone was reused');
   assert.equal(api.unregistered.length, 0);
 });
+
+// --- Audio alarm sensors (end to end) ----------------------------------------
+
+/** A camera shaped like the live Front Door: smoke + CO + the combined type all enabled. */
+const alarmCamera = () =>
+  camera({
+    featureFlags: { smartDetectTypes: ['person'], smartDetectAudioTypes: ['alrmSmoke', 'alrmCmonx'] },
+    smartDetectSettings: { objectTypes: ['person'], audioTypes: ['smoke_cmonx', 'alrmSmoke', 'alrmCmonx'] },
+  });
+
+test('audio sensors are not created unless the option is on', async () => {
+  const { api } = await startPlatform({ exposeCameraStreams: false }, { hubs: [hub()], cameras: [alarmCamera()] });
+  const registered = names(api.registered);
+  assert.ok(!registered.some((n) => /Smoke|CO Alarm/.test(n)), `unexpected alarm sensors: ${registered}`);
+});
+
+test('enabling audio sensors registers one native sensor per service', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false, exposeAudioSensors: true },
+    { hubs: [hub()], cameras: [alarmCamera()] },
+  );
+  const registered = names(api.registered);
+  // Exactly one of each despite three overlapping Protect types being enabled.
+  assert.equal(registered.filter((n) => n === 'Front Yard Smoke Alarm').length, 1);
+  assert.equal(registered.filter((n) => n === 'Front Yard CO Alarm').length, 1);
+});
+
+test('a smoke detection reaches the native SmokeSensor, not a motion sensor', async () => {
+  const { api, state } = await startPlatform(
+    { exposeCameraStreams: false, exposeAudioSensors: true },
+    { hubs: [hub()], cameras: [alarmCamera()] },
+  );
+  const smoke = api.registered.find((a) => a.displayName === 'Front Yard Smoke Alarm');
+
+  state.events.onEvent({ item: { type: 'smartAudioDetect', device: 'cam-1', smartDetectTypes: ['alrmSmoke'] } });
+
+  assert.equal(smoke.getService(Service.SmokeSensor).value(C.SmokeDetected), C.SmokeDetected.SMOKE_DETECTED);
+
+  state.events.onEvent({
+    item: { type: 'smartAudioDetect', device: 'cam-1', smartDetectTypes: ['alrmSmoke'], end: 1 },
+  });
+  assert.equal(smoke.getService(Service.SmokeSensor).value(C.SmokeDetected), C.SmokeDetected.SMOKE_NOT_DETECTED);
+});
+
+// One Protect detection, two HomeKit sensors. Collapsing it to smoke alone would silently drop CO
+// for anyone automating on it.
+test('a combined smoke/CO detection fires both sensors', async () => {
+  const { api, state } = await startPlatform(
+    { exposeCameraStreams: false, exposeAudioSensors: true },
+    { hubs: [hub()], cameras: [alarmCamera()] },
+  );
+  const smoke = api.registered.find((a) => a.displayName === 'Front Yard Smoke Alarm');
+  const co = api.registered.find((a) => a.displayName === 'Front Yard CO Alarm');
+
+  state.events.onEvent({ item: { type: 'smartAudioDetect', device: 'cam-1', smartDetectTypes: ['smoke_cmonx'] } });
+
+  assert.equal(smoke.getService(Service.SmokeSensor).value(C.SmokeDetected), C.SmokeDetected.SMOKE_DETECTED);
+  assert.equal(
+    co.getService(Service.CarbonMonoxideSensor).value(C.CarbonMonoxideDetected),
+    C.CarbonMonoxideDetected.CO_LEVELS_ABNORMAL,
+  );
+});
+
+test('an audio detection with the option off is warned about, not silently dropped', async () => {
+  const { state, log } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [alarmCamera()] },
+  );
+  state.events.onEvent({ item: { type: 'smartAudioDetect', device: 'cam-1', smartDetectTypes: ['alrmSmoke'] } });
+  state.events.onEvent({ item: { type: 'smartAudioDetect', device: 'cam-1', smartDetectTypes: ['alrmSmoke'] } });
+
+  const warns = logged(log, 'warn').filter((m) => /exposeAudioSensors/.test(m));
+  assert.equal(warns.length, 1, 'warned once, with the fix named');
+});
+
+test('an offline camera deactivates its alarm sensors too', async () => {
+  const { api, state, clock } = await startPlatform(
+    { exposeCameraStreams: false, exposeAudioSensors: true },
+    { hubs: [hub()], cameras: [alarmCamera()] },
+  );
+  const smoke = api.registered.find((a) => a.displayName === 'Front Yard Smoke Alarm');
+
+  state.cameras = [{ ...alarmCamera(), state: 'DISCONNECTED' }];
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.equal(smoke.getService(Service.SmokeSensor).value(C.StatusActive), false);
+});

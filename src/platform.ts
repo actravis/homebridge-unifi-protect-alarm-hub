@@ -12,12 +12,15 @@ import { ProtectApiError, ProtectClient, type ProtectClientOptions } from './cli
 import type { AccessoryHandler, AlarmHub, ProtectEvent } from './types';
 import { SecuritySystemAccessory } from './accessories/securitySystem';
 import { HubAccessory, ReadonlyContactAccessory, ZoneAccessory } from './accessories/sensors';
-import { CameraAccessory, ObjectSensorAccessory } from './accessories/camera';
+import { AlarmSensorAccessory, CameraAccessory, ObjectSensorAccessory } from './accessories/camera';
 import { planAccessories, type PlannedAccessory } from './discovery';
 import { basePollSeconds, effectivePollSeconds } from './pollPolicy';
-import { cameraKey, objectSensorKey, objectSensorName, planCameraAccessories } from './cameraDiscovery';
+import { audioSensorKey, cameraKey, objectSensorKey, objectSensorName, planCameraAccessories } from './cameraDiscovery';
 import { decodeCameraEvent } from './cameraEvents';
+import { alarmKindLabel, isAudioDetection, sensorKindsFor } from './detectionKinds';
 import { redactPayload } from './util';
+import { probeAudioCodec, type AudioCodecChoice } from './streaming/audioCodec';
+import { resolveFfmpegPath } from './streaming/ffmpegPath';
 
 interface AccessorySpec {
   uuid: string;
@@ -72,6 +75,8 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   private readonly handlers = new Map<string, AccessoryHandler>();
   private readonly cameraHandlers = new Map<string, CameraAccessory>();
   private readonly objectHandlers = new Map<string, ObjectSensorAccessory>();
+  /** Native smoke / CO sensors driven by the cameras' audio detection, keyed by accessory UUID. */
+  private readonly alarmHandlers = new Map<string, AlarmSensorAccessory>();
   private disposeEvents?: () => void;
   private syncingCameras = false;
   private resyncCameras = false;
@@ -103,6 +108,10 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   private consecutiveFailures = 0;
   /** Set on Homebridge shutdown; every async path checks it before touching the accessory API. */
   private stopped = false;
+  /** So the chosen-codec line is logged once, not on every discovery pass. */
+  private audioReported = false;
+  /** Probed once: which audio codec this ffmpeg can encode, or undefined for video-only. */
+  private audioCodec?: AudioCodecChoice;
 
   constructor(
     readonly log: Logging,
@@ -295,7 +304,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     // survives a Homebridge restart, keeps its sockets, and accumulates on each restart.
     // Each shutdown is isolated, or one throwing handler would skip the rest AND the client
     // close below — turning a cosmetic failure into leaked processes and sockets.
-    for (const uuid of [...this.cameraHandlers.keys(), ...this.objectHandlers.keys()]) {
+    for (const uuid of [...this.cameraHandlers.keys(), ...this.objectHandlers.keys(), ...this.alarmHandlers.keys()]) {
       this.shutdownCameraHandler(uuid);
     }
     void this.client?.close();
@@ -561,6 +570,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
 
     const { Categories, uuid } = this.api.hap;
     const streaming = this.config.exposeCameraStreams !== false;
+    if (streaming && this.config.exposeCameraAudio === true) {
+      await this.ensureAudioCodec();
+    }
     const desired = new Set<string>();
 
     for (const plan of planCameraAccessories(cameras, this.config)) {
@@ -584,6 +596,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
           doorbellTrigger: this.config.exposeDoorbellTriggers === true,
           streaming,
           source: client,
+          audioCodec: this.audioCodec,
         };
         // Cameras are bridged like everything else: they appear automatically with the bridge,
         // are cached/restored across restarts, and prune normally. (Publishing them as external
@@ -615,6 +628,21 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
         }
         this.objectHandlers.get(objId)?.setOnline(plan.online);
       }
+      for (const kind of plan.alarmKinds) {
+        const alarmId = uuid.generate(audioSensorKey(plan.deviceId, kind));
+        desired.add(alarmId);
+        const name = `${plan.name} ${alarmKindLabel(kind)}`;
+        if (!this.alarmHandlers.has(alarmId)) {
+          const accessory = this.acquireAccessory(alarmId, name, Categories.SENSOR);
+          this.alarmHandlers.set(
+            alarmId,
+            new AlarmSensorAccessory(this, accessory, { name, serial: `${plan.deviceId}:${kind}`, kind }),
+          );
+        } else if (this.renameAccessory(alarmId, name)) {
+          this.alarmHandlers.get(alarmId)?.setName(name);
+        }
+        this.alarmHandlers.get(alarmId)?.setOnline(plan.online);
+      }
     }
 
     // Prune camera-domain accessories that are no longer present.
@@ -628,6 +656,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
         this.accessories.delete(id);
         this.cameraHandlers.delete(id);
         this.objectHandlers.delete(id);
+        this.alarmHandlers.delete(id);
         this.log.info(`Removed camera accessory "${accessory.displayName}".`);
       }
     }
@@ -643,11 +672,38 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     }
   }
 
+  /**
+   * Probe ffmpeg's audio encoders once, before any CameraController is built.
+   *
+   * Must happen before accessory creation: the controller advertises the codec at construction,
+   * and advertising one the delegate cannot deliver makes iOS refuse to render video at all.
+   */
+  private async ensureAudioCodec(): Promise<void> {
+    if (this.audioReported) {
+      return;
+    }
+    // No local "already probed" flag guarding the await: setting one before awaiting would let a
+    // concurrent caller see "probed" while the result was still undefined, and quietly build a
+    // CameraController with no audio. probeAudioCodec caches the PROMISE, so awaiting it repeatedly
+    // costs nothing and always yields the same answer.
+    this.audioCodec = await probeAudioCodec(resolveFfmpegPath());
+    this.audioReported = true;
+    if (this.audioCodec) {
+      this.log.info(`Camera audio enabled using ${this.audioCodec.encoder} (${this.audioCodec.hapCodec}).`);
+    } else {
+      this.log.warn(
+        'Camera audio is switched on, but this ffmpeg cannot encode a codec HomeKit accepts ' +
+          '(needs AAC-ELD via libfdk_aac, or Opus via libopus). Streaming video only.',
+      );
+    }
+  }
+
   /** Stop a camera or object-sensor handler's background work, whichever kind it is. */
   private shutdownCameraHandler(uuid: string): void {
     try {
       this.cameraHandlers.get(uuid)?.shutdown();
       this.objectHandlers.get(uuid)?.shutdown();
+      this.alarmHandlers.get(uuid)?.shutdown();
     } catch (err) {
       this.log.debug(`Camera shutdown failed: ${(err as Error).message}`);
     }
@@ -729,6 +785,24 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
           this.log.warn(`Ring from a camera not detected as a doorbell (${d.deviceId}); add it to "doorbellDeviceIds" to expose a doorbell.`);
         }
         handler.applyDetection(d.kind, d.active);
+      } else if (isAudioDetection(d.kind)) {
+        // Smoke / CO. One Protect type can drive two HomeKit sensors (a combined smoke+CO alarm),
+        // and two types can drive the same one, so fan out over the mapped services.
+        let routed = false;
+        for (const kind of sensorKindsFor(d.kind)) {
+          const handler = this.alarmHandlers.get(this.api.hap.uuid.generate(audioSensorKey(d.deviceId, kind)));
+          if (handler) {
+            handler.applyDetection(d.active);
+            routed = true;
+          }
+        }
+        if (!routed) {
+          this.noteUnroutedDetection(
+            `${d.deviceId}:${d.kind}`,
+            `"${d.kind}" audio detection from ${d.deviceId} has no sensor — turn on "exposeAudioSensors" ` +
+              'to expose smoke/CO sensors for it.',
+          );
+        }
       } else {
         const objectHandler = this.objectHandlers.get(this.api.hap.uuid.generate(objectSensorKey(d.deviceId, d.kind)));
         if (!objectHandler) {

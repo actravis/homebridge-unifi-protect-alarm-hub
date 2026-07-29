@@ -35,6 +35,8 @@ export const Characteristic = {
     DISARM: 3,
   }),
   ProgrammableSwitchEvent: char('ProgrammableSwitchEvent', { SINGLE_PRESS: 0, DOUBLE_PRESS: 1, LONG_PRESS: 2 }),
+  SmokeDetected: char('SmokeDetected', { SMOKE_NOT_DETECTED: 0, SMOKE_DETECTED: 1 }),
+  CarbonMonoxideDetected: char('CarbonMonoxideDetected', { CO_LEVELS_NORMAL: 0, CO_LEVELS_ABNORMAL: 1 }),
   On: char('On'),
 };
 
@@ -50,6 +52,8 @@ export const Service = {
   SecuritySystem: svc('SecuritySystem'),
   Doorbell: svc('Doorbell'),
   Switch: svc('Switch'),
+  SmokeSensor: svc('SmokeSensor'),
+  CarbonMonoxideSensor: svc('CarbonMonoxideSensor'),
 };
 
 class FakeCharacteristic {

@@ -15,6 +15,9 @@ import type {
 } from 'homebridge';
 import type { RtspsStreams } from '../types';
 import { redactStreamUrl } from '../util';
+import type { AudioCodecChoice } from './audioCodec';
+import type { AudioArgsOptions } from './ffmpegArgs';
+import { supportsFpsMax, type EncodeProbe } from './ffmpegFeatures';
 import { buildVideoArgs, effectiveBitrateKbps, encodeSrtpParams, pickRtspsUrl, selectStreamQuality } from './ffmpegArgs';
 
 /** What the delegate needs from the client: snapshots + RTSPS stream URLs. ProtectClient satisfies this. */
@@ -44,6 +47,14 @@ export interface StreamingDelegateOptions {
    * `child_process.spawn`.
    */
   spawn?: typeof spawn;
+  /**
+   * The probed audio encoder, or undefined for video-only. MUST match what the CameraController
+   * advertised: if the controller declares a codec and this is absent, iOS waits for audio that
+   * never arrives and refuses to render the video either.
+   */
+  audioCodec?: AudioCodecChoice;
+  /** Probe used to test optional ffmpeg flags; injectable so tests need no real ffmpeg. */
+  encodeProbe?: EncodeProbe;
 }
 
 /**
@@ -75,6 +86,13 @@ interface Session {
   videoSSRC: number;
   videoKey: Buffer;
   videoSalt: Buffer;
+  /** Audio counterparts, present only when audio is enabled for this camera. */
+  audioPort?: number;
+  audioSSRC?: number;
+  audioKey?: Buffer;
+  audioSalt?: Buffer;
+  audioSocket?: Socket;
+  audioReturnPort?: number;
   /** Reserves the advertised port until ffmpeg takes it over; undefined once released. */
   videoSocket?: Socket;
   /** The port we advertised to iOS as our RTCP endpoint (ffmpeg binds `localrtcpport` here). */
@@ -117,6 +135,36 @@ export function pickAddressOverride(sourceAddress: string, addressVersion: strin
     return undefined;
   }
   return isIPv4(addr) === (addressVersion !== 'ipv6') ? addr : undefined;
+}
+
+/**
+ * Decoder complaints that are EXPECTED when joining a live stream, and only mean "we connected
+ * partway through a group of pictures and are waiting for the next keyframe".
+ *
+ * Every Protect substream has a ~5s keyframe interval, so a 24fps HEVC camera emits roughly a
+ * hundred of these per connect — enough to bury the handful of lines that actually matter (the
+ * stream mapping, the negotiated output, real errors). They are counted and summarised instead.
+ *
+ * Deliberately narrow: each pattern is a known mid-GOP artefact. Anything unrecognised is still
+ * logged, because a filter that swallows novel errors is worse than a noisy log.
+ */
+const EXPECTED_DECODER_NOISE = [
+  /Could not find ref with POC/,
+  /Error constructing the frame RPS/,
+  /Skipping invalid undecodable NALU/,
+  /First slice in a frame missing/,
+  // The H.264 equivalents of the same mid-GOP situation.
+  /non-existing PPS .* referenced/,
+  /decode_slice_header error/,
+  /no frame!/,
+  // swscaler, once per stream: the camera reports a JPEG-range pixel format. Harmless and not
+  // something a user can act on.
+  /deprecated pixel format used/,
+];
+
+/** True if this ffmpeg output line is expected mid-GOP noise rather than a real problem. */
+export function isExpectedFfmpegNoise(line: string): boolean {
+  return EXPECTED_DECODER_NOISE.some((pattern) => pattern.test(line));
 }
 
 /** Close a socket, tolerating an already-closed one (Node throws in that case). */
@@ -300,6 +348,25 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       const videoSocket = await bindUdp(family);
       videoSocket.on('error', (err) => this.opts.log.debug(`Video return socket error: ${err.message}`));
       const videoReturnPort = videoSocket.address().port;
+
+      // Audio is an independent RTP stream: its own port, SSRC and SRTP keys. Reserve the port the
+      // same way, so ffmpeg can later bind it as its audio RTCP endpoint.
+      //
+      // Bound inside its own try: a failure here happens AFTER the video socket exists, and the
+      // outer catch only answers the callback — it has no reference to release, so the descriptor
+      // would leak for the lifetime of the process, once per failed stream attempt.
+      const wantAudio = this.opts.audioCodec !== undefined;
+      let audioSocket: Socket | undefined;
+      if (wantAudio) {
+        try {
+          audioSocket = await bindUdp(family);
+        } catch (err) {
+          closeSocket(videoSocket);
+          throw err;
+        }
+      }
+      audioSocket?.on('error', (err) => this.opts.log.debug(`Audio return socket error: ${err.message}`));
+      const audioSSRC = wantAudio ? randomSsrc() : undefined;
       this.opts.log.debug(
         `[stream] prepared (${this.opts.deviceId}) videoPort=${videoReturnPort} ssrc=${videoSSRC} ` +
           `src=${addressOverride ?? 'auto'} target=${request.targetAddress}`,
@@ -321,6 +388,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
         videoSalt: request.video.srtp_salt,
         videoSocket,
         videoReturnPort,
+        audioPort: wantAudio ? request.audio.port : undefined,
+        audioSSRC,
+        audioKey: wantAudio ? request.audio.srtp_key : undefined,
+        audioSalt: wantAudio ? request.audio.srtp_salt : undefined,
+        audioSocket,
+        audioReturnPort: audioSocket?.address().port,
         prepareTimer,
       });
       response = {
@@ -331,7 +404,17 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
           srtp_key: request.video.srtp_key,
           srtp_salt: request.video.srtp_salt,
         },
-        // No `audio` — video-only. iOS renders video without waiting for a promised audio stream.
+        // Present only when we will really send audio; see StreamingDelegateOptions.audioCodec.
+        ...(wantAudio && audioSocket
+          ? {
+              audio: {
+                port: audioSocket.address().port,
+                ssrc: audioSSRC!,
+                srtp_key: request.audio.srtp_key,
+                srtp_salt: request.audio.srtp_salt,
+              },
+            }
+          : {}),
       };
     } catch (err) {
       callback(err as Error);
@@ -431,6 +514,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
         `mtu=${v.mtu} → ${this.opts.deviceId}`,
     );
 
+    // Cached after the first stream, so this costs one short ffmpeg run per process.
+    const capFps = await supportsFpsMax(this.opts.ffmpegPath, this.opts.encodeProbe);
     const args = buildVideoArgs({
       rtspsUrl: url,
       width: v.width,
@@ -446,12 +531,16 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       videoPort: session.videoPort,
       localRtcpPort: session.videoReturnPort,
       mtu: v.mtu,
+      capFps,
+      audio: this.audioArgsFor(session, request),
     });
 
-    // Hand the reserved port over to ffmpeg, which binds it as its RTCP socket (localrtcpport)
-    // so receiver reports arrive on the port we advertised to iOS.
+    // Hand the reserved ports over to ffmpeg, which binds them as its RTCP sockets
+    // (localrtcpport) so receiver reports arrive on the ports we advertised to iOS.
     closeSocket(session.videoSocket);
     session.videoSocket = undefined;
+    closeSocket(session.audioSocket);
+    session.audioSocket = undefined;
 
     this.opts.log.debug(`[stream] spawning ffmpeg (${this.opts.deviceId})`);
     // stdin/stdout are explicitly ignored, only stderr is piped. ffmpeg writes the stream to a
@@ -467,14 +556,33 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     // ffmpeg echoes its input URL in the startup banner, and RTSPS URLs embed the stream key —
     // redact before anything reaches a log line (see redactStreamUrl's contract).
     const scrub = (text: string): string => text.split(url).join(redactStreamUrl(url));
-    proc.stderr?.on('data', (d: Buffer) =>
-      this.opts.log.debug(`[ffmpeg ${this.opts.deviceId}] ${scrub(d.toString().trim())}`),
-    );
+    // Split per line rather than logging each chunk whole: ffmpeg writes in bursts that do not
+    // align with line boundaries, so chunk-logging interleaved unrelated lines into each other.
+    let suppressed = 0;
+    proc.stderr?.on('data', (d: Buffer) => {
+      for (const raw of d.toString().split('\n')) {
+        const line = raw.trim();
+        if (!line) {
+          continue;
+        }
+        if (isExpectedFfmpegNoise(line)) {
+          suppressed += 1;
+          continue;
+        }
+        this.opts.log.debug(`[ffmpeg ${this.opts.deviceId}] ${scrub(line)}`);
+      }
+    });
     proc.on('error', (err) => {
       this.opts.log.error(`ffmpeg failed to start (is ffmpeg installed?): ${err.message}`);
       this.endSession(request.sessionID, session);
     });
     proc.on('exit', (code, signal) => {
+      if (suppressed > 0) {
+        this.opts.log.debug(
+          `[ffmpeg ${this.opts.deviceId}] suppressed ${suppressed} expected decoder warnings ` +
+            '(joined mid-GOP, waiting for the first keyframe)',
+        );
+      }
       this.opts.log.debug(`[ffmpeg ${this.opts.deviceId}] exited code=${code} signal=${signal ?? '-'}`);
       // An exit we didn't ask for (camera rebooted, RTSPS dropped) would otherwise leave HomeKit
       // showing a frozen frame and holding the stream slot forever.
@@ -484,6 +592,37 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       }
     });
     callback();
+  }
+
+  /**
+   * The audio half of the ffmpeg command, or undefined for a video-only stream.
+   *
+   * HomeKit reports the sample rate in kHz (its AudioStreamingSamplerate enum is 8/16/24) while
+   * ffmpeg wants Hz, hence the multiply — passing 24 straight through would ask for 24Hz audio.
+   */
+  private audioArgsFor(
+    session: Session,
+    request: Extract<StreamingRequest, { type: 'start' }>,
+  ): AudioArgsOptions | undefined {
+    const codec = this.opts.audioCodec;
+    const a = request.audio;
+    if (
+      !codec || !a || session.audioPort === undefined || session.audioSSRC === undefined ||
+      !session.audioKey || !session.audioSalt
+    ) {
+      return undefined;
+    }
+    return {
+      encoder: codec.encoder,
+      sampleRateHz: a.sample_rate * 1000,
+      bitrateKbps: a.max_bit_rate,
+      payloadType: a.pt,
+      ssrc: session.audioSSRC,
+      srtpParams: encodeSrtpParams(session.audioKey, session.audioSalt),
+      port: session.audioPort,
+      localRtcpPort: session.audioReturnPort,
+      packetTimeMs: a.packet_time,
+    };
   }
 
   /**
@@ -512,6 +651,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     }
     this.sessions.delete(sessionID); // delete first: the exit handler checks identity
     clearTimeout(session.prepareTimer);
+    closeSocket(session.audioSocket);
     const proc = session.ffmpeg;
     if (proc && proc.exitCode === null && !proc.killed) {
       // Ask ffmpeg to close the RTSP session cleanly, then insist.

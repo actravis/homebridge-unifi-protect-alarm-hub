@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { cameraKey, isDoorbell, objectSensorKey, planCameraAccessories } from '../dist/cameraDiscovery.js';
+import { audioSensorKey, cameraKey, isDoorbell, objectSensorKey, planCameraAccessories } from '../dist/cameraDiscovery.js';
 
 const cam = (over = {}) => ({ id: 'c1', modelKey: 'camera', name: 'Front Door', featureFlags: {}, ...over });
 
@@ -121,4 +121,45 @@ test('object types the camera supports but has switched off are reported', () =>
 test('no settings block means "unknown", not "everything is disabled"', () => {
   const plan = planCameraAccessories([cam({ featureFlags: { smartDetectTypes: ['person'] } })], {})[0];
   assert.deepEqual(plan.disabledObjectTypes, []);
+});
+
+// --- Audio alarm sensors -----------------------------------------------------
+
+test('audio alarm sensors are off unless explicitly enabled', () => {
+  const c = cam({ smartDetectSettings: { audioTypes: ['alrmSmoke', 'alrmCmonx'] } });
+  assert.deepEqual(planCameraAccessories([c], {})[0].alarmKinds, []);
+  assert.deepEqual(planCameraAccessories([c], { exposeAudioSensors: false })[0].alarmKinds, []);
+});
+
+test('enabled audio types become the matching native sensors', () => {
+  const plan = planCameraAccessories(
+    [cam({ smartDetectSettings: { audioTypes: ['alrmSmoke', 'alrmCmonx'] } })],
+    { exposeAudioSensors: true },
+  )[0];
+  assert.deepEqual(plan.alarmKinds, ['smoke', 'carbonMonoxide']);
+});
+
+// Observed live: Front Door has both `alrmSmoke` and the combined `smoke_cmonx` enabled. Both
+// mean smoke, and two accessories called "Front Door Smoke Alarm" would be useless.
+test('overlapping types collapse to one sensor per HomeKit service', () => {
+  const plan = planCameraAccessories(
+    [cam({ smartDetectSettings: { audioTypes: ['smoke_cmonx', 'alrmSmoke', 'alrmCmonx'] } })],
+    { exposeAudioSensors: true },
+  )[0];
+  assert.deepEqual(plan.alarmKinds, ['smoke', 'carbonMonoxide']);
+});
+
+test('audio types with no native service produce no alarm sensor', () => {
+  const plan = planCameraAccessories(
+    [cam({ smartDetectSettings: { audioTypes: ['alrmBabyCry', 'alrmSpeak'] } })],
+    { exposeAudioSensors: true },
+  )[0];
+  assert.deepEqual(plan.alarmKinds, []);
+});
+
+test('audioSensorKey is keyed by service and cannot collide with other sensors', () => {
+  assert.equal(audioSensorKey('c1', 'smoke'), 'c1:audio:smoke');
+  assert.notEqual(audioSensorKey('c1', 'smoke'), audioSensorKey('c1', 'carbonMonoxide'));
+  assert.notEqual(audioSensorKey('c1', 'smoke'), objectSensorKey('c1', 'smoke'));
+  assert.notEqual(audioSensorKey('c1', 'smoke'), cameraKey('c1'));
 });

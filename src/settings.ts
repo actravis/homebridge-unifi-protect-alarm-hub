@@ -27,8 +27,12 @@ export interface ProtectConfig extends PlatformConfig {
   exposeCameras?: boolean;
   /** Expose per-type smart-detect sensors (person/vehicle/animal/package) — default on. */
   exposeObjectSensors?: boolean;
-  /** Attach a HomeKit camera (tile, snapshots; live streaming in a later release) — default on. */
+  /** Expose smoke/CO sensors driven by the cameras' audio detection — default off (experimental). */
+  exposeAudioSensors?: boolean;
+  /** Attach a HomeKit camera (tile, snapshots, live video) — default on. */
   exposeCameraStreams?: boolean;
+  /** Include camera audio in the live stream — default off (experimental). */
+  exposeCameraAudio?: boolean;
   /** Add a per-camera "Doorbell Trigger" switch that fires a ring from automations — default off. */
   exposeDoorbellTriggers?: boolean;
   /** Device IDs to force-treat as doorbells, overriding the LCD-screen heuristic. */

@@ -56,14 +56,36 @@ test('a smartDetectZone with no types yields nothing', () => {
 
 // --- Forward compatibility ---------------------------------------------------
 
-test('any smartDetect* variant is decoded, not just the two seen in the spike', () => {
+test('every smart* variant is decoded, whatever Protect names it', () => {
+  // This list is deliberately not an allow-list in the source: the previous `smartDetect` prefix
+  // excluded `smartAudioDetect` and dropped every smoke/CO detection without a trace.
   for (const type of ['smartDetectZone', 'smartDetectLine', 'smartDetectLoiterZone', 'smartAudioDetect']) {
-    const decoded = decodeCameraEvent({ item: { type, device: 'c1', smartDetectTypes: ['package'] } });
     assert.deepEqual(
-      decoded,
-      type.startsWith('smartDetect') ? [{ deviceId: 'c1', kind: 'package', active: true }] : [],
+      decodeCameraEvent({ item: { type, device: 'c1', smartDetectTypes: ['package'] } }),
+      [{ deviceId: 'c1', kind: 'package', active: true }],
       `type ${type}`,
     );
   }
 });
 
+
+// REGRESSION: the prefix was `smartDetect`, and Protect names audio detection `smartAudioDetect`
+// — which does not match. Every smoke and CO alarm detection was being silently dropped. Match
+// the whole `smart*` family and read whatever types the payload carries.
+test('audio detections are decoded, not dropped by a too-narrow prefix', () => {
+  assert.deepEqual(
+    decodeCameraEvent({ item: { type: 'smartAudioDetect', device: 'c1', smartDetectTypes: ['alrmSmoke'] } }),
+    [{ deviceId: 'c1', kind: 'alrmSmoke', active: true }],
+  );
+  // The combined smoke/CO type the live console reports.
+  assert.deepEqual(
+    decodeCameraEvent({ item: { type: 'smartAudioDetect', device: 'c1', smartDetectTypes: ['smoke_cmonx'] } }),
+    [{ deviceId: 'c1', kind: 'smoke_cmonx', active: true }],
+  );
+});
+
+test('non-smart event types are still left to the alarm path', () => {
+  for (const type of ['alarmHubEntryOpened', 'alarmHubEntryClosed', 'somethingElse']) {
+    assert.deepEqual(decodeCameraEvent({ item: { type, device: 'h1' } }), [], type);
+  }
+});

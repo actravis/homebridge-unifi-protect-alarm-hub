@@ -23,10 +23,15 @@ export interface Detection {
  * So `active = (item.end == null)`: an event with an `end` marks the detection over. Events
  * we don't handle (e.g. `alarmHubEntryOpened`, which belongs to the alarm path) yield [].
  *
- * Any `smartDetect*` type is handled, not just the two seen in the spike: Protect keeps adding
- * variants (loiter zones, line crossings, audio) and they all carry the detections the same way,
- * so an allow-list would silently drop new ones. An empty result is the platform's cue to log
- * the payload once, so a type we genuinely cannot decode still leaves evidence.
+ * Any `smart*` type is handled, not just the `smartDetect*` ones seen in the spike. Protect keeps
+ * inventing variants — `smartDetectLine`, `smartDetectLoiterZone`, and audio detection, which is
+ * named `smartAudioDetect` and so did NOT match a `smartDetect` prefix. That miss silently
+ * dropped every smoke and CO alarm detection, which is exactly the failure an allow-list of
+ * known names invites. Matching the family and reading whatever types the payload carries means
+ * a new variant arrives working rather than absent.
+ *
+ * An empty result is still the platform's cue to log the payload once, so a shape we genuinely
+ * cannot decode leaves evidence instead of vanishing.
  */
 export function decodeCameraEvent(event: ProtectEvent | undefined): Detection[] {
   const item = event?.item;
@@ -39,7 +44,7 @@ export function decodeCameraEvent(event: ProtectEvent | undefined): Detection[] 
   if (type === 'motion' || type === 'ring') {
     return [{ deviceId, kind: type, active }];
   }
-  if (type.startsWith('smartDetect')) {
+  if (type.startsWith('smart')) {
     return (item.smartDetectTypes ?? []).map((kind) => ({ deviceId, kind, active }));
   }
   return [];

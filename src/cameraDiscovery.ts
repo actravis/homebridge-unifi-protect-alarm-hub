@@ -2,6 +2,7 @@
 // the "what to expose" rules are unit-testable. The platform maps each plan to a real
 // accessory (camera = overall motion + optional doorbell; object types = separate sensors).
 
+import { alarmSensorKinds, type SensorKind } from './detectionKinds';
 import type { Camera } from './types';
 
 export interface CameraPlan {
@@ -13,6 +14,11 @@ export interface CameraPlan {
   objectTypes: string[];
   /** False when Protect reports the camera as disconnected — the accessory stays, marked inactive. */
   online: boolean;
+  /**
+   * HomeKit alarm sensors this camera warrants, from the audio detections Protect has enabled
+   * (smoke / CO). Empty unless `exposeAudioSensors` is on.
+   */
+  alarmKinds: SensorKind[];
   /**
    * Object types the camera supports but that are switched OFF in Protect right now. Their
    * sensors are still exposed (the user may enable detection later, and we only re-discover
@@ -47,11 +53,22 @@ export function objectSensorName(cameraName: string, objectType: string): string
   return `${cameraName} ${objectType.charAt(0).toUpperCase()}${objectType.slice(1)}`;
 }
 
+/**
+ * Accessory-key seed for a camera's audio-alarm sensor. Keyed by HomeKit service rather than by
+ * Protect type, because several Protect types can mean the same alarm (`alrmSmoke` and
+ * `smoke_cmonx` both mean smoke) and they must share one sensor.
+ */
+export function audioSensorKey(deviceId: string, kind: SensorKind): string {
+  return `${deviceId}:audio:${kind}`;
+}
+
 export interface CameraPlanConfig {
   /** Master toggle for all camera accessories (default on). */
   exposeCameras?: boolean;
   /** Expose per-type smart-detect sensors (default on). */
   exposeObjectSensors?: boolean;
+  /** Expose smoke / CO sensors driven by the cameras' audio detection (default off). */
+  exposeAudioSensors?: boolean;
   /** Device IDs to force-treat as doorbells, overriding the heuristic. */
   doorbellDeviceIds?: string[];
 }
@@ -105,6 +122,7 @@ export function planCameraAccessories(cameras: Camera[], config: CameraPlanConfi
       name: camera.name ?? 'Camera',
       isDoorbell: isDoorbell(camera, config),
       objectTypes: supported,
+      alarmKinds: config.exposeAudioSensors === true ? alarmSensorKinds(camera.smartDetectSettings?.audioTypes) : [],
       online: isCameraOnline(camera),
       disabledObjectTypes: enabled ? supported.filter((type) => !enabled.includes(type)) : [],
     };

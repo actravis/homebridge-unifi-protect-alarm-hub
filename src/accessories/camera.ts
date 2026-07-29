@@ -1,9 +1,11 @@
-import type { PlatformAccessory, Service } from 'homebridge';
+import type { Characteristic, PlatformAccessory, Service, WithUUID } from 'homebridge';
 import type { UnifiProtectPlatform } from '../platform';
 import type { DetectionKind } from '../cameraEvents';
+import type { SensorKind } from '../detectionKinds';
 import { ProtectStreamingDelegate, type StreamSource } from '../streaming/streamingDelegate';
 import { buildCameraController } from '../streaming/cameraOptions';
 import { resolveFfmpegPath } from '../streaming/ffmpegPath';
+import type { AudioCodecChoice } from '../streaming/audioCodec';
 
 /** Injectable timers so the motion safety-clear is unit-testable. */
 export interface Timers {
@@ -107,6 +109,11 @@ export class CameraAccessory {
       streaming?: boolean;
       /** Snapshot + RTSPS source (the ProtectClient). Required when `streaming` is set. */
       source?: StreamSource;
+      /**
+       * Probed audio encoder, or undefined for video-only. Passed to BOTH the controller (which
+       * advertises it) and the delegate (which sends it) — they must never disagree.
+       */
+      audioCodec?: AudioCodecChoice;
     },
     timers: Timers = REAL_TIMERS,
   ) {
@@ -149,6 +156,7 @@ export class CameraAccessory {
         source: opts.source,
         log: platform.log,
         ffmpegPath: resolveFfmpegPath(),
+        audioCodec: opts.audioCodec,
         // Snapshots are the most frequent contact we have with a camera, so their outcome is
         // the freshest reachability signal available between discovery passes.
         onHealth: (ok) => {
@@ -160,7 +168,7 @@ export class CameraAccessory {
       });
       // The delegate needs the controller back so it can tell HomeKit when a stream dies
       // underneath it (otherwise that stream slot stays busy until Homebridge restarts).
-      const controller = buildCameraController(platform.api.hap, delegate);
+      const controller = buildCameraController(platform.api.hap, delegate, opts.audioCodec);
       delegate.setController(controller);
       accessory.configureController(controller);
       this.streaming = delegate;
@@ -221,6 +229,88 @@ export class CameraAccessory {
       this.motion.set(active);
     } else if (kind === 'ring' && active) {
       this.ring();
+    }
+  }
+}
+
+/**
+ * A native HomeKit smoke or CO sensor driven by a camera's audio detection.
+ *
+ * This reports that a camera HEARD an alarm — it is not a detector itself, and the accessory name
+ * ("Front Door Smoke Alarm") is worded to say so. The value is the bridge it creates: a sounding
+ * alarm becomes a first-class HomeKit trigger, so it can turn on lights, unlock doors, or raise a
+ * critical notification. A motion sensor could do none of that.
+ *
+ * Detections auto-clear on the end event, with the same safety timeout the motion sensors use —
+ * an alarm sensor stuck ON after a missed end event would keep firing automations.
+ */
+export class AlarmSensorAccessory {
+  private readonly service: Service;
+  private readonly characteristic: WithUUID<new () => Characteristic>;
+  private readonly detectedValue: number;
+  private readonly clearValue: number;
+  private handle?: ReturnType<typeof setTimeout>;
+  private online = true;
+
+  constructor(
+    private readonly platform: UnifiProtectPlatform,
+    accessory: PlatformAccessory,
+    opts: { name: string; serial: string; kind: SensorKind },
+    private readonly timers: Timers = REAL_TIMERS,
+  ) {
+    const { Service, Characteristic } = platform;
+    platform.applyInfo(accessory, opts.serial, 'UniFi Protect Camera');
+    if (opts.kind === 'carbonMonoxide') {
+      this.service =
+        accessory.getService(Service.CarbonMonoxideSensor) ?? accessory.addService(Service.CarbonMonoxideSensor);
+      this.characteristic = Characteristic.CarbonMonoxideDetected;
+      this.detectedValue = Characteristic.CarbonMonoxideDetected.CO_LEVELS_ABNORMAL;
+      this.clearValue = Characteristic.CarbonMonoxideDetected.CO_LEVELS_NORMAL;
+    } else {
+      this.service = accessory.getService(Service.SmokeSensor) ?? accessory.addService(Service.SmokeSensor);
+      this.characteristic = Characteristic.SmokeDetected;
+      this.detectedValue = Characteristic.SmokeDetected.SMOKE_DETECTED;
+      this.clearValue = Characteristic.SmokeDetected.SMOKE_NOT_DETECTED;
+    }
+    this.service.updateCharacteristic(Characteristic.Name, opts.name);
+    this.service.updateCharacteristic(Characteristic.StatusActive, true);
+    this.service.updateCharacteristic(this.characteristic, this.clearValue);
+  }
+
+  applyDetection(active: boolean): void {
+    if (this.handle) {
+      this.timers.clear(this.handle);
+      this.handle = undefined;
+    }
+    this.service.updateCharacteristic(this.characteristic, active ? this.detectedValue : this.clearValue);
+    if (active) {
+      this.handle = this.timers.set(() => {
+        this.handle = undefined;
+        this.service.updateCharacteristic(this.characteristic, this.clearValue);
+      }, MOTION_SAFETY_CLEAR_MS);
+    }
+  }
+
+  /** Mirror the parent camera's reachability — an offline camera hears nothing. */
+  setOnline(online: boolean): void {
+    if (this.online === online) {
+      return;
+    }
+    this.online = online;
+    this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, online);
+    if (!online) {
+      this.applyDetection(false);
+    }
+  }
+
+  setName(name: string): void {
+    this.service.updateCharacteristic(this.platform.Characteristic.Name, name);
+  }
+
+  shutdown(): void {
+    if (this.handle) {
+      this.timers.clear(this.handle);
+      this.handle = undefined;
     }
   }
 }

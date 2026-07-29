@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 
 import {
+  isExpectedFfmpegNoise,
   pickAddressOverride,
   ProtectStreamingDelegate,
   randomSsrc,
@@ -407,4 +408,127 @@ test('a throwing HAP snapshot callback is contained, not fatal', async () => {
 
   assert.equal(unhandled, undefined, 'the throw must not escape as an unhandled rejection');
   assert.ok(log.entries.some((e) => e.level === 'error' && /hap exploded/.test(e.msg)));
+});
+
+// --- Audio negotiation -------------------------------------------------------
+// The controller's advertised codec and the delegate's output must never disagree: iOS responds to
+// a promised-but-silent audio stream by refusing to render the VIDEO too.
+
+const startWithAudio = (sessionID = 'a1') => ({
+  type: 'start',
+  sessionID,
+  video: { width: 1280, height: 720, fps: 30, max_bit_rate: 299, pt: 99, mtu: 1378, profile: 2, level: 2 },
+  audio: { codec: 'OPUS', channel: 1, sample_rate: 24, max_bit_rate: 24, packet_time: 30, pt: 110 },
+});
+
+test('video-only: no audio block is promised in the prepare response', async () => {
+  const { delegate } = makeStreamDelegate();
+  const res = await new Promise((resolve, reject) =>
+    delegate.prepareStream(prepareRequest(), (err, r) => (err ? reject(err) : resolve(r))),
+  );
+  assert.equal(res.audio, undefined);
+});
+
+test('with audio: the prepare response advertises an audio endpoint of its own', async () => {
+  const { delegate } = makeStreamDelegate({ audioCodec: { encoder: 'libopus', hapCodec: 'OPUS' } });
+  const res = await new Promise((resolve, reject) =>
+    delegate.prepareStream(prepareRequest(), (err, r) => (err ? reject(err) : resolve(r))),
+  );
+  assert.ok(res.audio, 'an audio block is required or iOS never sends audio parameters');
+  assert.ok(res.audio.port > 0);
+  assert.notEqual(res.audio.port, res.video.port, 'audio is an independent RTP stream');
+  assert.notEqual(res.audio.ssrc, res.video.ssrc);
+  // HomeKit supplies separate keys per stream; echoing the video ones would fail SRTP decryption.
+  assert.deepEqual(res.audio.srtp_key, prepareRequest().audio.srtp_key);
+});
+
+test('with audio: ffmpeg gets a second output using the negotiated parameters', async () => {
+  const { delegate, spawned } = makeStreamDelegate({ audioCodec: { encoder: 'libopus', hapCodec: 'OPUS' } });
+  await new Promise((resolve, reject) =>
+    delegate.prepareStream(prepareRequest('a1'), (err) => (err ? reject(err) : resolve())),
+  );
+  await new Promise((resolve) => delegate.handleStreamRequest(startWithAudio('a1'), resolve));
+
+  const args = spawned[0].args.join(' ');
+  assert.match(args, /-codec:a libopus/);
+  assert.match(args, /-payload_type 110/);
+  // HomeKit reports kHz; ffmpeg wants Hz. Passing 24 through would request 24Hz audio.
+  assert.match(args, /-ar 24000/);
+  assert.match(args, /-b:a 24k/);
+  // packet_time 30 is illegal for libopus and would kill the whole process.
+  assert.match(args, /-frame_duration 20/);
+  assert.equal(args.match(/-f rtp/g).length, 2);
+});
+
+test('without a probed codec, a start request stays video-only even if iOS offers audio', async () => {
+  const { delegate, spawned } = makeStreamDelegate(); // no audioCodec
+  await new Promise((resolve, reject) =>
+    delegate.prepareStream(prepareRequest('a2'), (err) => (err ? reject(err) : resolve())),
+  );
+  await new Promise((resolve) => delegate.handleStreamRequest(startWithAudio('a2'), resolve));
+
+  const args = spawned[0].args.join(' ');
+  assert.match(args, /-an/, 'source audio is dropped');
+  assert.equal(args.match(/-f rtp/g).length, 1, 'one output only');
+});
+
+// --- ffmpeg log filtering ----------------------------------------------------
+// A 24fps HEVC camera emits ~100 decoder complaints per connect while it waits for the first
+// keyframe, burying the few lines that matter. They are suppressed and counted — but the filter
+// must stay narrow, because one that swallows novel errors is worse than a noisy log.
+
+test('expected mid-GOP decoder noise is recognised', () => {
+  for (const line of [
+    '[hevc @ 0x1] Could not find ref with POC 51',
+    '[hevc @ 0x1] Error constructing the frame RPS.',
+    '[hevc @ 0x1] Skipping invalid undecodable NALU: 1',
+    '[hevc @ 0x1] First slice in a frame missing.',
+    '[h264 @ 0x1] non-existing PPS 0 referenced',
+    '[h264 @ 0x1] decode_slice_header error',
+    '[h264 @ 0x1] no frame!',
+    '[swscaler @ 0x1] deprecated pixel format used, make sure you did set range correctly',
+  ]) {
+    assert.equal(isExpectedFfmpegNoise(line), true, line);
+  }
+});
+
+test('everything diagnostic is still logged', () => {
+  for (const line of [
+    'Input #0, rtsp, from \'rtsps://…\':',
+    'Stream mapping:',
+    '  Stream #0:2 -> #0:0 (hevc (native) -> h264 (libx264))',
+    '[libx264 @ 0x1] profile High, level 4.0, 4:2:0, 8-bit',
+    'frame=  20 fps=0.0 q=29.0 size=  184KiB speed=1.32x',
+    // The problems this session actually hunted down — none may ever be hidden.
+    '[aost#1:0/libopus] Non-monotonic DTS; previous: 238920, current: 238680',
+    '[libopus @ 0x1] Queue input is backward in time',
+    '[libopus @ 0x1] Invalid frame duration: 30.',
+    '[libfdk_aac @ 0x1] Unable to initialize the encoder: Transport library initialization error',
+    'Conversion failed!',
+    'Error while opening encoder - maybe incorrect parameters',
+    '[rtsp @ 0x1] Option not found',
+  ]) {
+    assert.equal(isExpectedFfmpegNoise(line), false, line);
+  }
+});
+
+test('ffmpeg stderr is logged per line, and the noise is summarised once', async () => {
+  const log = makeLog();
+  const { delegate, spawned } = makeStreamDelegate({ log });
+  await startStream(delegate);
+  const proc = spawned[0].proc;
+
+  // ffmpeg writes in bursts that do not align with line boundaries.
+  proc.stderr.emit('data', Buffer.from(
+    'Stream mapping:\n[hevc @ 0x1] Could not find ref with POC 1\n[hevc @ 0x1] First slice in a frame missing.\n',
+  ));
+  proc.stderr.emit('data', Buffer.from('[hevc @ 0x1] Skipping invalid undecodable NALU: 1\nreal problem here\n'));
+  proc.emit('exit', 0, null);
+
+  const lines = log.entries.map((e) => e.msg);
+  assert.ok(lines.some((m) => /Stream mapping:/.test(m)), 'diagnostics survive');
+  assert.ok(lines.some((m) => /real problem here/.test(m)), 'unrecognised lines survive');
+  assert.ok(!lines.some((m) => /Could not find ref with POC/.test(m)), 'noise is suppressed');
+  const summary = lines.filter((m) => /suppressed 3 expected decoder warnings/.test(m));
+  assert.equal(summary.length, 1, `expected one summary line, got ${summary.length}`);
 });

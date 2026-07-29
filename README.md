@@ -49,7 +49,8 @@ plugin. The two coexist fine.
   it has already pushed; the full rate resumes the moment the feed drops.
 - **Cameras** — each camera appears in HomeKit with:
   - **Live video** — pulled from the camera's RTSPS stream and transcoded by ffmpeg
-    (typically ~2s to first frame). No account password, no cloud.
+    (typically ~2s to first frame). No account password, no cloud. Camera audio is available
+    behind `exposeCameraAudio`.
   - **Snapshots** — including the thumbnail on motion and doorbell notifications.
   - **Motion + smart detection** — a motion sensor per camera plus optional per-type sensors
     (person / vehicle / animal / package), driven by the realtime events feed.
@@ -63,7 +64,7 @@ plugin. The two coexist fine.
 
 ## Roadmap
 
-- **Camera audio** — the stream is video-only today; the API also supports two-way talkback.
+- **Two-way talkback** — the API supports it (Opus); camera audio already streams one way.
 - **Devices & settings** — chimes, lights, sensors, liveviews, and camera setting switches.
 - **Adaptive bitrate** — honour HomeKit's `reconfigure` requests instead of using a
   fixed per-resolution bitrate.
@@ -103,8 +104,10 @@ configure the plugin.
   any other supervised state is surfaced as a generic *fault*.
 - **SuperLink / wireless sensors** are not yet supported (they are adopted as separate
   devices); planned for a future release.
-- **Camera streams are video-only.** Audio (both camera audio and talkback) is not wired up
-  yet. Live video is transcoded, so several simultaneous viewers cost CPU on the Homebridge
+- **Camera audio is experimental and talkback is not implemented.** One-way audio works behind
+  `exposeCameraAudio`, but which codec you get depends on your ffmpeg build: HomeKit wants AAC-ELD,
+  and the bundled ffmpeg lists `libfdk_aac` yet cannot initialise the ELD profile, so it falls back
+  to Opus. Live video is transcoded, so several simultaneous viewers cost CPU on the Homebridge
   host; the stream bitrate is a fixed floor per resolution rather than adapting to HomeKit's
   requests.
 
