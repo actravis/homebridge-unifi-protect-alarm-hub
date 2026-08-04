@@ -97,3 +97,22 @@ jobs:
           cache: npm
 
       - run: npm audit --omit=dev --audit-level=high
+
+  secrets:
+    # Rule: secrets never reach logs, commits, or artifacts. The pattern layer catches unknown
+    # secrets by shape; the hash denylist in .secret-hashes catches known-real values that look
+    # ordinary (a live webhook Trigger ID is just a UUID). Same command CI and local, so the two
+    # cannot drift.
+    name: Secret scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No install step: the scanner is dependency-free by design, so a compromised dependency
+      # cannot influence the check that looks for leaked credentials.
+      - run: npm run scan:secrets
