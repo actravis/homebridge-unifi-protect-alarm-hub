@@ -607,3 +607,97 @@ test('an offline camera deactivates its alarm sensors too', async () => {
 
   assert.equal(smoke.getService(Service.SmokeSensor).value(C.StatusActive), false);
 });
+
+// --- Chimes ------------------------------------------------------------------
+
+const CHIME_TRIGGER = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+const chimeDevice = (over = {}) => ({
+  id: 'chime-1', modelKey: 'chime', name: 'Doorbell Chime', state: 'CONNECTED',
+  cameraIds: ['cam-1'],
+  ringSettings: [{ cameraId: 'cam-1', volume: 80, ringtoneId: 'ring-1', repeatTimes: 2 }],
+  ...over,
+});
+
+const withChime = { exposeCameraStreams: false, chimeTriggerId: CHIME_TRIGGER };
+
+test('a configured chime is registered as a ring button', async () => {
+  const { api, state } = await startPlatform(withChime, { hubs: [hub()], cameras: [], chimes: [chimeDevice()] });
+  assert.ok(names(api.registered).includes('Doorbell Chime'));
+  assert.equal(state.calls.getChimes, 1);
+});
+
+// The API has no ring endpoint, so without a Trigger ID there is nothing the button could do.
+// Skipping discovery entirely also saves a request against a 10/s rate limit.
+test('with neither control configured there is no chime accessory and no chime request', async () => {
+  const { api, state } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [], chimes: [chimeDevice()] },
+  );
+  assert.ok(!names(api.registered).includes('Doorbell Chime'));
+  assert.equal(state.calls.getChimes, 0);
+});
+
+test('exposeChimes:false skips chime discovery even with a Trigger ID', async () => {
+  const { api, state } = await startPlatform(
+    { ...withChime, exposeChimes: false },
+    { hubs: [hub()], cameras: [], chimes: [chimeDevice()] },
+  );
+  assert.ok(!names(api.registered).includes('Doorbell Chime'));
+  assert.equal(state.calls.getChimes, 0);
+});
+
+test('pressing the chime button fires the configured Alarm Manager webhook', async () => {
+  const { api, state } = await startPlatform(withChime, { hubs: [hub()], cameras: [], chimes: [chimeDevice()] });
+  const accessory = api.registered.find((a) => a.displayName === 'Doorbell Chime');
+  await accessory.getServiceById(Service.Switch, 'ring').getCharacteristic(C.On).setHandler(true);
+
+  assert.deepEqual(state.webhooks, [CHIME_TRIGGER]);
+});
+
+// The two controls are independent config knobs, so the mute switch must work with no Trigger ID.
+test('the mute switch alone is enough to create a chime accessory', async () => {
+  const { api, state } = await startPlatform(
+    { exposeCameraStreams: false, exposeChimeMute: true },
+    { hubs: [hub()], cameras: [], chimes: [chimeDevice()] },
+  );
+  const accessory = api.registered.find((a) => a.displayName === 'Doorbell Chime');
+  assert.ok(accessory, 'accessory exists with no Trigger ID configured');
+  assert.equal(accessory.getServiceById(Service.Switch, 'ring'), undefined, 'no ring button');
+
+  await accessory.getServiceById(Service.Switch, 'mute').getCharacteristic(C.On).setHandler(false);
+  assert.deepEqual(state.chimePatches.map((p) => p.patch.ringSettings[0].volume), [0]);
+  assert.deepEqual(state.webhooks, []);
+});
+
+// Chimes and cameras are reconciled separately; the domain tag is what stops each prune from
+// deleting the other's accessories.
+test('the camera reconcile never prunes a chime, and vice versa', async () => {
+  const { api, clock } = await startPlatform(withChime, { hubs: [hub()], cameras: [camera()], chimes: [chimeDevice()] });
+  assert.ok(names(api.registered).includes('Doorbell Chime'));
+  assert.ok(names(api.registered).includes('Front Yard'));
+
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.equal(api.unregistered.length, 0);
+});
+
+test('a chime removed from Protect is pruned', async () => {
+  const { api, state, clock } = await startPlatform(withChime, { hubs: [hub()], cameras: [], chimes: [chimeDevice()] });
+  state.chimes = [];
+  clock.cameraInterval().fn();
+  await flush();
+  assert.deepEqual(names(api.unregistered), ['Doorbell Chime']);
+});
+
+test('chime discovery failure warns once and does not stop camera discovery', async () => {
+  const { api, log, state } = await startPlatform(
+    withChime,
+    { hubs: [hub()], cameras: [camera()], chimes: [], chimesError: new Error('timeout') },
+  );
+  assert.equal(logged(log, 'warn').filter((m) => /Chime discovery failed/.test(m)).length, 1);
+  // The camera side must be unaffected by the chime failure.
+  assert.ok(names(api.registered).includes('Front Yard'));
+  assert.ok(state.calls.getCameras > 0);
+});

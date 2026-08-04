@@ -39,8 +39,19 @@ side gained a substantial round of reliability and security work.
   `CarbonMonoxideSensor` accessories rather than generic motion sensors, so a sounding alarm is a
   first-class automation trigger and can raise a Home hub critical notification. Only detections
   you have enabled in Protect are exposed. Enable with `exposeAudioSensors`.
+- **Doorbell chimes.** A chime can be exposed with two independent, optional controls:
+  - a **Ring button** that rings it on demand or from an automation, enabled by setting
+    `chimeTriggerId`;
+  - an **Audible switch** that mutes and unmutes it, enabled with `exposeChimeMute`.
+
+  Ringing goes through an Alarm Manager webhook because the Integration API has no ring endpoint
+  for chimes: create an alarm in Protect with a **Webhook** trigger and a chime action, then paste
+  its Trigger ID into `chimeTriggerId`. Without a Trigger ID no ring button is created, since a
+  button that cannot ring would fail silently inside an automation. Muting sets the ring volume to
+  0 for every paired camera and restores the previous level on unmute, preserving each camera's
+  chosen ringtone and repeat count.
 - New options: `exposeCameras`, `exposeObjectSensors`, `exposeAudioSensors`, `exposeCameraStreams`,
-  `exposeCameraAudio`,
+  `exposeCameraAudio`, `exposeChimes`, `chimeTriggerId`, `exposeChimeMute`,
   `exposeDoorbellTriggers`, `doorbellDeviceIds`, `exposeAlarm` (for a cameras-only setup), and
   `realtimeIdleTimeout`.
 - ffmpeg is supplied automatically via the optional `ffmpeg-for-homebridge` dependency, falling

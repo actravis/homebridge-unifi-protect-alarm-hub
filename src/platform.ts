@@ -13,6 +13,8 @@ import type { AccessoryHandler, AlarmHub, ProtectEvent } from './types';
 import { SecuritySystemAccessory } from './accessories/securitySystem';
 import { HubAccessory, ReadonlyContactAccessory, ZoneAccessory } from './accessories/sensors';
 import { AlarmSensorAccessory, CameraAccessory, ObjectSensorAccessory } from './accessories/camera';
+import { ChimeAccessory } from './accessories/chime';
+import { chimeKey, planChimeAccessories } from './chimeDiscovery';
 import { planAccessories, type PlannedAccessory } from './discovery';
 import { basePollSeconds, effectivePollSeconds } from './pollPolicy';
 import { audioSensorKey, cameraKey, objectSensorKey, objectSensorName, planCameraAccessories } from './cameraDiscovery';
@@ -36,13 +38,13 @@ interface AccessorySpec {
 const STALE_AFTER_FAILURES = 3;
 
 /**
- * How often to re-run camera discovery.
+ * How often to re-discover the non-alarm devices (cameras, chimes).
  *
- * Cameras used to be discovered only at startup and on an events-socket reconnect, so a camera
- * added, renamed, or unplugged in Protect could go unnoticed for hours. This is one request per
- * interval for the whole plugin, so it is cheap even against the console's ~10 req/s budget.
+ * These used to be discovered only at startup and on an events-socket reconnect, so a device added,
+ * renamed, or unplugged in Protect could go unnoticed for hours. It is one request per device class
+ * per interval, so it stays cheap against the console's ~10 req/s budget.
  */
-const CAMERA_DISCOVERY_SECONDS = 300;
+const DEVICE_DISCOVERY_SECONDS = 300;
 
 /**
  * The I/O boundaries the platform owns, injectable so discovery, reconcile and the poll
@@ -77,6 +79,8 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   private readonly objectHandlers = new Map<string, ObjectSensorAccessory>();
   /** Native smoke / CO sensors driven by the cameras' audio detection, keyed by accessory UUID. */
   private readonly alarmHandlers = new Map<string, AlarmSensorAccessory>();
+  private readonly chimeHandlers = new Map<string, ChimeAccessory>();
+  private chimeDiscoveryOk = true;
   private disposeEvents?: () => void;
   private syncingCameras = false;
   private resyncCameras = false;
@@ -233,14 +237,14 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       // Discover cameras regardless of the realtime setting. This used to live inside the
       // realtime branch, so `useRealtime: false` silently produced no camera accessories at
       // all. Without realtime the accessories still work; they just don't get live detections.
-      if (this.config.exposeCameras !== false) {
-        if (this.config.useRealtime === false) {
-          this.log.info('Realtime is off: cameras are exposed but motion/doorbell events will not fire.');
-        }
-        void this.syncCameras();
-        // Detections arrive over the events socket, but a camera being added, renamed, or going
+      if (this.config.exposeCameras !== false && this.config.useRealtime === false) {
+        this.log.info('Realtime is off: cameras are exposed but motion/doorbell events will not fire.');
+      }
+      if (this.config.exposeCameras !== false || this.config.exposeChimes !== false) {
+        void this.syncDevices();
+        // Detections arrive over the events socket, but a device being added, renamed, or going
         // offline does not — that only shows up in a discovery pass.
-        this.cameraTimer = this.deps.setInterval(() => void this.syncCameras(), CAMERA_DISCOVERY_SECONDS * 1000);
+        this.cameraTimer = this.deps.setInterval(() => void this.syncDevices(), DEVICE_DISCOVERY_SECONDS * 1000);
       }
       if (alarmEnabled && this.sirenChannels.size) {
         const shown = [...this.sirenChannels].map((c) => Number(c) + 1).join(', ');
@@ -304,7 +308,10 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     // survives a Homebridge restart, keeps its sockets, and accumulates on each restart.
     // Each shutdown is isolated, or one throwing handler would skip the rest AND the client
     // close below — turning a cosmetic failure into leaked processes and sockets.
-    for (const uuid of [...this.cameraHandlers.keys(), ...this.objectHandlers.keys(), ...this.alarmHandlers.keys()]) {
+    for (const uuid of [
+      ...this.cameraHandlers.keys(), ...this.objectHandlers.keys(),
+      ...this.alarmHandlers.keys(), ...this.chimeHandlers.keys(),
+    ]) {
       this.shutdownCameraHandler(uuid);
     }
     void this.client?.close();
@@ -515,6 +522,74 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
 
   // ---- Cameras (event-driven; separate from the alarm-hub poll/reconcile) ----
 
+  /** One discovery pass over every non-alarm device class. */
+  private async syncDevices(): Promise<void> {
+    await this.syncCameras();
+    await this.syncChimes();
+  }
+
+  /**
+   * Discover chimes and reconcile their accessories.
+   *
+   * Kept separate from the camera reconcile rather than folded into it: they are different device
+   * classes with different config gates, and a failure fetching one must not stop the other.
+   */
+  private async syncChimes(): Promise<void> {
+    const client = this.client;
+    // With neither a ring trigger nor the mute switch there is nothing to expose, so don't spend a
+    // request discovering chimes at all.
+    const anyChimeControl = !!this.config.chimeTriggerId?.trim() || this.config.exposeChimeMute === true;
+    if (!client || this.stopped || this.config.exposeChimes === false || !anyChimeControl) {
+      return;
+    }
+    let chimes;
+    try {
+      chimes = await client.getChimes();
+    } catch (err) {
+      if (this.chimeDiscoveryOk) {
+        this.chimeDiscoveryOk = false;
+        this.log.warn(`Chime discovery failed: ${(err as Error).message}. Will keep retrying.`);
+      }
+      return;
+    }
+    if (this.stopped) {
+      return;
+    }
+    if (!this.chimeDiscoveryOk) {
+      this.chimeDiscoveryOk = true;
+      this.log.info('Chime discovery recovered.');
+    }
+
+    const { Categories, uuid } = this.api.hap;
+    const desired = new Set<string>();
+    for (const plan of planChimeAccessories(chimes, this.config)) {
+      const id = uuid.generate(chimeKey(plan.deviceId));
+      desired.add(id);
+      let handler = this.chimeHandlers.get(id);
+      if (!handler) {
+        const accessory = this.acquireAccessory(id, plan.name, Categories.SWITCH, 'chime');
+        handler = new ChimeAccessory(this, accessory, {
+          name: plan.name,
+          serial: plan.deviceId,
+          source: client,
+        });
+        this.chimeHandlers.set(id, handler);
+      } else if (this.renameAccessory(id, plan.name)) {
+        handler.setName(plan.name);
+      }
+      handler.update(plan);
+    }
+
+    for (const [id, accessory] of this.accessories) {
+      if (accessory.context.domain === 'chime' && !desired.has(id)) {
+        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.accessories.delete(id);
+        this.chimeHandlers.delete(id);
+        this.log.info(`Removed chime accessory "${accessory.displayName}".`);
+      }
+    }
+  }
+
   /** Discover cameras and create/prune their accessories (overall motion, doorbell, object sensors). */
   private async syncCameras(): Promise<void> {
     if (!this.client || this.stopped || this.config.exposeCameras === false) {
@@ -704,6 +779,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       this.cameraHandlers.get(uuid)?.shutdown();
       this.objectHandlers.get(uuid)?.shutdown();
       this.alarmHandlers.get(uuid)?.shutdown();
+      this.chimeHandlers.get(uuid)?.shutdown();
     } catch (err) {
       this.log.debug(`Camera shutdown failed: ${(err as Error).message}`);
     }
@@ -739,17 +815,28 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     return true;
   }
 
-  /** Get-or-create a registered accessory tagged as camera-domain. */
-  private acquireAccessory(uuid: string, name: string, category: number): PlatformAccessory {
+  /**
+   * Get-or-create a registered accessory tagged with its device domain.
+   *
+   * The domain is what keeps the reconcilers from deleting each other's work: each one only prunes
+   * accessories it owns. Chimes get their own domain rather than borrowing the cameras' — sharing it
+   * would mean the camera prune had to special-case every non-camera accessory it encountered.
+   */
+  private acquireAccessory(
+    uuid: string,
+    name: string,
+    category: number,
+    domain: 'camera' | 'chime' = 'camera',
+  ): PlatformAccessory {
     let accessory = this.accessories.get(uuid);
     if (!accessory) {
       accessory = new this.api.platformAccessory(name, uuid, category);
-      accessory.context.domain = 'camera';
+      accessory.context.domain = domain;
       this.accessories.set(uuid, accessory);
       this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       this.log.info(`Added accessory "${name}".`);
     } else {
-      accessory.context.domain = 'camera'; // ensure a restored cached accessory is tagged
+      accessory.context.domain = domain; // ensure a restored cached accessory is tagged
       // Category is baked into the cached accessory. Turning `exposeCameraStreams` on for a
       // camera that was first discovered as a plain sensor would otherwise leave it showing a
       // sensor tile forever, because reuse skipped the constructor that sets this.

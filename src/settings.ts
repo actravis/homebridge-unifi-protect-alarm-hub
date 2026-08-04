@@ -33,10 +33,20 @@ export interface ProtectConfig extends PlatformConfig {
   exposeCameraStreams?: boolean;
   /** Include camera audio in the live stream — default off (experimental). */
   exposeCameraAudio?: boolean;
+  /**
+   * Alarm Manager Trigger ID for an alarm whose action rings the chime. Required for the chime
+   * ring button: the Integration API has no play/ring endpoint, so this webhook is the only
+   * supported way to ring one. Without it, no ring button is created.
+   */
+  chimeTriggerId?: string;
+  /** Add a per-chime "Audible" mute switch — opt-in, since it is a second tile per chime. */
+  exposeChimeMute?: boolean;
   /** Add a per-camera "Doorbell Trigger" switch that fires a ring from automations — default off. */
   exposeDoorbellTriggers?: boolean;
   /** Device IDs to force-treat as doorbells, overriding the LCD-screen heuristic. */
   doorbellDeviceIds?: string[];
+  /** Master toggle for chime accessories — default on; also needs a ring trigger and/or mute. */
+  exposeChimes?: boolean;
   /** Comma-separated, 1-indexed output channel(s) that mean a real alarm. Blank = any output. */
   sirenOutputChannels?: string;
 

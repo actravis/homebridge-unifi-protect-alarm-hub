@@ -119,6 +119,36 @@ export interface RtspsStreams {
 }
 
 /**
+ * One chime's ring configuration for a single paired camera. `ringSettings` is an array because a
+ * chime can be paired to several cameras with different volumes.
+ *
+ * Confirmed against a live chime; `ringtoneId` refers to a ringtone the API gives us no way to
+ * enumerate (`/chimes/{id}/ringtones` is 404), so it is carried through untouched on writes.
+ */
+export interface ChimeRingSetting {
+  cameraId?: string;
+  /** 0-100. Writable via PATCH — verified with a round-trip on real hardware. */
+  volume?: number;
+  ringtoneId?: string;
+  repeatTimes?: number;
+}
+
+/**
+ * The writable subset of a chime. Deliberately narrow: the API rejects unknown fields, and only
+ * `ringSettings` has been verified to round-trip. Note the write replaces the whole array, so
+ * always send back every field of every entry.
+ */
+export interface ChimeSettingsPatch {
+  ringSettings?: ChimeRingSetting[];
+}
+
+export interface Chime extends ProtectDevice {
+  /** Cameras whose ring triggers this chime. */
+  cameraIds?: string[];
+  ringSettings?: ChimeRingSetting[];
+}
+
+/**
  * A semantic event from the `/subscribe/events` WebSocket — far richer than the thin
  * `/subscribe/devices` deltas. `item.type` is the event kind (motion, smartDetectZone,
  * ring, alarmHubEntryOpened, …); `item.device` is the source device id; smart detections

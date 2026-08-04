@@ -1,6 +1,6 @@
 import type { TLSSocket } from 'node:tls';
 import { Agent, buildConnector, fetch, WebSocket } from 'undici';
-import type { AlarmHub, Camera, ProtectEvent, RtspsStreams } from '../types';
+import type { AlarmHub, Camera, Chime, ChimeSettingsPatch, ProtectEvent, RtspsStreams } from '../types';
 import { computeRetryDelay, exponentialBackoff, jitter, reconnectDelay, reserveSlot } from './timing';
 
 /** Undici's Response type (avoids depending on the DOM lib for a global `Response`). */
@@ -218,6 +218,19 @@ export class ProtectClient {
     return this.request<void>(`/alarm-manager/webhook/${encodeURIComponent(triggerId)}`, { method: 'POST' });
   }
 
+  /**
+   * Update a chime's writable settings. Only `ringSettings` is verified to round-trip; the API
+   * rejects unknown fields, and the write REPLACES the whole array (see ChimeSettingsPatch).
+   */
+  patchChime(id: string, patch: ChimeSettingsPatch): Promise<Chime> {
+    return this.request<Chime>(`/chimes/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      // A plain object: `request` serializes it. Passing a pre-stringified body double-encodes it
+      // and the console answers 400.
+      body: patch,
+    });
+  }
+
   // ---- Cameras ----
 
   getCameras(): Promise<Camera[]> {
@@ -258,6 +271,13 @@ export class ProtectClient {
     }
     return Buffer.from(await res.arrayBuffer());
   }
+
+  // ---- Chimes ----
+
+  getChimes(): Promise<Chime[]> {
+    return this.request<Chime[]>('/chimes');
+  }
+
 
   /** Free the connection pool. */
   async close(): Promise<void> {

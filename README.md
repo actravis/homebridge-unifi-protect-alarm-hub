@@ -57,6 +57,14 @@ plugin. The two coexist fine.
   - **Doorbell** — ring events for doorbell cameras, and an optional per-camera trigger
     switch so any camera can ring the doorbell from an automation.
 
+- **Doorbell chimes** — a chime can appear with either or both of:
+  - a **Ring button** to ring it on demand or from an automation (set `chimeTriggerId`);
+  - an **Audible switch** to mute and unmute it (`exposeChimeMute`), for automations like
+    "silent after 10pm". Muting preserves each camera's ringtone and repeat count.
+
+  Ringing needs a one-time setup step because the Integration API has no ring endpoint for
+  chimes — see [Ringing a chime](#ringing-a-chime).
+
   Cameras appear automatically with the bridge — no per-camera pairing. Cameras are
   re-discovered every few minutes, so one added, renamed, or unplugged in Protect is picked up
   without a restart; a camera Protect reports as disconnected is marked unavailable in HomeKit
@@ -65,7 +73,7 @@ plugin. The two coexist fine.
 ## Roadmap
 
 - **Two-way talkback** — the API supports it (Opus); camera audio already streams one way.
-- **Devices & settings** — chimes, lights, sensors, liveviews, and camera setting switches.
+- **Devices & settings** — lights, sensors, liveviews, and camera setting switches.
 - **Adaptive bitrate** — honour HomeKit's `reconfigure` requests instead of using a
   fixed per-resolution bitrate.
 
@@ -95,6 +103,23 @@ plugin. The two coexist fine.
 All settings are documented inline in the Homebridge UI — you shouldn't need this file to
 configure the plugin.
 
+## Ringing a chime
+
+The official API exposes a chime's settings but has no endpoint to make it ring, so the plugin
+rings it through **Alarm Manager**, which can act on hardware the REST API does not expose:
+
+1. In UniFi Protect, open **Alarm Manager** and create an alarm.
+2. Give it a **Webhook** trigger and an action that plays your chime.
+3. Copy the alarm's **Trigger ID** into the plugin's `chimeTriggerId` setting.
+
+The ring button appears once a Trigger ID is set. With none configured, no ring button is created
+at all — a button that cannot ring looks functional in the Home app and then fails silently inside
+an automation.
+
+The webhook requires your API key, so the Trigger ID is not on its own enough for someone on your
+network to fire it. The mute switch (`exposeChimeMute`) needs no setup; it uses the chime's normal
+settings endpoint.
+
 ## Limitations
 
 - **Outputs are read-only.** UniFi does not yet expose a way to trigger alarm-hub outputs
@@ -104,6 +129,9 @@ configure the plugin.
   any other supervised state is surfaced as a generic *fault*.
 - **SuperLink / wireless sensors** are not yet supported (they are adopted as separate
   devices); planned for a future release.
+- **Chimes cannot be rung by the API directly.** Ringing requires an Alarm Manager webhook (see
+  [Ringing a chime](#ringing-a-chime)); every chime play/ring endpoint returns 404. Ringtones
+  cannot be listed or changed either — the plugin preserves whatever you set in Protect.
 - **Camera audio is experimental and talkback is not implemented.** One-way audio works behind
   `exposeCameraAudio`, but which codec you get depends on your ffmpeg build: HomeKit wants AAC-ELD,
   and the bundled ffmpeg lists `libfdk_aac` yet cannot initialise the ELD profile, so it falls back

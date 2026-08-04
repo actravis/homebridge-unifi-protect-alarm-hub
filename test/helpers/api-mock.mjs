@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { Characteristic, FakeAccessory, Service, makeLog } from './hap-mock.mjs';
 
 /** Real hap Categories values for the ones the platform uses. */
-const Categories = { SECURITY_SYSTEM: 11, SENSOR: 10, CAMERA: 17, VIDEO_DOORBELL: 18 };
+const Categories = { SECURITY_SYSTEM: 11, SENSOR: 10, SWITCH: 8, CAMERA: 17, VIDEO_DOORBELL: 18 };
 
 /**
  * Deterministic stand-in for hap's uuid.generate. Only the mapping matters here — the property
@@ -74,11 +74,17 @@ export function fakeClient(overrides = {}) {
   const state = {
     hubs: [],
     cameras: [],
+    chimes: [],
     version: { applicationVersion: '7.1.87' },
     /** Set to an Error (or a function returning one) to make getAlarmHubs reject. */
     hubsError: undefined,
     camerasError: undefined,
-    calls: { getAlarmHubs: 0, getCameras: 0 },
+    chimesError: undefined,
+    /** Every fireWebhook call, so tests assert on which Alarm Manager trigger was fired. */
+    webhooks: [],
+    /** Every patchChime call, so tests assert on what was actually written. */
+    chimePatches: [],
+    calls: { getAlarmHubs: 0, getCameras: 0, getChimes: 0 },
     closed: false,
     devices: undefined, // { onChange, log, hooks, dispose }
     events: undefined,
@@ -104,6 +110,25 @@ export function fakeClient(overrides = {}) {
       }
       return state.cameras;
     },
+    async getChimes() {
+      state.calls.getChimes += 1;
+      if (state.chimesError) {
+        throw state.chimesError;
+      }
+      return state.chimes;
+    },
+    async patchChime(id, patch) {
+      state.chimePatches.push({ id, patch });
+      if (state.chimePatchError) {
+        throw state.chimePatchError;
+      }
+      // Mirror the console: the write replaces ringSettings wholesale.
+      const chime = state.chimes.find((c) => c.id === id);
+      if (chime && patch.ringSettings) {
+        chime.ringSettings = patch.ringSettings;
+      }
+      return chime;
+    },
     async getSnapshot() {
       return Buffer.from([0]);
     },
@@ -113,7 +138,12 @@ export function fakeClient(overrides = {}) {
     async enableRtspsStream() {
       return {};
     },
-    async fireWebhook() {},
+    async fireWebhook(triggerId) {
+      state.webhooks.push(triggerId);
+      if (state.webhookError) {
+        throw state.webhookError;
+      }
+    },
     subscribeDevices(onChange, log, hooks = {}) {
       state.devices = { onChange, log, hooks, disposed: false };
       return () => {

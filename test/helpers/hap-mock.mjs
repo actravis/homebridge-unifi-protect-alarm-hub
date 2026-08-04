@@ -116,12 +116,27 @@ export class FakeAccessory {
     /** Set by configureController — how tests reach the streaming delegate. */
     this.controller = undefined;
   }
+  /**
+   * Services are keyed by type *and* subtype, because HAP lets one accessory carry several services
+   * of the same type distinguished only by subtype — a chime does exactly that, with a ring button
+   * and a mute switch both being Switches.
+   */
+  static key(token, subtype) {
+    return subtype === undefined ? token : `${token?.svcName ?? String(token)}::${subtype}`;
+  }
   getService(token) {
     return this.services.get(token);
   }
-  addService(token) {
+  getServiceById(token, subtype) {
+    return this.services.get(FakeAccessory.key(token, subtype));
+  }
+  addService(token, name, subtype) {
     const service = new FakeService(token);
-    this.services.set(token, service);
+    if (name !== undefined) {
+      service.updateCharacteristic(Characteristic.Name, name);
+    }
+    service.subtype = subtype;
+    this.services.set(FakeAccessory.key(token, subtype), service);
     return service;
   }
   removeService(token) {

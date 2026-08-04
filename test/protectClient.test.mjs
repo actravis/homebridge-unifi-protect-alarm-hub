@@ -243,6 +243,28 @@ test('enableRtspsStream POSTs the qualities body to the right path', async () =>
   assert.match(calls[0].url, /\/cameras\/cam1\/rtsps-stream$/);
 });
 
+// `request` serializes the body itself, so a method that pre-stringifies double-encodes it and the
+// console answers 400. Asserting the parsed body is an object catches that; asserting only that the
+// request was made does not. (Regression: patchChime shipped double-encoded and 400'd on hardware.)
+test('patchChime PATCHes a JSON object body, not a double-encoded string', async () => {
+  const ringSettings = [{ cameraId: 'cam1', volume: 0, ringtoneId: 'r1', repeatTimes: 1 }];
+  const { client, calls } = makeClient(() => makeResponse({ json: { id: 'chime1', ringSettings } }));
+  await client.patchChime('chime1', { ringSettings });
+
+  assert.equal(calls[0].init.method, 'PATCH');
+  assert.match(calls[0].url, /\/chimes\/chime1$/);
+  assert.equal(calls[0].init.headers['Content-Type'], 'application/json');
+  const parsed = JSON.parse(calls[0].init.body);
+  assert.equal(typeof parsed, 'object', 'a double-encoded body parses to a string');
+  assert.deepEqual(parsed, { ringSettings });
+});
+
+test('patchChime percent-encodes the device id', async () => {
+  const { client, calls } = makeClient(() => makeResponse({ json: {} }));
+  await client.patchChime('a/b', { ringSettings: [] });
+  assert.match(calls[0].url, /\/chimes\/a%2Fb$/);
+});
+
 // --- Realtime WebSocket -----------------------------------------------------
 
 test('subscribeDevices fires only on linkstation changes, reconnects on close, and disposes cleanly', () => {
