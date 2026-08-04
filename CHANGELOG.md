@@ -17,6 +17,13 @@ side gained a substantial round of reliability and security work.
 - Alarm Hub accessories are **unchanged** across the rename — their identities are identical,
   so rooms, custom names, and automations carry over without re-pairing.
 
+### Fixed
+
+- **A disabled feature no longer leaves a dead accessory behind.** Turning off cameras or chimes
+  (or leaving a chime unconfigured) skipped reconciliation entirely, so an accessory cached from an
+  earlier config stayed registered with nothing driving it: HomeKit showed the tile at its last
+  known value and silently ignored every change. Those accessories are now removed.
+
 ### Added
 
 - **Cameras.** Each camera appears in HomeKit with live video, snapshots, and a motion sensor.

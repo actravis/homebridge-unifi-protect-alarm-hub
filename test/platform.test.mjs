@@ -701,3 +701,80 @@ test('chime discovery failure warns once and does not stop camera discovery', as
   assert.ok(names(api.registered).includes('Front Yard'));
   assert.ok(state.calls.getCameras > 0);
 });
+
+// --- Orphaned accessories when a feature is switched off ----------------------
+// Skipping a domain by returning early leaves any cached accessory registered with no handler
+// bound: HomeKit shows the tile at its last cached value and silently discards writes. That is
+// exactly what happened in the field — a chime switch stuck "on" that did nothing after the chime
+// gained a config gate it had not needed before.
+
+/** Replay a cached accessory the way Homebridge does, before didFinishLaunching. */
+async function startWithCached(config, clientState, cachedName, domain, seed) {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  const client = fakeClient(clientState);
+  const platform = new UnifiProtectPlatform(
+    log,
+    { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key', ...config },
+    api,
+    { createClient: () => client, ...clock.deps },
+  );
+  const cached = new api.platformAccessory(cachedName, generateUuid(seed), 8);
+  cached.context.domain = domain;
+  platform.configureAccessory(cached);
+  api.emit('didFinishLaunching');
+  await flush();
+  return { api, log, state: client.state };
+}
+
+test('a cached chime accessory is pruned when no chime controls are configured', async () => {
+  const { api, log, state } = await startWithCached(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [], chimes: [chimeDevice()] },
+    'Doorbell Chime', 'chime', 'chime-1:chime',
+  );
+  assert.deepEqual(names(api.unregistered), ['Doorbell Chime'], 'a dead switch must not linger');
+  assert.equal(state.calls.getChimes, 0, 'and no request is wasted discovering chimes');
+  assert.ok(logged(log, 'info').some((m) => /no chime controls configured/.test(m)));
+});
+
+test('a cached chime accessory is pruned when exposeChimes is turned off', async () => {
+  const { api, log } = await startWithCached(
+    { exposeCameraStreams: false, exposeChimes: false, chimeTriggerId: CHIME_TRIGGER },
+    { hubs: [hub()], cameras: [], chimes: [chimeDevice()] },
+    'Doorbell Chime', 'chime', 'chime-1:chime',
+  );
+  assert.deepEqual(names(api.unregistered), ['Doorbell Chime']);
+  assert.ok(logged(log, 'info').some((m) => /exposeChimes is off/.test(m)));
+});
+
+test('a configured chime accessory is kept, not pruned', async () => {
+  const { api } = await startWithCached(
+    { exposeCameraStreams: false, chimeTriggerId: CHIME_TRIGGER },
+    { hubs: [hub()], cameras: [], chimes: [chimeDevice()] },
+    'Doorbell Chime', 'chime', 'chime-1:chime',
+  );
+  assert.equal(api.unregistered.length, 0);
+});
+
+test('a cached camera accessory is pruned when exposeCameras is turned off', async () => {
+  const { api, log } = await startWithCached(
+    { exposeCameras: false },
+    { hubs: [hub()], cameras: [camera()] },
+    'Front Yard', 'camera', 'cam-1:camera',
+  );
+  assert.deepEqual(names(api.unregistered), ['Front Yard']);
+  assert.ok(logged(log, 'info').some((m) => /exposeCameras is off/.test(m)));
+});
+
+// Pruning must not take the alarm side with it — the domains are independent.
+test('pruning a disabled domain leaves other domains alone', async () => {
+  const { api } = await startWithCached(
+    { exposeCameras: false },
+    { hubs: [hub()] },
+    'Front Yard', 'camera', 'cam-1:camera',
+  );
+  assert.deepEqual(names(api.unregistered), ['Front Yard']);
+  assert.ok(names(api.registered).includes('Security System'), 'alarm accessories still registered');
+});

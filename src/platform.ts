@@ -538,10 +538,18 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
    */
   private async syncChimes(): Promise<void> {
     const client = this.client;
+    if (!client || this.stopped) {
+      return;
+    }
     // With neither a ring trigger nor the mute switch there is nothing to expose, so don't spend a
-    // request discovering chimes at all.
+    // request discovering chimes — but DO prune, or a chime accessory cached from an earlier config
+    // lingers as a dead switch.
     const anyChimeControl = !!this.config.chimeTriggerId?.trim() || this.config.exposeChimeMute === true;
-    if (!client || this.stopped || this.config.exposeChimes === false || !anyChimeControl) {
+    if (this.config.exposeChimes === false || !anyChimeControl) {
+      this.pruneDomain(
+        'chime',
+        this.config.exposeChimes === false ? 'exposeChimes is off' : 'no chime controls configured',
+      );
       return;
     }
     let chimes;
@@ -594,7 +602,11 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
 
   /** Discover cameras and create/prune their accessories (overall motion, doorbell, object sensors). */
   private async syncCameras(): Promise<void> {
-    if (!this.client || this.stopped || this.config.exposeCameras === false) {
+    if (!this.client || this.stopped) {
+      return;
+    }
+    if (this.config.exposeCameras === false) {
+      this.pruneDomain('camera', 'exposeCameras is off');
       return;
     }
     if (this.syncingCameras) {
@@ -788,6 +800,31 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   }
 
   /** Stop a camera or object-sensor handler's background work, whichever kind it is. */
+  /**
+   * Unregister every accessory in a domain.
+   *
+   * Called when a feature is switched off or was never configured. Returning early WITHOUT this
+   * leaves a cached accessory registered with no handler bound: HomeKit keeps showing the tile at
+   * whatever value it last cached and silently discards writes, which is exactly the "control that
+   * looks functional but cannot work" failure. Reconciling to an empty set is the only safe way to
+   * skip a domain.
+   */
+  private pruneDomain(domain: 'camera' | 'chime', reason: string): void {
+    // Snapshot: unregistering mutates the map we are iterating.
+    for (const [id, accessory] of [...this.accessories]) {
+      if (accessory.context.domain !== domain) {
+        continue;
+      }
+      this.shutdownCameraHandler(id);
+      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      this.accessories.delete(id);
+      this.cameraHandlers.delete(id);
+      this.chimeHandlers.delete(id);
+      this.objectHandlers.delete(id);
+      this.log.info(`Removed ${domain} accessory "${accessory.displayName}" (${reason}).`);
+    }
+  }
+
   private shutdownCameraHandler(uuid: string): void {
     try {
       this.cameraHandlers.get(uuid)?.shutdown();
