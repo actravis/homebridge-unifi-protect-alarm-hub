@@ -119,6 +119,20 @@ export interface RtspsStreams {
 }
 
 /**
+ * Where to send talkback audio, from POST /cameras/{id}/talkback-session.
+ *
+ * Observed stable on real hardware: the same `rtp://<camera-ip>:<port>` on every call, so there is
+ * no per-session allocation and nothing to tear down (GET and DELETE both 404). The host is the
+ * CAMERA, not the console.
+ */
+export interface TalkbackSession {
+  url?: string;
+  codec?: string;
+  samplingRate?: number;
+  bitsPerSample?: number;
+}
+
+/**
  * One chime's ring configuration for a single paired camera. `ringSettings` is an array because a
  * chime can be paired to several cameras with different volumes.
  *

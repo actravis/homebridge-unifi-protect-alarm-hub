@@ -50,7 +50,7 @@ plugin. The two coexist fine.
 - **Cameras** — each camera appears in HomeKit with:
   - **Live video** — pulled from the camera's RTSPS stream and transcoded by ffmpeg
     (typically ~2s to first frame). No account password, no cloud. Camera audio is available
-    behind `exposeCameraAudio`.
+    behind `exposeCameraAudio`, and two-way talkback behind `exposeTalkback`.
   - **Snapshots** — including the thumbnail on motion and doorbell notifications.
   - **Motion + smart detection** — a motion sensor per camera plus optional per-type sensors
     (person / vehicle / animal / package), driven by the realtime events feed.
@@ -72,7 +72,6 @@ plugin. The two coexist fine.
 
 ## Roadmap
 
-- **Two-way talkback** — the API supports it (Opus); camera audio already streams one way.
 - **Devices & settings** — lights, sensors, liveviews, and camera setting switches.
 - **Adaptive bitrate** — honour HomeKit's `reconfigure` requests instead of using a
   fixed per-resolution bitrate.
@@ -132,7 +131,11 @@ settings endpoint.
 - **Chimes cannot be rung by the API directly.** Ringing requires an Alarm Manager webhook (see
   [Ringing a chime](#ringing-a-chime)); every chime play/ring endpoint returns 404. Ringtones
   cannot be listed or changed either — the plugin preserves whatever you set in Protect.
-- **Camera audio is experimental and talkback is not implemented.** One-way audio works behind
+- **Talkback needs a route to the camera itself.** The console hands back an RTP target on the
+  **camera's** IP, not the console's, so Homebridge must be able to reach the camera directly —
+  unlike live video, which only ever talks to the console. Cameras on an isolated IoT VLAN will
+  stream fine but cannot receive talkback.
+- **Camera audio and talkback are experimental.** One-way audio works behind
   `exposeCameraAudio`, but which codec you get depends on your ffmpeg build: HomeKit wants AAC-ELD,
   and the bundled ffmpeg lists `libfdk_aac` yet cannot initialise the ELD profile, so it falls back
   to Opus. Live video is transcoded, so several simultaneous viewers cost CPU on the Homebridge

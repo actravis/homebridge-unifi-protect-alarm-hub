@@ -161,6 +161,12 @@
         "default": false,
         "description": "Include the camera microphone in the live stream. Needs an ffmpeg that can encode a codec HomeKit accepts \u2014 AAC-ELD (libfdk_aac) or Opus (libopus); the bundled ffmpeg provides Opus. The plugin tests this at startup and logs which codec it chose, or falls back to video-only if neither works. Experimental: audio changes how iOS negotiates the stream, so if live view stops working, turn this off first."
       },
+      "exposeTalkback": {
+        "title": "Two-way audio (talkback, experimental)",
+        "type": "boolean",
+        "default": false,
+        "description": "Talk from the Home app to a camera's speaker. Requires camera audio to be enabled, a camera with a speaker, and a network route from Homebridge to the camera itself (the talkback target is the camera's own IP, not the console's)."
+      },
       "refreshInterval": {
         "title": "Fallback refresh interval (seconds)",
         "type": "integer",
@@ -242,6 +248,7 @@
         "exposeDoorbellTriggers",
         "exposeCameraStreams",
         "exposeCameraAudio",
+        "exposeTalkback",
         "doorbellDeviceIds",
         "exposeChimes",
         "chimeTriggerId",

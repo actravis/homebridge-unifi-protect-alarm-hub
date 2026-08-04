@@ -1,6 +1,8 @@
 import type { TLSSocket } from 'node:tls';
 import { Agent, buildConnector, fetch, WebSocket } from 'undici';
-import type { AlarmHub, Camera, Chime, ChimeSettingsPatch, ProtectEvent, RtspsStreams } from '../types';
+import type {
+  AlarmHub, Camera, Chime, ChimeSettingsPatch, ProtectEvent, RtspsStreams, TalkbackSession,
+} from '../types';
 import { computeRetryDelay, exponentialBackoff, jitter, reconnectDelay, reserveSlot } from './timing';
 
 /** Undici's Response type (avoids depending on the DOM lib for a global `Response`). */
@@ -235,6 +237,17 @@ export class ProtectClient {
 
   getCameras(): Promise<Camera[]> {
     return this.request<Camera[]>('/cameras');
+  }
+
+  /**
+   * Ask the camera where to send talkback audio. POST arms the camera's listener and returns the
+   * target; it is idempotent in practice (same target every call) and there is no session to close.
+   */
+  startTalkbackSession(id: string): Promise<TalkbackSession> {
+    return this.request<TalkbackSession>(
+      `/cameras/${encodeURIComponent(id)}/talkback-session`,
+      { method: 'POST' },
+    );
   }
 
   /**

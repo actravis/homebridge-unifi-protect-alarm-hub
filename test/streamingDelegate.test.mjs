@@ -229,6 +229,11 @@ class FakeProc extends EventEmitter {
   constructor() {
     super();
     this.stderr = new EventEmitter();
+    // Talkback writes its SDP to stdin; record it so tests can assert on what ffmpeg was told.
+    this.stdinChunks = [];
+    this.stdin = Object.assign(new EventEmitter(), {
+      end: (chunk) => { if (chunk) this.stdinChunks.push(String(chunk)); this.stdinEnded = true; },
+    });
     this.exitCode = null;
     this.killed = false;
     this.signals = [];
@@ -531,4 +536,138 @@ test('ffmpeg stderr is logged per line, and the noise is summarised once', async
   assert.ok(!lines.some((m) => /Could not find ref with POC/.test(m)), 'noise is suppressed');
   const summary = lines.filter((m) => /suppressed 3 expected decoder warnings/.test(m));
   assert.equal(summary.length, 1, `expected one summary line, got ${summary.length}`);
+});
+
+// --- Talkback (two-way audio) -----------------------------------------------
+// The camera's talkback listener is a plain RTP sink on the CAMERA's IP; HomeKit's microphone
+// arrives as SRTP on the audio port we advertised. So talkback is a second ffmpeg, and the audio
+// port changes owner — which is the part most likely to break one-way streaming if it regresses.
+
+const OPUS = { encoder: 'libopus', hapCodec: 'OPUS' };
+const talkbackStart = (sessionID = 's1') => ({
+  ...startRequest(sessionID),
+  audio: { port: 50002, pt: 110, sample_rate: 24, max_bit_rate: 24, packet_time: 20 },
+});
+
+/** prepare + start with audio negotiated, so the talkback path is reachable. */
+async function runWithAudio(delegate, sessionID = 's1') {
+  await new Promise((resolve, reject) =>
+    delegate.prepareStream(prepareRequest(sessionID), (err) => (err ? reject(err) : resolve())),
+  );
+  return new Promise((resolve) => delegate.handleStreamRequest(talkbackStart(sessionID), resolve));
+}
+
+const talkbackDeps = (over = {}) => ({
+  audioCodec: OPUS,
+  talkback: true,
+  source: {
+    getSnapshot: async () => Buffer.from([1]),
+    getRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+    enableRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+    startTalkbackSession: async () => ({ url: 'rtp://192.168.1.197:7004', codec: 'opus', samplingRate: 24000 }),
+  },
+  ...over,
+});
+
+// The default path is the one already live-verified; talkback must not disturb it.
+test('with talkback off only one ffmpeg runs and audio keeps its RTCP port', async () => {
+  const { delegate, spawned } = makeStreamDelegate({ audioCodec: OPUS });
+  const err = await runWithAudio(delegate);
+  assert.ifError(err);
+  assert.equal(spawned.length, 1, 'no second process');
+  // localrtcpport is an output-URL query parameter, not a flag.
+  const audioUrl = spawned[0].args.at(-1);
+  assert.match(audioUrl, /^srtp:\/\/10\.0\.0\.2:50002\?/);
+  assert.match(audioUrl, /localrtcpport=\d+/, 'the audio stream owns the port when talkback is off');
+});
+
+test('with talkback on a second ffmpeg is spawned for the reverse path', async () => {
+  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+  const err = await runWithAudio(delegate);
+  assert.ifError(err);
+  assert.equal(spawned.length, 2);
+  const args = spawned[1].args.join(' ');
+  assert.match(args, /-f sdp -i pipe:0/);
+  assert.ok(args.endsWith('rtp://192.168.1.197:7004'), 'output goes to the camera');
+});
+
+test('the talkback SDP is written to stdin and describes an encrypted stream', async () => {
+  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+  await runWithAudio(delegate);
+  const sdp = spawned[1].proc.stdinChunks.join('');
+  assert.match(sdp, /RTP\/SAVP 110/);
+  assert.match(sdp, /a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:/);
+  assert.match(sdp, /a=rtpmap:110 opus\/24000\/1/);
+  assert.ok(spawned[1].proc.stdinEnded, 'stdin must be closed or ffmpeg waits forever');
+});
+
+test('talkback gets stdin as a pipe, unlike the one-way stream', async () => {
+  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+  await runWithAudio(delegate);
+  assert.deepEqual(spawned[0].opts.stdio, ['ignore', 'ignore', 'pipe']);
+  assert.deepEqual(spawned[1].opts.stdio, ['pipe', 'ignore', 'pipe']);
+});
+
+// Two processes cannot bind the same UDP port; the outbound stream would die on startup.
+// Two processes cannot bind the same UDP port: the outbound stream would fail to start.
+test('when talkback owns the audio port the outbound stream does not also claim it', async () => {
+  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+  await runWithAudio(delegate);
+  const urls = spawned[0].args.filter((a) => /^srtp:\/\//.test(a));
+  const [videoUrl, audioUrl] = urls;
+  assert.equal(urls.length, 2);
+  assert.match(videoUrl, /localrtcpport=\d+/, 'video keeps its own RTCP port');
+  assert.ok(!/localrtcpport/.test(audioUrl), 'audio must yield the port to talkback');
+});
+
+test('a failed talkback session still leaves the live stream working', async () => {
+  const { delegate, spawned } = makeStreamDelegate(
+    talkbackDeps({
+      source: {
+        getSnapshot: async () => Buffer.from([1]),
+        getRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        enableRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        startTalkbackSession: async () => { throw new Error('no speaker'); },
+      },
+    }),
+  );
+  const err = await runWithAudio(delegate);
+  assert.ifError(err, 'video must survive a talkback failure');
+  assert.equal(spawned.length, 1);
+});
+
+// The URL is external input that becomes an ffmpeg argument.
+test('an unusable talkback URL is refused and does not spawn anything', async () => {
+  const { delegate, spawned } = makeStreamDelegate(
+    talkbackDeps({
+      source: {
+        getSnapshot: async () => Buffer.from([1]),
+        getRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        enableRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        startTalkbackSession: async () => ({ url: 'file:///etc/passwd', samplingRate: 24000 }),
+      },
+    }),
+  );
+  assert.ifError(await runWithAudio(delegate));
+  assert.equal(spawned.length, 1);
+});
+
+test('talkback is skipped entirely when there is no audio codec', async () => {
+  const { delegate, spawned } = makeStreamDelegate(talkbackDeps({ audioCodec: undefined }));
+  await startStream(delegate);
+  assert.equal(spawned.length, 1);
+});
+
+test('stopping the stream kills the talkback process too', async () => {
+  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+  await runWithAudio(delegate);
+  delegate.handleStreamRequest({ type: 'stop', sessionID: 's1' }, () => {});
+  assert.ok(spawned[1].proc.killed, 'a surviving talkback would hold the audio port');
+});
+
+test('shutdown kills the talkback process too', async () => {
+  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+  await runWithAudio(delegate);
+  delegate.shutdown();
+  assert.ok(spawned[1].proc.killed);
 });

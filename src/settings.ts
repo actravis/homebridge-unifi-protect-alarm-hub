@@ -34,6 +34,12 @@ export interface ProtectConfig extends PlatformConfig {
   /** Include camera audio in the live stream — default off (experimental). */
   exposeCameraAudio?: boolean;
   /**
+   * Two-way audio: talk from the Home app to the camera's speaker. Default off (experimental).
+   * Requires `exposeCameraAudio`, and requires Homebridge to have a network route to the camera
+   * itself — the talkback target is the camera's IP, not the console's.
+   */
+  exposeTalkback?: boolean;
+  /**
    * Alarm Manager Trigger ID for an alarm whose action rings the chime. Required for the chime
    * ring button: the Integration API has no play/ring endpoint, so this webhook is the only
    * supported way to ring one. Without it, no ring button is created.

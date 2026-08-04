@@ -105,6 +105,8 @@ export class CameraAccessory {
       serial: string;
       isDoorbell: boolean;
       doorbellTrigger?: boolean;
+      /** Enable two-way audio (talkback) for this camera. */
+      talkback?: boolean;
       /** Attach a HomeKit CameraController (camera tile, snapshots, live view). */
       streaming?: boolean;
       /** Snapshot + RTSPS source (the ProtectClient). Required when `streaming` is set. */
@@ -157,6 +159,7 @@ export class CameraAccessory {
         log: platform.log,
         ffmpegPath: resolveFfmpegPath(),
         audioCodec: opts.audioCodec,
+        talkback: opts.talkback,
         // Snapshots are the most frequent contact we have with a camera, so their outcome is
         // the freshest reachability signal available between discovery passes.
         onHealth: (ok) => {
@@ -168,7 +171,7 @@ export class CameraAccessory {
       });
       // The delegate needs the controller back so it can tell HomeKit when a stream dies
       // underneath it (otherwise that stream slot stays busy until Homebridge restarts).
-      const controller = buildCameraController(platform.api.hap, delegate, opts.audioCodec);
+      const controller = buildCameraController(platform.api.hap, delegate, opts.audioCodec, !!opts.talkback);
       delegate.setController(controller);
       accessory.configureController(controller);
       this.streaming = delegate;

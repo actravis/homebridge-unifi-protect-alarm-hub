@@ -15,6 +15,7 @@ export function buildCameraController(
   hap: HAP,
   delegate: CameraStreamingDelegate,
   audio?: AudioCodecChoice,
+  twoWayAudio = false,
 ): CameraController {
   return new hap.CameraController({
     cameraStreamCount: 2, // allow a couple of simultaneous viewers
@@ -40,6 +41,10 @@ export function buildCameraController(
       ...(audio
         ? {
             audio: {
+              // Declaring twoWayAudio makes iOS show a microphone button. Only set it when
+              // talkback is genuinely enabled: offering a button that does nothing is worse than
+              // not offering one.
+              twoWayAudio,
               codecs: [
                 {
                   type: audio.hapCodec,

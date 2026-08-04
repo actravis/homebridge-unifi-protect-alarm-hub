@@ -13,18 +13,23 @@ import type {
   StreamingRequest,
   StreamRequestCallback,
 } from 'homebridge';
-import type { RtspsStreams } from '../types';
+import type { RtspsStreams, TalkbackSession } from '../types';
 import { redactStreamUrl } from '../util';
 import type { AudioCodecChoice } from './audioCodec';
 import type { AudioArgsOptions } from './ffmpegArgs';
 import { supportsFpsMax, type EncodeProbe } from './ffmpegFeatures';
-import { buildVideoArgs, effectiveBitrateKbps, encodeSrtpParams, pickRtspsUrl, selectStreamQuality } from './ffmpegArgs';
+import {
+  buildVideoArgs, effectiveBitrateKbps, encodeSrtpParams, opusFrameDuration, pickRtspsUrl, selectStreamQuality,
+} from './ffmpegArgs';
+import { buildTalkbackArgs, buildTalkbackSdp, parseTalkbackTarget } from './talkback';
 
 /** What the delegate needs from the client: snapshots + RTSPS stream URLs. ProtectClient satisfies this. */
 export interface StreamSource {
   getSnapshot(deviceId: string): Promise<Buffer>;
   getRtspsStream(deviceId: string): Promise<RtspsStreams>;
   enableRtspsStream(deviceId: string, qualities: string[]): Promise<RtspsStreams>;
+  /** Only needed when talkback is enabled. */
+  startTalkbackSession?(deviceId: string): Promise<TalkbackSession>;
 }
 
 export interface StreamingDelegateOptions {
@@ -55,6 +60,11 @@ export interface StreamingDelegateOptions {
   audioCodec?: AudioCodecChoice;
   /** Probe used to test optional ffmpeg flags; injectable so tests need no real ffmpeg. */
   encodeProbe?: EncodeProbe;
+  /**
+   * Enable two-way audio. Off by default, and when off this class behaves exactly as before —
+   * the one-way streaming path is unchanged, including which process owns the audio RTCP port.
+   */
+  talkback?: boolean;
 }
 
 /**
@@ -100,6 +110,8 @@ interface Session {
   /** Reaps the session if 'start' never arrives; cleared once it does. */
   prepareTimer?: ReturnType<typeof setTimeout>;
   ffmpeg?: ChildProcess;
+  /** The second ffmpeg, decrypting HomeKit's microphone into Opus for the camera. */
+  talkback?: ChildProcess;
 }
 
 /**
@@ -484,6 +496,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     const v = request.video;
 
     let url: string | undefined;
+    let talkbackTarget: ReturnType<typeof parseTalkbackTarget>;
     try {
       const quality = selectStreamQuality(v.width);
       let streams = await this.opts.source.getRtspsStream(this.opts.deviceId);
@@ -492,6 +505,21 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
         // RTSPS not yet enabled on the camera — turn it on for the chosen quality, then retry.
         streams = await this.opts.source.enableRtspsStream(this.opts.deviceId, [quality]);
         url = pickRtspsUrl(streams, quality);
+      }
+      // Talkback is best-effort: a camera without a speaker, or an older console, must not cost
+      // the user their live video. Failure here degrades to one-way audio.
+      if (this.opts.talkback && session.audioSocket && this.opts.source.startTalkbackSession) {
+        try {
+          const s = await this.opts.source.startTalkbackSession(this.opts.deviceId);
+          talkbackTarget = parseTalkbackTarget(s.url, s.samplingRate);
+          if (!talkbackTarget) {
+            this.opts.log.warn(
+              `Talkback unavailable for ${this.opts.deviceId}: unusable target from the console.`,
+            );
+          }
+        } catch (err) {
+          this.opts.log.warn(`Talkback unavailable for ${this.opts.deviceId}: ${(err as Error).message}`);
+        }
       }
     } catch (err) {
       this.stopStream(request.sessionID); // release the reserved socket
@@ -532,7 +560,7 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       localRtcpPort: session.videoReturnPort,
       mtu: v.mtu,
       capFps,
-      audio: this.audioArgsFor(session, request),
+      audio: this.audioArgsFor(session, request, !!talkbackTarget),
     });
 
     // Hand the reserved ports over to ffmpeg, which binds them as its RTCP sockets
@@ -552,6 +580,10 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       stdio: ['ignore', 'ignore', 'pipe'],
     });
     session.ffmpeg = proc;
+
+    if (talkbackTarget && session.audioKey && session.audioSalt && request.audio) {
+      this.startTalkback(session, request, talkbackTarget);
+    }
 
     // ffmpeg echoes its input URL in the startup banner, and RTSPS URLs embed the stream key —
     // redact before anything reaches a log line (see redactStreamUrl's contract).
@@ -600,9 +632,60 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
    * HomeKit reports the sample rate in kHz (its AudioStreamingSamplerate enum is 8/16/24) while
    * ffmpeg wants Hz, hence the multiply — passing 24 straight through would ask for 24Hz audio.
    */
+  /**
+   * Spawn the talkback ffmpeg: HomeKit's SRTP microphone in, Opus RTP to the camera out.
+   *
+   * Failures are logged and swallowed. Talkback is an extra on top of a working stream, so a
+   * missing speaker or a busy port must never take the live view down with it.
+   */
+  private startTalkback(
+    session: Session,
+    request: Extract<StreamingRequest, { type: 'start' }>,
+    target: NonNullable<ReturnType<typeof parseTalkbackTarget>>,
+  ): void {
+    const a = request.audio;
+    const sdp = buildTalkbackSdp({
+      port: session.audioReturnPort ?? 0,
+      payloadType: a.pt,
+      sampleRate: a.sample_rate * 1000,
+      opus: this.opts.audioCodec?.encoder === 'libopus',
+      srtp: encodeSrtpParams(session.audioKey as Buffer, session.audioSalt as Buffer),
+    });
+    const args = buildTalkbackArgs({
+      target,
+      // Reuse the same clamp as the outbound stream: libopus rejects an illegal frame duration
+      // outright and kills the process.
+      frameDurationMs: opusFrameDuration(a.packet_time),
+    });
+    let proc: ChildProcess;
+    try {
+      // stdin is a pipe here — unlike every other spawn in this class — because the SDP is the
+      // input. stdout is ignored; an unread pipe would fill and block ffmpeg forever.
+      proc = (this.opts.spawn ?? spawn)(this.opts.ffmpegPath, args, {
+        env: process.env,
+        stdio: ['pipe', 'ignore', 'pipe'],
+      });
+    } catch (err) {
+      this.opts.log.warn(`Talkback failed to start: ${(err as Error).message}`);
+      return;
+    }
+    session.talkback = proc;
+    proc.on('error', (err) => this.opts.log.warn(`Talkback ffmpeg error: ${err.message}`));
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      for (const line of chunk.toString().split('\n').filter(Boolean)) {
+        this.opts.log.debug(`[talkback] ${line}`);
+      }
+    });
+    // A write to a process that died between spawn and now would throw EPIPE.
+    proc.stdin?.on('error', (err: Error) => this.opts.log.debug(`Talkback stdin: ${err.message}`));
+    proc.stdin?.end(sdp);
+    this.opts.log.debug(`[talkback] → ${target.host}:${target.port} @${target.sampleRate}Hz`);
+  }
+
   private audioArgsFor(
     session: Session,
     request: Extract<StreamingRequest, { type: 'start' }>,
+    talkbackOwnsPort = false,
   ): AudioArgsOptions | undefined {
     const codec = this.opts.audioCodec;
     const a = request.audio;
@@ -620,7 +703,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       ssrc: session.audioSSRC,
       srtpParams: encodeSrtpParams(session.audioKey, session.audioSalt),
       port: session.audioPort,
-      localRtcpPort: session.audioReturnPort,
+      // A port has one owner. When talkback is on, the talkback ffmpeg binds the advertised audio
+      // port to receive the phone's microphone, so the outbound stream must not also claim it —
+      // ffmpeg would fail to bind and the whole stream would die. Losing audio RTCP receiver
+      // reports is the cheaper trade: they are advisory, and this plugin ignores them anyway.
+      localRtcpPort: talkbackOwnsPort ? undefined : session.audioReturnPort,
       packetTimeMs: a.packet_time,
     };
   }
@@ -652,6 +739,16 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     this.sessions.delete(sessionID); // delete first: the exit handler checks identity
     clearTimeout(session.prepareTimer);
     closeSocket(session.audioSocket);
+    // Kill talkback first: it holds the audio port, and it has no RTSP session to close cleanly.
+    const talk = session.talkback;
+    session.talkback = undefined;
+    if (talk && talk.exitCode === null && !talk.killed) {
+      try {
+        talk.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
     const proc = session.ffmpeg;
     if (proc && proc.exitCode === null && !proc.killed) {
       // Ask ffmpeg to close the RTSP session cleanly, then insist.

@@ -39,6 +39,14 @@ side gained a substantial round of reliability and security work.
   `CarbonMonoxideSensor` accessories rather than generic motion sensors, so a sounding alarm is a
   first-class automation trigger and can raise a Home hub critical notification. Only detections
   you have enabled in Protect are exposed. Enable with `exposeAudioSensors`.
+- **Two-way audio (talkback, experimental, off by default).** Enable with `exposeTalkback` (needs
+  `exposeCameraAudio`). Talk from the Home app to a camera's speaker: HomeKit's microphone arrives
+  as SRTP and is re-encoded to the Opus RTP the camera expects, by a second ffmpeg process.
+
+  The console's talkback target is the **camera's own IP**, not the console's, so Homebridge needs a
+  network route to the camera itself. The URL is validated strictly before it becomes an ffmpeg
+  argument — only `rtp://host:port` is accepted. A camera without a speaker, or any talkback
+  failure, degrades to one-way audio rather than taking the live stream down.
 - **Doorbell chimes.** A chime can be exposed with two independent, optional controls:
   - a **Ring button** that rings it on demand or from an automation, enabled by setting
     `chimeTriggerId`;
@@ -51,7 +59,7 @@ side gained a substantial round of reliability and security work.
   0 for every paired camera and restores the previous level on unmute, preserving each camera's
   chosen ringtone and repeat count.
 - New options: `exposeCameras`, `exposeObjectSensors`, `exposeAudioSensors`, `exposeCameraStreams`,
-  `exposeCameraAudio`, `exposeChimes`, `chimeTriggerId`, `exposeChimeMute`,
+  `exposeCameraAudio`, `exposeTalkback`, `exposeChimes`, `chimeTriggerId`, `exposeChimeMute`,
   `exposeDoorbellTriggers`, `doorbellDeviceIds`, `exposeAlarm` (for a cameras-only setup), and
   `realtimeIdleTimeout`.
 - ffmpeg is supplied automatically via the optional `ffmpeg-for-homebridge` dependency, falling

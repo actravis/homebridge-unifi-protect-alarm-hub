@@ -81,6 +81,8 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   private readonly alarmHandlers = new Map<string, AlarmSensorAccessory>();
   private readonly chimeHandlers = new Map<string, ChimeAccessory>();
   private chimeDiscoveryOk = true;
+  /** Talkback-without-audio is warned about once, not on every discovery pass. */
+  private warnedTalkback = false;
   private disposeEvents?: () => void;
   private syncingCameras = false;
   private resyncCameras = false;
@@ -648,6 +650,15 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     if (streaming && this.config.exposeCameraAudio === true) {
       await this.ensureAudioCodec();
     }
+    // Talkback needs an audio session to ride on. Warn once rather than silently omitting the
+    // microphone button and leaving the user to guess why.
+    if (this.config.exposeTalkback === true && !this.audioCodec && !this.warnedTalkback) {
+      this.warnedTalkback = true;
+      this.log.warn(
+        'exposeTalkback is on but camera audio is not available, so two-way audio is disabled. ' +
+          'Enable exposeCameraAudio (and check the startup log for the audio codec probe result).',
+      );
+    }
     const desired = new Set<string>();
 
     for (const plan of planCameraAccessories(cameras, this.config)) {
@@ -672,6 +683,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
           streaming,
           source: client,
           audioCodec: this.audioCodec,
+          // Talkback rides on the audio path: without a codec there is no audio session for
+          // HomeKit to send a microphone over, so requesting it alone cannot work.
+          talkback: this.config.exposeTalkback === true && !!this.audioCodec,
         };
         // Cameras are bridged like everything else: they appear automatically with the bridge,
         // are cached/restored across restarts, and prune normally. (Publishing them as external
