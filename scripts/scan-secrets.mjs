@@ -24,14 +24,20 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const DENYLIST_FILE = '.secret-hashes';
+/**
+ * Overridable so tests cannot append to the committed denylist. That is not hypothetical: while
+ * mutation-testing the entropy guard, the disabled guard let the CLI test append a real MAC hash to
+ * the live file — a test with a side effect on the very artifact this script protects.
+ */
+const DENYLIST_FILE = process.env.SECRET_HASHES_FILE ?? '.secret-hashes';
 
-const sha = (value) => createHash('sha256').update(value, 'utf8').digest('hex');
+export const sha = (value) => createHash('sha256').update(value, 'utf8').digest('hex');
 
 /** Shapes that are secret by construction. */
-const PATTERNS = [
+export const PATTERNS = [
   { name: 'PEM private key', re: /-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/ },
   { name: 'GitHub token', re: /\bgh[pousr]_[A-Za-z0-9]{16,}\b/ },
   { name: 'AWS access key id', re: /\bAKIA[0-9A-Z]{16}\b/ },
@@ -51,22 +57,29 @@ const PATTERNS = [
  * Obvious non-secrets. Without this the script cries wolf on documentation and schema placeholders,
  * and a check people learn to ignore protects nothing.
  */
-const PLACEHOLDER = /^(?:x+|0+|1+|your|my|the)?[-_]?(?:your|example|sample|placeholder|redacted|dummy|fake|test|changeme|todo|xxx+|abc123|api[-_]?key|secret|token|password|<[^>]*>)/i;
-const isPlaceholder = (v) =>
-  PLACEHOLDER.test(v) ||
-  /^(?:1234|abcd)/i.test(v) ||
-  /^(1)\1+$/.test(v.replace(/-/g, '')) ||
-  new Set(v.replace(/-/g, '')).size <= 2; // e.g. 11111111-2222-... style fakes
+export const PLACEHOLDER =
+  /^(?:x+|0+|1+|your|my|the)?[-_]?(?:your|example|sample|placeholder|redacted|dummy|fake|test|changeme|change[-_]?this|replace[-_]?me|replace[-_]?this|insert[-_]?your|add[-_]?your|put[-_]?your|todo|xxx+|abc123|api[-_]?key|secret|token|password|<[^>]*>)/i;
+export const isPlaceholder = (v) => {
+  if (PLACEHOLDER.test(v) || /^(?:1234|abcd)/i.test(v)) {
+    return true;
+  }
+  const groups = v.split('-');
+  // The conventional hand-written fake: every dash-separated group is one character repeated
+  // (11111111-2222-3333-4444-555555555555). Distinct-character counting misses this — that shape has
+  // five distinct characters — so check the groups.
+  if (groups.length > 1 && groups.every((g) => g.length > 0 && new Set(g).size === 1)) {
+    return true;
+  }
+  return new Set(v.replace(/-/g, '')).size <= 2;
+};
 
 /** Tokens worth hashing against the denylist: UUIDs and long opaque runs. */
-const CANDIDATE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[A-Za-z0-9]{16,}\b/g;
+export const CANDIDATE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\b[A-Za-z0-9]{16,}\b/g;
 
-function loadDenylist() {
-  if (!existsSync(DENYLIST_FILE)) {
-    return new Map();
-  }
+/** Parse the denylist file's text into hash -> label. Malformed lines are ignored, not fatal. */
+export function parseDenylist(text) {
   const entries = new Map();
-  for (const line of readFileSync(DENYLIST_FILE, 'utf8').split('\n')) {
+  for (const line of text.split('\n')) {
     const text = line.replace(/#.*$/, '').trim();
     if (!text) {
       continue;
@@ -79,6 +92,10 @@ function loadDenylist() {
   return entries;
 }
 
+function loadDenylist() {
+  return existsSync(DENYLIST_FILE) ? parseDenylist(readFileSync(DENYLIST_FILE, 'utf8')) : new Map();
+}
+
 /**
  * Rough entropy of a value, in bits: length x log2(observed alphabet size).
  *
@@ -87,13 +104,13 @@ function loadDenylist() {
  * cautionary case — 48 bits, and the first 24 are a published vendor OUI, so the remaining space is
  * ~16.7M candidates. Measured: the MAC was recovered from its SHA-256 in 5.3 seconds.
  */
-function entropyBits(value) {
+export function entropyBits(value) {
   const alphabet = new Set(value).size;
   return value.length * Math.log2(Math.max(alphabet, 2));
 }
 
 /** Below this, hashing does not hide the value from anyone who can read the file. */
-const MIN_ENTROPY_BITS = 64;
+export const MIN_ENTROPY_BITS = 64;
 
 function addToDenylist(label) {
   const value = readFileSync(0, 'utf8').trim(); // stdin: never argv
@@ -134,27 +151,22 @@ function contentOf(path, staged) {
   }
 }
 
-const staged = process.argv.includes('--staged');
-if (process.argv.includes('--add')) {
-  const i = process.argv.indexOf('--add');
-  addToDenylist(process.argv[i + 1]);
-  process.exit(0);
-}
-
-const denylist = loadDenylist();
-const findings = [];
-
-for (const file of filesToScan(staged)) {
+/**
+ * Findings for one file's content. Pure: no filesystem, no git, no process state — so the rules can
+ * be unit-tested directly instead of only through a real repository.
+ */
+export function scanContent(file, content, denylist = new Map()) {
+  const findings = [];
   // A tracked env file is a finding regardless of contents.
   if (/^\.env(\.|$)/.test(basename(file)) && !/example|sample|template/i.test(file)) {
-    findings.push({ file, line: 0, what: 'tracked .env file', detail: file });
-    continue;
+    return [{ file, line: 0, what: 'tracked .env file', detail: file }];
   }
-  const content = contentOf(file, staged);
   if (!content || content.includes('\0')) {
-    continue; // empty or binary
+    return findings; // empty or binary
   }
-  const self = basename(file) === 'scan-secrets.mjs'; // this file names the patterns it hunts
+  // These two files necessarily contain secret-SHAPED strings: one defines the patterns, the other
+  // tests them. Both stay subject to the denylist layer below, so a REAL value is still caught here.
+  const self = /^(?:scan-secrets\.mjs|scanSecrets\.test\.mjs)$/.test(basename(file));
 
   content.split('\n').forEach((line, i) => {
     if (/scan-secrets|secret-hashes|allow-secret/.test(line)) {
@@ -176,6 +188,32 @@ for (const file of filesToScan(staged)) {
       }
     }
   });
+  return findings;
+}
+
+// --- CLI ---------------------------------------------------------------------
+// Guarded so importing this module for tests does not scan, exit, or touch the filesystem.
+const invokedDirectly =
+  !!process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (!invokedDirectly) {
+  // Imported (tests). Nothing below runs.
+} else {
+  main();
+}
+
+function main() {
+const staged = process.argv.includes('--staged');
+if (process.argv.includes('--add')) {
+  const i = process.argv.indexOf('--add');
+  addToDenylist(process.argv[i + 1]);
+  process.exit(0);
+}
+
+const denylist = loadDenylist();
+const findings = [];
+
+for (const file of filesToScan(staged)) {
+  findings.push(...scanContent(file, contentOf(file, staged), denylist));
 }
 
 if (findings.length === 0) {
@@ -192,3 +230,4 @@ console.error(`
 Remove the value and use a fake. If it is genuinely not a secret, make that obvious
 (a placeholder like "your-api-key") or append "allow-secret" to the line.\n`);
 process.exit(1);
+}

@@ -34,7 +34,9 @@ module.exports = tseslint.config(
   {
     // Tests are plain Node ESM (run by `node --test`), not TypeScript in the src program.
     // Without declaring the runtime globals, linting them is all false `no-undef` noise.
-    files: ['test/**/*.mjs'],
+    // scripts/ too: same plain-Node-ESM situation, and the secret scanner is held to the same
+    // standard as the code it guards.
+    files: ['test/**/*.mjs', 'scripts/**/*.mjs'],
     languageOptions: {
       globals: {
         Buffer: 'readonly',
