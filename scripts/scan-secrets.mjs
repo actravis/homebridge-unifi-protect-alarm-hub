@@ -79,10 +79,35 @@ function loadDenylist() {
   return entries;
 }
 
+/**
+ * Rough entropy of a value, in bits: length x log2(observed alphabet size).
+ *
+ * The denylist is published (that is the point — hashes are safe to commit), so a low-entropy value
+ * must never go in it: its hash is a brute-force target, not a protection. A MAC address is the
+ * cautionary case — 48 bits, and the first 24 are a published vendor OUI, so the remaining space is
+ * ~16.7M candidates. Measured: the MAC was recovered from its SHA-256 in 5.3 seconds.
+ */
+function entropyBits(value) {
+  const alphabet = new Set(value).size;
+  return value.length * Math.log2(Math.max(alphabet, 2));
+}
+
+/** Below this, hashing does not hide the value from anyone who can read the file. */
+const MIN_ENTROPY_BITS = 64;
+
 function addToDenylist(label) {
   const value = readFileSync(0, 'utf8').trim(); // stdin: never argv
   if (!value) {
     console.error('Nothing on stdin. Usage: printf %s \'secret\' | node scripts/scan-secrets.mjs --add \'label\'');
+    process.exit(2);
+  }
+  const bits = entropyBits(value);
+  if (bits < MIN_ENTROPY_BITS) {
+    console.error(
+      `Refusing to add: ~${Math.round(bits)} bits of entropy is brute-forceable from the hash ` +
+        `(need ${MIN_ENTROPY_BITS}+).\nThe denylist is committed, so a weak value would be disclosed ` +
+        'by its own hash. Keep short identifiers (MACs, IPs, PINs) out of the repo by other means.',
+    );
     process.exit(2);
   }
   appendFileSync(DENYLIST_FILE, `${sha(value)}  ${label || 'secret'}\n`);
