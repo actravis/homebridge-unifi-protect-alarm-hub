@@ -697,8 +697,9 @@ test('a talkback failure is reported once per camera, not on every stream start'
   assert.equal(warns.length, 1, `expected one warning across three streams, got ${warns.length}`);
 });
 
-// A bare "HTTP 403" leaves the user with nothing to act on; the cause is a permission they can grant.
-test('a 403 talkback failure explains that the API key lacks camera write access', async () => {
+// A 403 here has been observed to be transient on an all-access key, so the message must not assert
+// a permissions problem — it should say it may recover and what to check if it does not.
+test('a 403 talkback failure is reported as possibly transient, not as a permissions verdict', async () => {
   const err = Object.assign(new Error('HTTP 403'), { status: 403 });
   const log = makeLog();
   const { delegate } = makeStreamDelegate(
@@ -713,9 +714,44 @@ test('a 403 talkback failure explains that the API key lacks camera write access
     }),
   );
   await runWithAudio(delegate);
-  assert.ok(log.entries.some((e) => /lacks write access for cameras/.test(e.msg)));
+  const msg = log.entries.map((e) => e.msg).join('\n');
+  assert.match(msg, /often transient/);
+  assert.match(msg, /write access for cameras/);
+  assert.ok(!/lacks write access/.test(msg), 'must not state a cause it cannot know');
 });
 
 // The port-0 guard (talkback needs an advertised audio port) is exercised by the no-audio-codec case
 // above; driving prepareStream with no audio section leaks a bound socket and hangs the runner, so it
 // is not tested that way.
+
+// A single transient 403 must not silence the warning for the process lifetime.
+test('a talkback recovery re-arms the once-only warning', async () => {
+  let fail = true;
+  const log = makeLog();
+  const { delegate } = makeStreamDelegate(
+    talkbackDeps({
+      log,
+      source: {
+        getSnapshot: async () => Buffer.from([1]),
+        getRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        enableRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        startTalkbackSession: async () => {
+          if (fail) {
+            throw Object.assign(new Error('HTTP 403'), { status: 403 });
+          }
+          return { url: 'rtp://192.168.1.197:7004', samplingRate: 24000 };
+        },
+      },
+    }),
+  );
+  const run = async (id) => {
+    await runWithAudio(delegate, id);
+    delegate.handleStreamRequest({ type: 'stop', sessionID: id }, () => {});
+  };
+  await run('s1');                       // fails, warns
+  fail = false; await run('s2');         // recovers, re-arms
+  fail = true; await run('s3');          // fails again, must warn again
+
+  const warns = log.entries.filter((e) => e.level === 'warn' && /Talkback unavailable/.test(e.msg));
+  assert.equal(warns.length, 2, `expected a warning either side of the recovery, got ${warns.length}`);
+});

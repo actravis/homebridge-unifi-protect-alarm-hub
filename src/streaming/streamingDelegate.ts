@@ -517,17 +517,23 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
         try {
           const s = await this.opts.source.startTalkbackSession(this.opts.deviceId);
           talkbackTarget = parseTalkbackTarget(s.url, s.samplingRate);
+          if (talkbackTarget) {
+            // Recovered: re-arm the warning so a later failure is reported rather than swallowed.
+            this.talkbackWarned = false;
+          }
           if (!talkbackTarget) {
             this.warnTalkbackOnce('the console returned an unusable target');
           }
         } catch (err) {
           const e = err as { status?: number; message: string };
-          // 403 here means the API key lacks camera WRITE access — actionable, and permanent until
-          // the key is changed, so say what to do rather than repeating a bare HTTP error.
+          // A 403 from this endpoint is NOT reliably a permissions problem. Observed on real
+          // hardware: the same all-access key returned 403 for every camera write during one window
+          // and 200 before and after, unreproducible by bursting. So report both possibilities and
+          // keep retrying rather than latching a diagnosis.
           this.warnTalkbackOnce(
             e.status === 403
-              ? 'the API key lacks write access for cameras — grant it in UniFi > Settings > ' +
-                'Integrations, or set exposeTalkback:false'
+              ? 'the console refused the request (HTTP 403). This is often transient and later ' +
+                'attempts may succeed; if it persists, check the API key has write access for cameras'
               : e.message,
           );
         }

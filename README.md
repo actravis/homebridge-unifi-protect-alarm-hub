@@ -137,8 +137,10 @@ settings endpoint.
   that audio then reaches iOS from an unexpected source port; because an audio codec is advertised,
   iOS waits for it before rendering video. Fixing this needs the plugin to own that port and relay
   both directions. Until then talkback is a deliberate trade, and off by default.
-- **Talkback needs an API key with write access for cameras.** Read-only keys get HTTP 403 from the
-  talkback endpoint (and cannot enable RTSPS on a camera either).
+- **Talkback can fail with HTTP 403, sometimes transiently.** A read-only API key will always be
+  refused, but an all-access key has also been observed returning 403 for every camera write during
+  one window, with 200 before and after and no way to reproduce it. The plugin keeps retrying on the
+  next stream and reports the problem once rather than treating it as permanent.
 - **Talkback needs a route to the camera itself.** The console hands back an RTP target on the
   **camera's** IP, not the console's, so Homebridge must be able to reach the camera directly —
   unlike live video, which only ever talks to the console. Cameras on an isolated IoT VLAN will

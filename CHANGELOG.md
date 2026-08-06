@@ -19,6 +19,11 @@ side gained a substantial round of reliability and security work.
 
 ### Known issues
 
+- **Camera writes can return a transient HTTP 403.** Observed on an all-access API key: every camera
+  write (`rtsps-stream`, `talkback-session`) returned 403 for one window, with 200 before and after,
+  not reproducible by bursting. Talkback reports it once and retries on the next stream. If RTSPS is
+  already enabled on your cameras this is invisible, since only the read path is needed.
+
 - **`exposeTalkback` costs stream load time** — measured 9-11s to first frame, against 1-2s with it
   off. Talkback takes over the audio port the outbound stream sends from, so audio arrives at iOS
   from an unexpected source port and iOS waits for it before rendering video. Off by default; a
