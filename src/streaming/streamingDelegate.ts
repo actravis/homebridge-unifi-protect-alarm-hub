@@ -21,6 +21,7 @@ import { supportsFpsMax, type EncodeProbe } from './ffmpegFeatures';
 import {
   buildVideoArgs, effectiveBitrateKbps, encodeSrtpParams, opusFrameDuration, pickRtspsUrl, selectStreamQuality,
 } from './ffmpegArgs';
+import { startAudioRelay, type AudioRelay } from './audioRelay';
 import { buildTalkbackArgs, buildTalkbackSdp, parseTalkbackTarget } from './talkback';
 
 /** What the delegate needs from the client: snapshots + RTSPS stream URLs. ProtectClient satisfies this. */
@@ -112,6 +113,12 @@ interface Session {
   ffmpeg?: ChildProcess;
   /** The second ffmpeg, decrypting HomeKit's microphone into Opus for the camera. */
   talkback?: ChildProcess;
+  /** Forwards audio both ways so the advertised port keeps its owner (see audioRelay.ts). */
+  relay?: AudioRelay;
+  /** Socket the outbound ffmpeg sends audio to when relaying; also the relay's sender for inbound. */
+  relaySocket?: Socket;
+  /** Localhost port the talkback ffmpeg binds for the microphone stream. */
+  talkbackInPort?: number;
 }
 
 /**
@@ -559,6 +566,29 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
         `mtu=${v.mtu} → ${this.opts.deviceId}`,
     );
 
+    // With talkback on, the plugin keeps the advertised audio port and relays both directions, so
+    // the outbound stream still reaches iOS from the port it expects. Bind the two private sockets
+    // that makes possible before building args, since the args reference the relay port.
+    if (talkbackTarget) {
+      try {
+        // Always IPv4: both relay hops are localhost (ffmpeg -> us, us -> talkback ffmpeg). Only
+        // the advertised socket talks to the phone, and it keeps whatever family prepareStream chose.
+        const relaySocket = await bindUdp('udp4');
+        relaySocket.on('error', (err) => this.opts.log.debug(`Audio relay socket error: ${err.message}`));
+        const talkbackIn = await bindUdp('udp4');
+        session.talkbackInPort = talkbackIn.address().port;
+        // Hand the port straight to the talkback ffmpeg: it must bind it to read the SDP stream.
+        closeSocket(talkbackIn);
+        session.relaySocket = relaySocket;
+      } catch (err) {
+        this.warnTalkbackOnce(`could not set up the audio relay: ${(err as Error).message}`);
+        talkbackTarget = undefined;
+        closeSocket(session.relaySocket);
+        session.relaySocket = undefined;
+        session.talkbackInPort = undefined;
+      }
+    }
+
     // Cached after the first stream, so this costs one short ffmpeg run per process.
     const capFps = await supportsFpsMax(this.opts.ffmpegPath, this.opts.encodeProbe);
     const args = buildVideoArgs({
@@ -584,8 +614,14 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     // (localrtcpport) so receiver reports arrive on the ports we advertised to iOS.
     closeSocket(session.videoSocket);
     session.videoSocket = undefined;
-    closeSocket(session.audioSocket);
-    session.audioSocket = undefined;
+    if (talkbackTarget) {
+      // Keep it: the plugin owns the advertised audio port for the whole session and relays through
+      // it. Handing it to ffmpeg is what cost 9-11s of load time.
+      this.opts.log.debug(`[talkback] relaying audio via the advertised port (${this.opts.deviceId})`);
+    } else {
+      closeSocket(session.audioSocket);
+      session.audioSocket = undefined;
+    }
 
     this.opts.log.debug(`[stream] spawning ffmpeg (${this.opts.deviceId})`);
     // stdin/stdout are explicitly ignored, only stderr is piped. ffmpeg writes the stream to a
@@ -600,6 +636,17 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
 
     if (talkbackTarget && session.audioKey && session.audioSalt && request.audio) {
       this.startTalkback(session, request, talkbackTarget);
+      if (session.audioSocket && session.relaySocket) {
+        session.relay = startAudioRelay({
+          advertised: session.audioSocket,
+          local: session.relaySocket,
+          // The phone's audio port comes from prepareStream, not the start request.
+          target: { address: session.targetAddress, port: session.audioPort as number },
+          talkbackPort: session.talkbackInPort,
+          onError: (direction, message) =>
+            this.opts.log.debug(`[talkback] ${direction} relay error: ${message}`),
+        });
+      }
     }
 
     // ffmpeg echoes its input URL in the startup banner, and RTSPS URLs embed the stream key —
@@ -671,8 +718,9 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
   ): void {
     const a = request.audio;
     const sdp = buildTalkbackSdp({
-      // Guaranteed present: startStream only reaches here when audioReturnPort is defined.
-      port: session.audioReturnPort as number,
+      // The relay's private port, NOT the advertised one — the plugin keeps that and forwards to
+      // here, so the outbound stream can still send from it.
+      port: session.talkbackInPort as number,
       payloadType: a.pt,
       sampleRate: a.sample_rate * 1000,
       opus: this.opts.audioCodec?.encoder === 'libopus',
@@ -730,20 +778,18 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       ssrc: session.audioSSRC,
       srtpParams: encodeSrtpParams(session.audioKey, session.audioSalt),
       port: session.audioPort,
-      // A port has one owner. When talkback is on, the talkback ffmpeg binds the advertised audio
-      // port to receive the phone's microphone, so the outbound stream must not also claim it —
-      // ffmpeg would fail to bind and the whole stream would die.
+      // A UDP port has one owner, and with talkback on that owner must be the plugin: iOS sends the
+      // microphone to the advertised port AND expects our audio to come from it.
       //
-      // THIS IS NOT A FREE TRADE. An earlier comment here claimed only advisory RTCP receiver
-      // reports were lost; measurement disproved that. Without `localrtcpport` ffmpeg sends the
-      // audio from an EPHEMERAL source port (measured: 49573 instead of the advertised 55555), so
-      // audio reaches iOS from a port it never expected. Because we advertise an audio codec, iOS
-      // waits for that stream before rendering video at all (see cameraOptions.ts) — reported in
-      // the field as 9-11s stream load times, against 1-2s with talkback off.
-      //
-      // Fixing this properly means Node owning the advertised port and relaying both directions, so
-      // the source port stays symmetric. Until then talkback costs load time and stays default-off.
+      // An earlier version let the talkback ffmpeg take the port and had the outbound stream send
+      // from an ephemeral one. That measured 9-11s to first frame (49573 instead of the advertised
+      // 55555, so iOS never associated the audio and waited for it before rendering video at all —
+      // see cameraOptions.ts). Now the outbound stream sends to a localhost relay socket and the
+      // plugin re-emits from the advertised port, so the wire looks exactly as it does with talkback
+      // off. `localRtcpPort` is therefore irrelevant on the relayed path — ffmpeg is talking to
+      // localhost, not to the phone.
       localRtcpPort: talkbackOwnsPort ? undefined : session.audioReturnPort,
+      relayPort: talkbackOwnsPort ? session.relaySocket?.address().port : undefined,
       packetTimeMs: a.packet_time,
     };
   }
@@ -775,7 +821,11 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     this.sessions.delete(sessionID); // delete first: the exit handler checks identity
     clearTimeout(session.prepareTimer);
     closeSocket(session.audioSocket);
-    // Kill talkback first: it holds the audio port, and it has no RTSP session to close cleanly.
+    session.relay?.stop();
+    session.relay = undefined;
+    closeSocket(session.relaySocket);
+    session.relaySocket = undefined;
+    // Kill talkback first: it has no RTSP session to close cleanly.
     const talk = session.talkback;
     session.talkback = undefined;
     if (talk && talk.exitCode === null && !talk.killed) {

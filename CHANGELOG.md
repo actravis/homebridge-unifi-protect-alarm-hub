@@ -24,11 +24,6 @@ side gained a substantial round of reliability and security work.
   not reproducible by bursting. Talkback reports it once and retries on the next stream. If RTSPS is
   already enabled on your cameras this is invisible, since only the read path is needed.
 
-- **`exposeTalkback` costs stream load time** — measured 9-11s to first frame, against 1-2s with it
-  off. Talkback takes over the audio port the outbound stream sends from, so audio arrives at iOS
-  from an unexpected source port and iOS waits for it before rendering video. Off by default; a
-  proper fix requires relaying both directions through the plugin.
-
 ### Security
 
 - **Updated `undici` to 6.28.0**, clearing three advisories against the plugin's only runtime
@@ -70,7 +65,9 @@ side gained a substantial round of reliability and security work.
   `CarbonMonoxideSensor` accessories rather than generic motion sensors, so a sounding alarm is a
   first-class automation trigger and can raise a Home hub critical notification. Only detections
   you have enabled in Protect are exposed. Enable with `exposeAudioSensors`.
-- **Two-way audio (talkback, experimental, off by default).** Enable with `exposeTalkback` (needs
+- **Two-way audio (talkback, experimental, off by default).** Costs nothing in stream startup: the
+  plugin owns the audio port HomeKit was told about and relays both directions, so outbound audio
+  still reaches iOS from the source port it expects. Enable with `exposeTalkback` (needs
   `exposeCameraAudio`). Talk from the Home app to a camera's speaker: HomeKit's microphone arrives
   as SRTP and is re-encoded to the Opus RTP the camera expects, by a second ffmpeg process.
 

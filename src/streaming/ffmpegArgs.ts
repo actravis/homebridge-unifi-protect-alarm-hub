@@ -116,6 +116,17 @@ export interface AudioArgsOptions {
   /** HomeKit's audio port on the phone, and the port we advertised for its RTCP. */
   port: number;
   localRtcpPort?: number;
+  /**
+   * When set, audio is sent to `127.0.0.1:<relayPort>` instead of straight to the phone, and the
+   * plugin re-emits each packet from the port advertised to iOS (see audioRelay.ts).
+   *
+   * This exists because two-way audio needs that advertised port for the phone's microphone, and a
+   * UDP port has one owner. Letting ffmpeg send from an ephemeral port instead measured 9-11s to
+   * first frame: audio reached iOS from a source port it never expected, and since a codec is
+   * advertised iOS waits for that stream before rendering video. Relaying keeps the source port
+   * iOS expects, so the wire looks exactly as it does with talkback off.
+   */
+  relayPort?: number;
   /** Frame duration HomeKit asked for, in ms. */
   packetTimeMs?: number;
 }
@@ -323,7 +334,11 @@ export function buildVideoArgs(o: VideoArgsOptions): string[] {
       '-f', 'rtp',
       '-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80',
       '-srtp_out_params', a.srtpParams,
-      `srtp://${o.address}:${a.port}?${audioRtcp}rtcpport=${a.port}&pkt_size=${AUDIO_PKT_SIZE}`,
+      // SRTP is keyed on the SSRC, not the destination, so a relayed packet is byte-identical to
+      // one sent directly — the plugin forwards opaque bytes and never re-encrypts.
+      a.relayPort === undefined
+        ? `srtp://${o.address}:${a.port}?${audioRtcp}rtcpport=${a.port}&pkt_size=${AUDIO_PKT_SIZE}`
+        : `srtp://127.0.0.1:${a.relayPort}?pkt_size=${AUDIO_PKT_SIZE}`,
     );
   }
   return args;
