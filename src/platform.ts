@@ -54,6 +54,11 @@ const DEVICE_DISCOVERY_SECONDS = 300;
  */
 export interface PlatformDeps {
   createClient: (opts: ProtectClientOptions) => ProtectClient;
+  /**
+   * Probe for a usable HomeKit audio encoder. Injectable so tests are deterministic: the real one
+   * spawns ffmpeg, which makes the outcome depend on the host's build (see rule: tests inject I/O).
+   */
+  probeAudioCodec: (ffmpegPath: string) => Promise<AudioCodecChoice | undefined>;
   setInterval: (fn: () => void, ms: number) => NodeJS.Timeout;
   clearInterval: (handle: NodeJS.Timeout) => void;
   setTimeout: (fn: () => void, ms: number) => NodeJS.Timeout;
@@ -61,6 +66,7 @@ export interface PlatformDeps {
 
 const REAL_PLATFORM_DEPS: PlatformDeps = {
   createClient: (opts) => new ProtectClient(opts),
+  probeAudioCodec,
   setInterval: (fn, ms) => setInterval(fn, ms),
   clearInterval: (handle) => clearInterval(handle),
   setTimeout: (fn, ms) => setTimeout(fn, ms),
@@ -697,7 +703,12 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
           audioCodec: this.audioCodec,
           // Talkback rides on the audio path: without a codec there is no audio session for
           // HomeKit to send a microphone over, so requesting it alone cannot work.
-          talkback: this.config.exposeTalkback === true && !!this.audioCodec,
+          //
+          // Also gated on the camera actually HAVING a speaker, decided from data discovery already
+          // fetched. Asking a speakerless camera answers 503, which the retry policy treated as
+          // transient — measured ~7s of backoff, all of it blocking video from starting. On observed
+          // hardware only the doorbell has a speaker.
+          talkback: this.config.exposeTalkback === true && !!this.audioCodec && plan.hasSpeaker,
         };
         // Cameras are bridged like everything else: they appear automatically with the bridge,
         // are cached/restored across restarts, and prune normally. (Publishing them as external
@@ -787,7 +798,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     // concurrent caller see "probed" while the result was still undefined, and quietly build a
     // CameraController with no audio. probeAudioCodec caches the PROMISE, so awaiting it repeatedly
     // costs nothing and always yields the same answer.
-    this.audioCodec = await probeAudioCodec(resolveFfmpegPath());
+    this.audioCodec = await this.deps.probeAudioCodec(resolveFfmpegPath());
     this.audioReported = true;
     if (this.audioCodec) {
       this.log.info(`Camera audio enabled using ${this.audioCodec.encoder} (${this.audioCodec.hapCodec}).`);

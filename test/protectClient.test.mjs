@@ -444,3 +444,23 @@ test('dispose cancels the watchdog and blocks further reconnects', () => {
   wsList[0].emit('close');
   assert.equal(wsList.length, 1); // disposed → no reconnect
 });
+
+// A speakerless camera answers 503 here. The normal policy retries 5xx with backoff, which turned an
+// ~85ms refusal into ~7s — all of it spent blocking the video stream from starting. This call gets
+// exactly one attempt.
+test('startTalkbackSession does not retry a 503, so it cannot delay a stream', async () => {
+  const { client, calls } = makeClient(() => makeResponse({ status: 503, text: 'unavailable' }));
+  await assert.rejects(() => client.startTalkbackSession('cam1'), (e) => e instanceof ProtectApiError);
+  assert.equal(calls.length, 1, `expected a single attempt, got ${calls.length}`);
+});
+
+// Contrast: an ordinary state read SHOULD ride out a transient 5xx.
+test('an ordinary request still retries a 503', async () => {
+  let n = 0;
+  const { client, calls } = makeClient(() => {
+    n += 1;
+    return n === 1 ? makeResponse({ status: 503, text: 'blip' }) : makeResponse({ json: [] });
+  });
+  await client.getCameras();
+  assert.ok(calls.length > 1, 'a transient 5xx on a read must be retried');
+});

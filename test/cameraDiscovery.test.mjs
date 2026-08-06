@@ -163,3 +163,26 @@ test('audioSensorKey is keyed by service and cannot collide with other sensors',
   assert.notEqual(audioSensorKey('c1', 'smoke'), objectSensorKey('c1', 'smoke'));
   assert.notEqual(audioSensorKey('c1', 'smoke'), cameraKey('c1'));
 });
+
+// Talkback capability is decided once here, from data /cameras already returns, so the plugin never
+// spends a request finding out. Asking a speakerless camera answers 503, and a retried 503 cost ~7s
+// of blocked video — see the platform gate.
+test('a camera with a speaker is planned as talkback-capable', () => {
+  const [plan] = planCameraAccessories(
+    [{ id: 'c1', modelKey: 'camera', name: 'Front Door', featureFlags: { hasSpeaker: true } }],
+    {},
+  );
+  assert.equal(plan.hasSpeaker, true);
+});
+
+test('a camera without a speaker is not, and an absent flag is treated as no speaker', () => {
+  const plans = planCameraAccessories(
+    [
+      { id: 'c1', modelKey: 'camera', name: 'Gatehouse', featureFlags: { hasSpeaker: false } },
+      { id: 'c2', modelKey: 'camera', name: 'Side Yard', featureFlags: {} },
+      { id: 'c3', modelKey: 'camera', name: 'Side Deck' },
+    ],
+    {},
+  );
+  assert.deepEqual(plans.map((p) => p.hasSpeaker), [false, false, false]);
+});

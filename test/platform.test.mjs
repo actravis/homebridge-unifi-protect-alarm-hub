@@ -30,7 +30,7 @@ const camera = (over = {}) => ({ id: 'cam-1', modelKey: 'camera', name: 'Front Y
  * Build a started platform: construct, fire 'didFinishLaunching', and let the first refresh and
  * camera sync settle. Returns everything a test needs to poke at it.
  */
-async function startPlatform(config = {}, clientState = {}) {
+async function startPlatform(config = {}, clientState = {}, audioCodec = { encoder: 'libopus', hapCodec: 'OPUS' }) {
   const log = makeLog();
   const api = fakeApi();
   const clock = fakeClock();
@@ -39,7 +39,7 @@ async function startPlatform(config = {}, clientState = {}) {
     log,
     { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key', ...config },
     api,
-    { createClient: () => client, ...clock.deps },
+    { createClient: () => client, probeAudioCodec: async () => audioCodec, ...clock.deps },
   );
   api.emit('didFinishLaunching');
   await flush();
@@ -506,7 +506,7 @@ test('restored cached accessories are reused rather than registered again', asyn
     log,
     { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key' },
     api,
-    { createClient: () => client, ...clock.deps },
+    { createClient: () => client, probeAudioCodec: async () => ({ encoder: 'libopus', hapCodec: 'OPUS' }), ...clock.deps },
   );
   // Homebridge replays the cached accessories before didFinishLaunching.
   const cached = new api.platformAccessory('Front Door', generateUuid(`${HUB_MAC}:zone:0:contact`), 10);
@@ -718,7 +718,7 @@ async function startWithCached(config, clientState, cachedName, domain, seed) {
     log,
     { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key', ...config },
     api,
-    { createClient: () => client, ...clock.deps },
+    { createClient: () => client, probeAudioCodec: async () => ({ encoder: 'libopus', hapCodec: 'OPUS' }), ...clock.deps },
   );
   const cached = new api.platformAccessory(cachedName, generateUuid(seed), 8);
   cached.context.domain = domain;
@@ -777,4 +777,37 @@ test('pruning a disabled domain leaves other domains alone', async () => {
   );
   assert.deepEqual(names(api.unregistered), ['Front Yard']);
   assert.ok(names(api.registered).includes('Security System'), 'alarm accessories still registered');
+});
+
+// Talkback is offered only to cameras that actually have a speaker. Asking a speakerless camera is
+// answered 503, and a retried 503 cost ~7s of blocked video; the capability comes free from data
+// discovery already fetched. User-visible consequence: the microphone button only on the doorbell.
+test('twoWayAudio is declared only for cameras with a speaker', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraAudio: true, exposeTalkback: true },
+    {
+      hubs: [hub()],
+      cameras: [
+        { id: 'bell', modelKey: 'camera', name: 'Front Door', featureFlags: { hasSpeaker: true, hasMic: true } },
+        { id: 'plain', modelKey: 'camera', name: 'Gatehouse', featureFlags: { hasSpeaker: false, hasMic: true } },
+      ],
+    },
+  );
+  const twoWay = (name) =>
+    api.registered.find((a) => a.displayName === name)?.controller?.config?.streamingOptions?.audio?.twoWayAudio;
+
+  assert.equal(twoWay('Front Door'), true, 'the doorbell has a speaker');
+  assert.equal(twoWay('Gatehouse'), false, 'a speakerless camera must not offer a microphone');
+});
+
+test('exposeTalkback:false declares twoWayAudio nowhere, speaker or not', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraAudio: true },
+    {
+      hubs: [hub()],
+      cameras: [{ id: 'bell', modelKey: 'camera', name: 'Front Door', featureFlags: { hasSpeaker: true } }],
+    },
+  );
+  const ctl = api.registered.find((a) => a.displayName === 'Front Door')?.controller;
+  assert.equal(ctl?.config?.streamingOptions?.audio?.twoWayAudio, false);
 });

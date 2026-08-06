@@ -38,6 +38,14 @@ side gained a substantial round of reliability and security work.
 
 ### Fixed
 
+- **Cameras without a speaker no longer delay their own video.** Talkback was requested for every
+  camera; a camera with no speaker answers `503`, which the retry policy treated as a transient
+  server error and retried with backoff — about 7 seconds, all of it spent before video could start.
+  Talkback capability now comes from `featureFlags.hasSpeaker`, already present in the data discovery
+  fetches, so a speakerless camera makes no talkback request at all, and the request is no longer
+  retried. Measured on four cameras: 20-110ms per stream, against ~7000ms before. Only doorbells have
+  speakers on observed hardware.
+
 - **A disabled feature no longer leaves a dead accessory behind.** Turning off cameras or chimes
   (or leaving a chime unconfigured) skipped reconciliation entirely, so an accessory cached from an
   earlier config stayed registered with nothing driving it: HomeKit showed the tile at its last

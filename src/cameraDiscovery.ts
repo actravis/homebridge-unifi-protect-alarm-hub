@@ -15,6 +15,15 @@ export interface CameraPlan {
   /** False when Protect reports the camera as disconnected — the accessory stays, marked inactive. */
   online: boolean;
   /**
+   * True when the camera has a speaker, i.e. talkback is even possible.
+   *
+   * Decided here, from data `/cameras` already returns, so no extra request is ever made to find
+   * out. Asking a speakerless camera for a talkback session is answered `503` — and because a 503
+   * is retried with backoff, that turned into ~7s of delay before video could start. On observed
+   * hardware only the doorbell has a speaker.
+   */
+  hasSpeaker: boolean;
+  /**
    * HomeKit alarm sensors this camera warrants, from the audio detections Protect has enabled
    * (smoke / CO). Empty unless `exposeAudioSensors` is on.
    */
@@ -124,6 +133,7 @@ export function planCameraAccessories(cameras: Camera[], config: CameraPlanConfi
       objectTypes: supported,
       alarmKinds: config.exposeAudioSensors === true ? alarmSensorKinds(camera.smartDetectSettings?.audioTypes) : [],
       online: isCameraOnline(camera),
+      hasSpeaker: camera.featureFlags?.hasSpeaker === true,
       disabledObjectTypes: enabled ? supported.filter((type) => !enabled.includes(type)) : [],
     };
   });

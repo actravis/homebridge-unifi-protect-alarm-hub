@@ -246,7 +246,10 @@ export class ProtectClient {
   startTalkbackSession(id: string): Promise<TalkbackSession> {
     return this.request<TalkbackSession>(
       `/cameras/${encodeURIComponent(id)}/talkback-session`,
-      { method: 'POST' },
+      // Deliberately NOT retried. A camera without a speaker answers 503, which the normal policy
+      // treats as transient and retries with backoff — measured ~7s, all of it spent blocking the
+      // video stream from starting. One attempt (~85ms) is the whole budget this deserves.
+      { method: 'POST', maxRetries: 0 },
     );
   }
 
@@ -300,8 +303,11 @@ export class ProtectClient {
   // ---- HTTP core ----
 
   /** Issue a JSON request and parse the body, throwing {@link ProtectApiError} on non-2xx. */
-  private async request<T>(path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
-    const res = await this.fetchRaw(path, init);
+  private async request<T>(
+    path: string,
+    init: { method?: string; body?: unknown; maxRetries?: number } = {},
+  ): Promise<T> {
+    const res = await this.fetchRaw(path, init, 0, init.maxRetries ?? MAX_RETRIES);
     const text = await res.text();
     if (!res.ok) {
       throw new ProtectApiError(`HTTP ${res.status} for ${path}`, res.status, text.slice(0, 300));
