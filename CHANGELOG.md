@@ -17,6 +17,18 @@ side gained a substantial round of reliability and security work.
 - Alarm Hub accessories are **unchanged** across the rename — their identities are identical,
   so rooms, custom names, and automations carry over without re-pairing.
 
+### Security
+
+- **Updated `undici` to 6.28.0**, clearing three advisories against the plugin's only runtime
+  dependency — most relevantly response desynchronisation via the retry interceptor, which this
+  client uses. Also updated a dev-only transitive dependency (`brace-expansion`).
+- **The dependency audit is now stricter where it matters.** Runtime dependencies fail the build at
+  **moderate** severity rather than high: there is only one, and it carries every HTTPS call, the
+  API key and the realtime socket. Dev dependencies fail at high. Those three advisories had been
+  sitting unnoticed under a high-only gate.
+- **`npm run verify`** runs lint, audit, secret scan and tests in one command — the same set CI
+  runs, and what `prepublishOnly` now uses.
+
 ### Fixed
 
 - **A disabled feature no longer leaves a dead accessory behind.** Turning off cameras or chimes

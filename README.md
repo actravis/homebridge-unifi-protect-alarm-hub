@@ -182,6 +182,16 @@ Two ideas run through the codebase:
 
 ## Development
 
+Before starting work and before any release, run the full gate:
+
+```
+npm run verify
+```
+
+That is lint, dependency audit, secret scan and tests — the same checks CI runs, so the two cannot
+drift. The audit uses two thresholds: runtime dependencies fail at **moderate** (there is one,
+`undici`, and it carries every HTTPS call and the API key), dev dependencies at **high**.
+
 ```bash
 npm install && npm test
 ```

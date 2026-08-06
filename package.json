@@ -26,13 +26,15 @@
     "homebridge": ">=1.8.0 || >=2.0.0-beta.0"
   },
   "scripts": {
+    "audit": "npm audit --omit=dev --audit-level=moderate && npm audit --audit-level=high",
     "build": "tsc",
     "clean": "rm -rf dist",
     "lint": "eslint src test scripts",
     "prepare": "npm run build",
-    "prepublishOnly": "npm run clean && npm run lint && npm run scan:secrets && npm test",
+    "prepublishOnly": "npm run clean && npm run verify",
     "scan:secrets": "node scripts/scan-secrets.mjs",
-    "test": "npm run build && node --test test/*.test.mjs"
+    "test": "npm run build && node --test test/*.test.mjs",
+    "verify": "npm run lint && npm run audit && npm run scan:secrets && npm test"
   },
   "files": [
     "dist",
