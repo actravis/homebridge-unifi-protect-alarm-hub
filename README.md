@@ -50,7 +50,8 @@ plugin. The two coexist fine.
 - **Cameras** — each camera appears in HomeKit with:
   - **Live video** — pulled from the camera's RTSPS stream and transcoded by ffmpeg
     (typically ~2s to first frame). No account password, no cloud. Camera audio is available
-    behind `exposeCameraAudio`, and two-way talkback behind `exposeTalkback`.
+    behind `exposeCameraAudio`. Two-way talkback is behind `exposeTalkback` but **costs stream
+    load time** — see limitations.
   - **Snapshots** — including the thumbnail on motion and doorbell notifications.
   - **Motion + smart detection** — a motion sensor per camera plus optional per-type sensors
     (person / vehicle / animal / package), driven by the realtime events feed.
@@ -131,6 +132,13 @@ settings endpoint.
 - **Chimes cannot be rung by the API directly.** Ringing requires an Alarm Manager webhook (see
   [Ringing a chime](#ringing-a-chime)); every chime play/ring endpoint returns 404. Ringtones
   cannot be listed or changed either — the plugin preserves whatever you set in Protect.
+- **Talkback slows stream startup.** Measured 9-11s to first frame with `exposeTalkback` on, against
+  1-2s with it off. Talkback has to take over the UDP port the outbound audio stream sends from, so
+  that audio then reaches iOS from an unexpected source port; because an audio codec is advertised,
+  iOS waits for it before rendering video. Fixing this needs the plugin to own that port and relay
+  both directions. Until then talkback is a deliberate trade, and off by default.
+- **Talkback needs an API key with write access for cameras.** Read-only keys get HTTP 403 from the
+  talkback endpoint (and cannot enable RTSPS on a camera either).
 - **Talkback needs a route to the camera itself.** The console hands back an RTP target on the
   **camera's** IP, not the console's, so Homebridge must be able to reach the camera directly —
   unlike live video, which only ever talks to the console. Cameras on an isolated IoT VLAN will

@@ -225,6 +225,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
   private deviceOnline = true;
   /** So the unimplemented-reconfigure notice appears once per camera, not once per request. */
   private reconfigureReported = false;
+  /** Talkback failures are persistent (permissions, no speaker) — report them once, not per stream. */
+  private talkbackWarned = false;
 
   constructor(private readonly opts: StreamingDelegateOptions) {}
 
@@ -508,17 +510,26 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       }
       // Talkback is best-effort: a camera without a speaker, or an older console, must not cost
       // the user their live video. Failure here degrades to one-way audio.
-      if (this.opts.talkback && session.audioSocket && this.opts.source.startTalkbackSession) {
+      if (
+        this.opts.talkback && session.audioSocket && session.audioReturnPort !== undefined &&
+        this.opts.source.startTalkbackSession
+      ) {
         try {
           const s = await this.opts.source.startTalkbackSession(this.opts.deviceId);
           talkbackTarget = parseTalkbackTarget(s.url, s.samplingRate);
           if (!talkbackTarget) {
-            this.opts.log.warn(
-              `Talkback unavailable for ${this.opts.deviceId}: unusable target from the console.`,
-            );
+            this.warnTalkbackOnce('the console returned an unusable target');
           }
         } catch (err) {
-          this.opts.log.warn(`Talkback unavailable for ${this.opts.deviceId}: ${(err as Error).message}`);
+          const e = err as { status?: number; message: string };
+          // 403 here means the API key lacks camera WRITE access — actionable, and permanent until
+          // the key is changed, so say what to do rather than repeating a bare HTTP error.
+          this.warnTalkbackOnce(
+            e.status === 403
+              ? 'the API key lacks write access for cameras — grant it in UniFi > Settings > ' +
+                'Integrations, or set exposeTalkback:false'
+              : e.message,
+          );
         }
       }
     } catch (err) {
@@ -632,6 +643,15 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
    * HomeKit reports the sample rate in kHz (its AudioStreamingSamplerate enum is 8/16/24) while
    * ffmpeg wants Hz, hence the multiply — passing 24 straight through would ask for 24Hz audio.
    */
+  /** Report a talkback problem once per camera; these causes are persistent, not per-stream. */
+  private warnTalkbackOnce(reason: string): void {
+    if (this.talkbackWarned) {
+      return;
+    }
+    this.talkbackWarned = true;
+    this.opts.log.warn(`Talkback unavailable for ${this.opts.deviceId}: ${reason}`);
+  }
+
   /**
    * Spawn the talkback ffmpeg: HomeKit's SRTP microphone in, Opus RTP to the camera out.
    *
@@ -645,7 +665,8 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
   ): void {
     const a = request.audio;
     const sdp = buildTalkbackSdp({
-      port: session.audioReturnPort ?? 0,
+      // Guaranteed present: startStream only reaches here when audioReturnPort is defined.
+      port: session.audioReturnPort as number,
       payloadType: a.pt,
       sampleRate: a.sample_rate * 1000,
       opus: this.opts.audioCodec?.encoder === 'libopus',
@@ -705,8 +726,17 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       port: session.audioPort,
       // A port has one owner. When talkback is on, the talkback ffmpeg binds the advertised audio
       // port to receive the phone's microphone, so the outbound stream must not also claim it —
-      // ffmpeg would fail to bind and the whole stream would die. Losing audio RTCP receiver
-      // reports is the cheaper trade: they are advisory, and this plugin ignores them anyway.
+      // ffmpeg would fail to bind and the whole stream would die.
+      //
+      // THIS IS NOT A FREE TRADE. An earlier comment here claimed only advisory RTCP receiver
+      // reports were lost; measurement disproved that. Without `localrtcpport` ffmpeg sends the
+      // audio from an EPHEMERAL source port (measured: 49573 instead of the advertised 55555), so
+      // audio reaches iOS from a port it never expected. Because we advertise an audio codec, iOS
+      // waits for that stream before rendering video at all (see cameraOptions.ts) — reported in
+      // the field as 9-11s stream load times, against 1-2s with talkback off.
+      //
+      // Fixing this properly means Node owning the advertised port and relaying both directions, so
+      // the source port stays symmetric. Until then talkback costs load time and stays default-off.
       localRtcpPort: talkbackOwnsPort ? undefined : session.audioReturnPort,
       packetTimeMs: a.packet_time,
     };

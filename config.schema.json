@@ -165,7 +165,7 @@
         "title": "Two-way audio (talkback, experimental)",
         "type": "boolean",
         "default": false,
-        "description": "Talk from the Home app to a camera's speaker. Requires camera audio to be enabled, a camera with a speaker, and a network route from Homebridge to the camera itself (the talkback target is the camera's own IP, not the console's)."
+        "description": "Talk from the Home app to a camera's speaker. COSTS STREAM LOAD TIME: enabling this measured 9-11s to first frame against 1-2s with it off, because talkback must take over the audio port the outbound stream sends from. Requires camera audio, a camera with a speaker, an API key with WRITE access for cameras, and a network route from Homebridge to the camera itself (the talkback target is the camera's own IP, not the console's)."
       },
       "refreshInterval": {
         "title": "Fallback refresh interval (seconds)",

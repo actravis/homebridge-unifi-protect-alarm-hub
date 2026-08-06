@@ -17,6 +17,13 @@ side gained a substantial round of reliability and security work.
 - Alarm Hub accessories are **unchanged** across the rename — their identities are identical,
   so rooms, custom names, and automations carry over without re-pairing.
 
+### Known issues
+
+- **`exposeTalkback` costs stream load time** — measured 9-11s to first frame, against 1-2s with it
+  off. Talkback takes over the audio port the outbound stream sends from, so audio arrives at iOS
+  from an unexpected source port and iOS waits for it before rendering video. Off by default; a
+  proper fix requires relaying both directions through the plugin.
+
 ### Security
 
 - **Updated `undici` to 6.28.0**, clearing three advisories against the plugin's only runtime

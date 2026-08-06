@@ -671,3 +671,51 @@ test('shutdown kills the talkback process too', async () => {
   delegate.shutdown();
   assert.ok(spawned[1].proc.killed);
 });
+
+// Talkback costs measured stream-load time (it yields the advertised audio port, so outbound audio
+// leaves from an ephemeral port and iOS waits for it). These guard the cheap correctness bits.
+
+test('a talkback failure is reported once per camera, not on every stream start', async () => {
+  const err = Object.assign(new Error('HTTP 403 for /cameras/x/talkback-session'), { status: 403 });
+  const log = makeLog();
+  const { delegate } = makeStreamDelegate(
+    talkbackDeps({
+      log,
+      source: {
+        getSnapshot: async () => Buffer.from([1]),
+        getRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        enableRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        startTalkbackSession: async () => { throw err; },
+      },
+    }),
+  );
+  for (const id of ['s1', 's2', 's3']) {
+    await runWithAudio(delegate, id);
+    delegate.handleStreamRequest({ type: 'stop', sessionID: id }, () => {});
+  }
+  const warns = log.entries.filter((e) => e.level === 'warn' && /Talkback unavailable/.test(e.msg));
+  assert.equal(warns.length, 1, `expected one warning across three streams, got ${warns.length}`);
+});
+
+// A bare "HTTP 403" leaves the user with nothing to act on; the cause is a permission they can grant.
+test('a 403 talkback failure explains that the API key lacks camera write access', async () => {
+  const err = Object.assign(new Error('HTTP 403'), { status: 403 });
+  const log = makeLog();
+  const { delegate } = makeStreamDelegate(
+    talkbackDeps({
+      log,
+      source: {
+        getSnapshot: async () => Buffer.from([1]),
+        getRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        enableRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
+        startTalkbackSession: async () => { throw err; },
+      },
+    }),
+  );
+  await runWithAudio(delegate);
+  assert.ok(log.entries.some((e) => /lacks write access for cameras/.test(e.msg)));
+});
+
+// The port-0 guard (talkback needs an advertised audio port) is exercised by the no-audio-codec case
+// above; driving prepareStream with no audio section leaks a bound socket and hangs the runner, so it
+// is not tested that way.
