@@ -14,7 +14,8 @@
 // Packets are forwarded verbatim. SRTP is keyed on the SSRC rather than the transport addresses, so
 // a relayed packet is byte-identical to a directly-sent one; nothing here decrypts or re-encrypts.
 
-import type { Socket } from 'node:dgram';
+import type { RemoteInfo, Socket } from 'node:dgram';
+import { stripV4Mapped } from '../util';
 
 export interface AudioRelayOptions {
   /** The socket bound to the port advertised to iOS. Owned by the caller; not closed here. */
@@ -23,15 +24,30 @@ export interface AudioRelayOptions {
   local: Socket;
   /** Where to send audio: the phone. */
   target: { address: string; port: number };
-  /** Localhost port the talkback ffmpeg listens on, or undefined to drop inbound audio. */
+  /**
+   * Localhost port the talkback ffmpeg listens on, or undefined to drop inbound audio.
+   *
+   * Undefined is a normal state, not an error: if talkback's process failed to spawn we still need
+   * the OUTBOUND leg, because ffmpeg is already addressing the relay socket — without it the phone
+   * would get no audio at all and iOS would stall waiting for the codec we advertised.
+   */
   talkbackPort?: number;
+  /**
+   * Only forward inbound packets from this address (the phone). Anything else is dropped.
+   *
+   * The advertised port is reachable by anything on the network, and inbound packets are forwarded
+   * to a process that feeds the camera's speaker. SRTP authentication already stops forged audio
+   * from being played, but without this filter any host could drive that forwarding path at will.
+   * Defence in depth, and it bounds the work an unauthenticated sender can cause.
+   */
+  allowFrom?: string;
   /** Diagnostics only; called at most once per direction to avoid log spam per packet. */
   onError?: (direction: 'outbound' | 'inbound', message: string) => void;
 }
 
 export interface AudioRelay {
-  /** Counters for diagnostics and tests: how many packets moved each way. */
-  readonly stats: { outbound: number; inbound: number };
+  /** Counters for diagnostics and tests: packets moved each way, and inbound dropped by the filter. */
+  readonly stats: { outbound: number; inbound: number; dropped: number };
   stop(): void;
 }
 
@@ -40,7 +56,7 @@ export interface AudioRelay {
  * belong to the caller, which closes them as part of normal session teardown.
  */
 export function startAudioRelay(opts: AudioRelayOptions): AudioRelay {
-  const stats = { outbound: 0, inbound: 0 };
+  const stats = { outbound: 0, inbound: 0, dropped: 0 };
   // One report per direction: a broken relay would otherwise log per packet, 50 times a second.
   const reported = { outbound: false, inbound: false };
   const fail = (direction: 'outbound' | 'inbound', err: Error): void => {
@@ -83,10 +99,14 @@ export function startAudioRelay(opts: AudioRelayOptions): AudioRelay {
     forward(opts.advertised, packet, opts.target.port, opts.target.address, 'outbound');
   };
 
-  const onAdvertised = (packet: Buffer): void => {
+  const onAdvertised = (packet: Buffer, rinfo: RemoteInfo): void => {
     const port = opts.talkbackPort;
     if (port === undefined) {
       return; // talkback not running: the microphone has nowhere to go, so drop it
+    }
+    if (opts.allowFrom !== undefined && stripV4Mapped(rinfo.address) !== stripV4Mapped(opts.allowFrom)) {
+      stats.dropped += 1;
+      return;
     }
     forward(opts.local, packet, port, '127.0.0.1', 'inbound');
   };

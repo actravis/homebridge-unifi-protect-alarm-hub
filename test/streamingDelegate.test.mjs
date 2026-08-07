@@ -245,8 +245,15 @@ class FakeProc extends EventEmitter {
   }
 }
 
-/** Build a delegate whose ffmpeg is a FakeProc, plus the spawn calls it recorded. */
-function makeStreamDelegate({ streams = { high: 'rtsps://10.0.0.1:7441/key' }, enableResult, ...over } = {}) {
+/**
+ * Build a delegate whose ffmpeg is a FakeProc, plus the spawn calls it recorded.
+ *
+ * Pass the test context `t` to have the delegate shut down automatically. With talkback on the
+ * plugin holds the advertised audio socket for the session's life, so a test that only shuts down on
+ * its success path leaks a socket when an assertion fails — and a leaked handle hangs `node --test`
+ * with no output rather than reporting. See the same note in audioRelay.test.mjs.
+ */
+function makeStreamDelegate({ streams = { high: 'rtsps://10.0.0.1:7441/key' }, enableResult, t, ...over } = {}) {
   const spawned = [];
   const enabled = [];
   const delegate = new ProtectStreamingDelegate({
@@ -269,6 +276,9 @@ function makeStreamDelegate({ streams = { high: 'rtsps://10.0.0.1:7441/key' }, e
     },
     ...over,
   });
+  if (t) {
+    t.after(() => delegate.shutdown());
+  }
   return { delegate, spawned, enabled };
 }
 
@@ -577,8 +587,8 @@ const talkbackDeps = (over = {}) => ({
 });
 
 // The default path is the one already live-verified; talkback must not disturb it.
-test('with talkback off only one ffmpeg runs and audio keeps its RTCP port', async () => {
-  const { delegate, spawned } = makeStreamDelegate({ audioCodec: OPUS });
+test('with talkback off only one ffmpeg runs and audio keeps its RTCP port', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ audioCodec: OPUS, t });
   const err = await runWithAudio(delegate);
   assert.ifError(err);
   assert.equal(spawned.length, 1, 'no second process');
@@ -586,55 +596,49 @@ test('with talkback off only one ffmpeg runs and audio keeps its RTCP port', asy
   const audioUrl = spawned[0].args.at(-1);
   assert.match(audioUrl, /^srtp:\/\/10\.0\.0\.2:50002\?/);
   assert.match(audioUrl, /localrtcpport=\d+/, 'the audio stream owns the port when talkback is off');
-  delegate.shutdown();
 });
 
-test('with talkback on a second ffmpeg is spawned for the reverse path', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+test('with talkback on a second ffmpeg is spawned for the reverse path', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ ...talkbackDeps(), t });
   const err = await runWithAudio(delegate);
   assert.ifError(err);
   assert.equal(spawned.length, 2);
   const args = spawned[1].args.join(' ');
   assert.match(args, /-f sdp -i pipe:0/);
   assert.ok(args.endsWith('rtp://192.168.1.197:7004'), 'output goes to the camera');
-  delegate.shutdown();
 });
 
-test('the talkback SDP is written to stdin and describes an encrypted stream', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+test('the talkback SDP is written to stdin and describes an encrypted stream', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ ...talkbackDeps(), t });
   await runWithAudio(delegate);
   const sdp = spawned[1].proc.stdinChunks.join('');
   assert.match(sdp, /RTP\/SAVP 110/);
   assert.match(sdp, /a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:/);
   assert.match(sdp, /a=rtpmap:110 opus\/24000\/1/);
   assert.ok(spawned[1].proc.stdinEnded, 'stdin must be closed or ffmpeg waits forever');
-  delegate.shutdown();
 });
 
-test('talkback gets stdin as a pipe, unlike the one-way stream', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+test('talkback gets stdin as a pipe, unlike the one-way stream', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ ...talkbackDeps(), t });
   await runWithAudio(delegate);
   assert.deepEqual(spawned[0].opts.stdio, ['ignore', 'ignore', 'pipe']);
   assert.deepEqual(spawned[1].opts.stdio, ['pipe', 'ignore', 'pipe']);
-  delegate.shutdown();
 });
 
 // Two processes cannot bind the same UDP port; the outbound stream would die on startup.
 // Two processes cannot bind the same UDP port: the outbound stream would fail to start.
-test('when talkback owns the audio port the outbound stream does not also claim it', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+test('when talkback owns the audio port the outbound stream does not also claim it', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ ...talkbackDeps(), t });
   await runWithAudio(delegate);
   const urls = spawned[0].args.filter((a) => /^srtp:\/\//.test(a));
   const [videoUrl, audioUrl] = urls;
   assert.equal(urls.length, 2);
   assert.match(videoUrl, /localrtcpport=\d+/, 'video keeps its own RTCP port');
   assert.ok(!/localrtcpport/.test(audioUrl), 'audio must yield the port to talkback');
-  delegate.shutdown();
 });
 
-test('a failed talkback session still leaves the live stream working', async () => {
-  const { delegate, spawned } = makeStreamDelegate(
-    talkbackDeps({
+test('a failed talkback session still leaves the live stream working', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ t, ...talkbackDeps({
       source: {
         getSnapshot: async () => Buffer.from([1]),
         getRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
@@ -642,17 +646,15 @@ test('a failed talkback session still leaves the live stream working', async () 
         startTalkbackSession: async () => { throw new Error('no speaker'); },
       },
     }),
-  );
+  });
   const err = await runWithAudio(delegate);
   assert.ifError(err, 'video must survive a talkback failure');
   assert.equal(spawned.length, 1);
-  delegate.shutdown();
 });
 
 // The URL is external input that becomes an ffmpeg argument.
-test('an unusable talkback URL is refused and does not spawn anything', async () => {
-  const { delegate, spawned } = makeStreamDelegate(
-    talkbackDeps({
+test('an unusable talkback URL is refused and does not spawn anything', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ t, ...talkbackDeps({
       source: {
         getSnapshot: async () => Buffer.from([1]),
         getRtspsStream: async () => ({ high: 'rtsps://10.0.0.1:7441/key' }),
@@ -660,29 +662,26 @@ test('an unusable talkback URL is refused and does not spawn anything', async ()
         startTalkbackSession: async () => ({ url: 'file:///etc/passwd', samplingRate: 24000 }),
       },
     }),
-  );
+  });
   assert.ifError(await runWithAudio(delegate));
   assert.equal(spawned.length, 1);
-  delegate.shutdown();
 });
 
-test('talkback is skipped entirely when there is no audio codec', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps({ audioCodec: undefined }));
+test('talkback is skipped entirely when there is no audio codec', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ t, ...talkbackDeps({ audioCodec: undefined }) });
   await startStream(delegate);
   assert.equal(spawned.length, 1);
-  delegate.shutdown();
 });
 
-test('stopping the stream kills the talkback process too', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+test('stopping the stream kills the talkback process too', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ ...talkbackDeps(), t });
   await runWithAudio(delegate);
   delegate.handleStreamRequest({ type: 'stop', sessionID: 's1' }, () => {});
   assert.ok(spawned[1].proc.killed, 'a surviving talkback would hold the audio port');
-  delegate.shutdown();
 });
 
-test('shutdown kills the talkback process too', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+test('shutdown kills the talkback process too', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ ...talkbackDeps(), t });
   await runWithAudio(delegate);
   delegate.shutdown();
   assert.ok(spawned[1].proc.killed);
@@ -691,11 +690,10 @@ test('shutdown kills the talkback process too', async () => {
 // Talkback costs measured stream-load time (it yields the advertised audio port, so outbound audio
 // leaves from an ephemeral port and iOS waits for it). These guard the cheap correctness bits.
 
-test('a talkback failure is reported once per camera, not on every stream start', async () => {
+test('a talkback failure is reported once per camera, not on every stream start', async (t) => {
   const err = Object.assign(new Error('HTTP 403 for /cameras/x/talkback-session'), { status: 403 });
   const log = makeLog();
-  const { delegate } = makeStreamDelegate(
-    talkbackDeps({
+  const { delegate } = makeStreamDelegate({ t, ...talkbackDeps({
       log,
       source: {
         getSnapshot: async () => Buffer.from([1]),
@@ -704,23 +702,21 @@ test('a talkback failure is reported once per camera, not on every stream start'
         startTalkbackSession: async () => { throw err; },
       },
     }),
-  );
+  });
   for (const id of ['s1', 's2', 's3']) {
     await runWithAudio(delegate, id);
     delegate.handleStreamRequest({ type: 'stop', sessionID: id }, () => {});
   }
   const warns = log.entries.filter((e) => e.level === 'warn' && /Talkback unavailable/.test(e.msg));
   assert.equal(warns.length, 1, `expected one warning across three streams, got ${warns.length}`);
-  delegate.shutdown();
 });
 
 // A 403 here has been observed to be transient on an all-access key, so the message must not assert
 // a permissions problem — it should say it may recover and what to check if it does not.
-test('a 403 talkback failure is reported as possibly transient, not as a permissions verdict', async () => {
+test('a 403 talkback failure is reported as possibly transient, not as a permissions verdict', async (t) => {
   const err = Object.assign(new Error('HTTP 403'), { status: 403 });
   const log = makeLog();
-  const { delegate } = makeStreamDelegate(
-    talkbackDeps({
+  const { delegate } = makeStreamDelegate({ t, ...talkbackDeps({
       log,
       source: {
         getSnapshot: async () => Buffer.from([1]),
@@ -729,13 +725,12 @@ test('a 403 talkback failure is reported as possibly transient, not as a permiss
         startTalkbackSession: async () => { throw err; },
       },
     }),
-  );
+  });
   await runWithAudio(delegate);
   const msg = log.entries.map((e) => e.msg).join('\n');
   assert.match(msg, /often transient/);
   assert.match(msg, /write access for cameras/);
   assert.ok(!/lacks write access/.test(msg), 'must not state a cause it cannot know');
-  delegate.shutdown();
 });
 
 // The port-0 guard (talkback needs an advertised audio port) is exercised by the no-audio-codec case
@@ -743,11 +738,10 @@ test('a 403 talkback failure is reported as possibly transient, not as a permiss
 // is not tested that way.
 
 // A single transient 403 must not silence the warning for the process lifetime.
-test('a talkback recovery re-arms the once-only warning', async () => {
+test('a talkback recovery re-arms the once-only warning', async (t) => {
   let fail = true;
   const log = makeLog();
-  const { delegate } = makeStreamDelegate(
-    talkbackDeps({
+  const { delegate } = makeStreamDelegate({ t, ...talkbackDeps({
       log,
       source: {
         getSnapshot: async () => Buffer.from([1]),
@@ -761,7 +755,7 @@ test('a talkback recovery re-arms the once-only warning', async () => {
         },
       },
     }),
-  );
+  });
   const run = async (id) => {
     await runWithAudio(delegate, id);
     delegate.handleStreamRequest({ type: 'stop', sessionID: id }, () => {});
@@ -772,32 +766,29 @@ test('a talkback recovery re-arms the once-only warning', async () => {
 
   const warns = log.entries.filter((e) => e.level === 'warn' && /Talkback unavailable/.test(e.msg));
   assert.equal(warns.length, 2, `expected a warning either side of the recovery, got ${warns.length}`);
-  delegate.shutdown();
 });
 
 // The relay is what makes talkback free: the plugin keeps the advertised audio port, so the outbound
 // stream still reaches iOS from the port it expects. Losing that measured 9-11s to first frame.
-test('with talkback on, outbound audio is sent to the relay, not straight to the phone', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+test('with talkback on, outbound audio is sent to the relay, not straight to the phone', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ ...talkbackDeps(), t });
   await runWithAudio(delegate);
   const audioUrl = spawned[0].args.at(-1);
   assert.match(audioUrl, /^srtp:\/\/127\.0\.0\.1:\d+\?/, 'audio goes to the local relay socket');
   assert.ok(!/10\.0\.0\.2/.test(audioUrl), 'and not directly to the phone');
-  delegate.shutdown();
 });
 
 // The regression guard: talkback must never again make the outbound stream use an ephemeral port.
-test('with talkback on, the advertised audio port is still the plugin\'s, not ffmpeg\'s', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+test('with talkback on, the advertised audio port is still the plugin\'s, not ffmpeg\'s', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ ...talkbackDeps(), t });
   await runWithAudio(delegate);
   const joined = spawned[0].args.join(' ');
   // Video keeps its own RTCP port; audio no longer needs one because it talks to localhost.
   assert.equal((joined.match(/localrtcpport=/g) ?? []).length, 1);
-  delegate.shutdown();
 });
 
-test('the talkback SDP listens on the relay\'s private port, not the advertised one', async () => {
-  const { delegate, spawned } = makeStreamDelegate(talkbackDeps());
+test('the talkback SDP listens on the relay\'s private port, not the advertised one', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ ...talkbackDeps(), t });
   await runWithAudio(delegate);
   const sdp = spawned[1].proc.stdinChunks.join('');
   const relayUrl = spawned[0].args.at(-1);
@@ -805,14 +796,40 @@ test('the talkback SDP listens on the relay\'s private port, not the advertised 
   const outboundPort = Number(/127\.0\.0\.1:(\d+)/.exec(relayUrl)[1]);
   assert.ok(sdpPort > 0);
   assert.notEqual(sdpPort, outboundPort, 'the two relay hops must not share a port');
-  delegate.shutdown();
 });
 
-test('with talkback off, audio still goes straight to the phone from the advertised port', async () => {
-  const { delegate, spawned } = makeStreamDelegate({ audioCodec: OPUS });
+test('with talkback off, audio still goes straight to the phone from the advertised port', async (t) => {
+  const { delegate, spawned } = makeStreamDelegate({ audioCodec: OPUS, t });
   await runWithAudio(delegate);
   const audioUrl = spawned[0].args.at(-1);
   assert.match(audioUrl, /^srtp:\/\/10\.0\.0\.2:50002\?/);
   assert.match(audioUrl, /localrtcpport=\d+/);
-  delegate.shutdown();
+});
+
+// If talkback's process never starts, the relay must STILL run: the outbound ffmpeg args already
+// address the relay socket, so skipping it would leave the phone with no audio and stall iOS on the
+// codec we advertised. Only the inbound leg is disabled.
+const spawnedLocal = [];
+// SCOPE: asserts the OUTBOUND half only. The delegate also passes `talkbackPort: undefined` in this
+// case to disable the inbound leg, and mutation-testing showed nothing here catches that — the
+// relay's own "outbound still flows with no talkback port configured" test covers how the relay
+// HONOURS an absent port, but not the delegate's decision to pass one. Verifying that needs the
+// advertised port plumbed out of the prepare response; recorded rather than left implied.
+test('a failed talkback spawn still relays outbound audio', async (t) => {
+  const { delegate } = makeStreamDelegate({ t, ...talkbackDeps({
+      spawn: (path, args, opts) => {
+        // The talkback process is the one reading an SDP from stdin; fail only that.
+        if (args.includes('sdp')) {
+          throw new Error('spawn failed');
+        }
+        const proc = new FakeProc();
+        spawnedLocal.push({ path, args, opts, proc });
+        return proc;
+      },
+    }),
+  });
+  const err = await runWithAudio(delegate);
+  assert.ifError(err, 'video must survive a failed talkback spawn');
+  // The outbound stream is still pointed at the relay, so the relay has to be forwarding.
+  assert.match(spawnedLocal[0].args.at(-1), /^srtp:\/\/127\.0\.0\.1:\d+\?/);
 });

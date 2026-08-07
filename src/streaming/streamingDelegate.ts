@@ -14,7 +14,7 @@ import type {
   StreamRequestCallback,
 } from 'homebridge';
 import type { RtspsStreams, TalkbackSession } from '../types';
-import { redactStreamUrl } from '../util';
+import { redactStreamUrl, stripV4Mapped } from '../util';
 import type { AudioCodecChoice } from './audioCodec';
 import type { AudioArgsOptions } from './ffmpegArgs';
 import { supportsFpsMax, type EncodeProbe } from './ffmpegFeatures';
@@ -22,6 +22,8 @@ import {
   buildVideoArgs, effectiveBitrateKbps, encodeSrtpParams, opusFrameDuration, pickRtspsUrl, selectStreamQuality,
 } from './ffmpegArgs';
 import { startAudioRelay, type AudioRelay } from './audioRelay';
+
+export { stripV4Mapped };
 import { buildTalkbackArgs, buildTalkbackSdp, parseTalkbackTarget } from './talkback';
 
 /** What the delegate needs from the client: snapshots + RTSPS stream URLs. ProtectClient satisfies this. */
@@ -130,13 +132,6 @@ export function randomSsrc(): number {
   return randomBytes(4).readUInt32BE(0) & 0x7fffffff;
 }
 
-/**
- * Node dual-stack sockets report IPv4 peers in IPv4-mapped IPv6 form (`::ffff:a.b.c.d`);
- * hap-nodejs and ffmpeg both want the plain dotted IPv4. Strip the prefix when present.
- */
-export function stripV4Mapped(addr: string): string {
-  return /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(addr)?.[1] ?? addr;
-}
 
 /**
  * The address to advertise as our RTP endpoint, or undefined to let hap-nodejs work it out.
@@ -642,7 +637,13 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
           local: session.relaySocket,
           // The phone's audio port comes from prepareStream, not the start request.
           target: { address: session.targetAddress, port: session.audioPort as number },
-          talkbackPort: session.talkbackInPort,
+          // Inbound only if talkback's process is actually there to receive it. The relay still runs
+          // either way: the outbound args already point at the relay socket, so skipping it would
+          // leave the phone with no audio and stall iOS on the codec we advertised.
+          talkbackPort: session.talkback ? session.talkbackInPort : undefined,
+          // The advertised port is reachable by anything on the network; only the phone's audio
+          // should ever be forwarded towards the camera's speaker.
+          allowFrom: session.targetAddress,
           onError: (direction, message) =>
             this.opts.log.debug(`[talkback] ${direction} relay error: ${message}`),
         });
@@ -820,9 +821,12 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     }
     this.sessions.delete(sessionID); // delete first: the exit handler checks identity
     clearTimeout(session.prepareTimer);
-    closeSocket(session.audioSocket);
+    // Detach the relay first: closing a socket it still forwards through means a queued packet
+    // lands on a closed handle. The send path guards against that, but a guard is a backstop, not
+    // an ordering.
     session.relay?.stop();
     session.relay = undefined;
+    closeSocket(session.audioSocket);
     closeSocket(session.relaySocket);
     session.relaySocket = undefined;
     // Kill talkback first: it has no RTSP session to close cleanly.

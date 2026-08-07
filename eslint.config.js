@@ -43,6 +43,7 @@ module.exports = tseslint.config(
         TextEncoder: 'readonly',
         URL: 'readonly',
         setTimeout: 'readonly',
+        clearTimeout: 'readonly',
         setImmediate: 'readonly',
         console: 'readonly',
         process: 'readonly',

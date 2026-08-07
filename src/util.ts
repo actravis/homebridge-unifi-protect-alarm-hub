@@ -66,3 +66,14 @@ export function redactPayload(value: unknown, maxChars = MAX_PAYLOAD_CHARS): str
   }
   return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
 }
+
+/**
+ * Node dual-stack sockets report IPv4 peers in IPv4-mapped IPv6 form (`::ffff:a.b.c.d`);
+ * hap-nodejs and ffmpeg both want the plain dotted IPv4. Strip the prefix when present.
+ *
+ * Lives here rather than in a streaming module because both the delegate and the audio relay need
+ * it, and importing between those two created a circular dependency.
+ */
+export function stripV4Mapped(addr: string): string {
+  return /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(addr)?.[1] ?? addr;
+}
