@@ -3,7 +3,7 @@
 // accessory (camera = overall motion + optional doorbell; object types = separate sensors).
 
 import { alarmSensorKinds, type SensorKind } from './detectionKinds';
-import type { Camera } from './types';
+import type { Camera, LcdMessage } from './types';
 
 export interface CameraPlan {
   deviceId: string;
@@ -14,6 +14,8 @@ export interface CameraPlan {
   objectTypes: string[];
   /** False when Protect reports the camera as disconnected — the accessory stays, marked inactive. */
   online: boolean;
+  /** The doorbell screen's current message, so the message switches can reflect the console. */
+  lcdMessage?: LcdMessage;
   /**
    * True when the camera has a speaker, i.e. talkback is even possible.
    *
@@ -134,6 +136,7 @@ export function planCameraAccessories(cameras: Camera[], config: CameraPlanConfi
       alarmKinds: config.exposeAudioSensors === true ? alarmSensorKinds(camera.smartDetectSettings?.audioTypes) : [],
       online: isCameraOnline(camera),
       hasSpeaker: camera.featureFlags?.hasSpeaker === true,
+      lcdMessage: camera.lcdMessage,
       disabledObjectTypes: enabled ? supported.filter((type) => !enabled.includes(type)) : [],
     };
   });

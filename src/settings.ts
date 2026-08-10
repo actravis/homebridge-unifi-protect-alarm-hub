@@ -49,6 +49,13 @@ export interface ProtectConfig extends PlatformConfig {
   exposeChimeMute?: boolean;
   /** Add a per-camera "Doorbell Trigger" switch that fires a ring from automations — default off. */
   exposeDoorbellTriggers?: boolean;
+  /**
+   * Add a switch per doorbell-screen message — opt-in, since each is another tile. Offers Protect's
+   * two presets plus anything in `doorbellMessages`.
+   */
+  exposeDoorbellMessages?: boolean;
+  /** Extra custom message texts to offer as switches (blank and duplicate entries are ignored). */
+  doorbellMessages?: string[];
   /** Device IDs to force-treat as doorbells, overriding the LCD-screen heuristic. */
   doorbellDeviceIds?: string[];
   /** Master toggle for chime accessories — default on; also needs a ring trigger and/or mute. */

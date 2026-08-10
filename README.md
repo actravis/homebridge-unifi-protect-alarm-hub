@@ -56,6 +56,10 @@ plugin. The two coexist fine.
     (person / vehicle / animal / package), driven by the realtime events feed.
   - **Doorbell** — ring events for doorbell cameras, and an optional per-camera trigger
     switch so any camera can ring the doorbell from an automation.
+  - **Doorbell screen messages** — optional switches (`exposeDoorbellMessages`) for Protect's two
+    presets plus your own texts (`doorbellMessages`). One message shows at a time, so turning one on
+    turns the others off; turning the active one off clears the screen. A message set in the Protect
+    app shows up on the matching switch.
 
 - **Doorbell chimes** — a chime can appear with either or both of:
   - a **Ring button** to ring it on demand or from an automation (set `chimeTriggerId`);

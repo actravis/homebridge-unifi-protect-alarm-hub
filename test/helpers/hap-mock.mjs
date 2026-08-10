@@ -112,7 +112,15 @@ export class FakeAccessory {
     this.UUID = uuid;
     this.category = category;
     this.context = {};
-    this.services = new Map();
+    /**
+     * Keyed store for getService/getServiceById.
+     *
+     * `services` (below) is exposed as an ARRAY because that is what hap-nodejs exposes. A Map here
+     * made `[...accessory.services]` yield [key, value] pairs in tests while yielding Services in
+     * production, so code that scans services for stale entries silently did nothing under test —
+     * a mock that lies about a shape hides exactly the bug it should catch.
+     */
+    this.serviceMap = new Map();
     /** Set by configureController — how tests reach the streaming delegate. */
     this.controller = undefined;
   }
@@ -124,11 +132,15 @@ export class FakeAccessory {
   static key(token, subtype) {
     return subtype === undefined ? token : `${token?.svcName ?? String(token)}::${subtype}`;
   }
+  /** Matches hap-nodejs: an array of Service. */
+  get services() {
+    return [...this.serviceMap.values()];
+  }
   getService(token) {
-    return this.services.get(token);
+    return this.serviceMap.get(token);
   }
   getServiceById(token, subtype) {
-    return this.services.get(FakeAccessory.key(token, subtype));
+    return this.serviceMap.get(FakeAccessory.key(token, subtype));
   }
   addService(token, name, subtype) {
     const service = new FakeService(token);
@@ -136,13 +148,13 @@ export class FakeAccessory {
       service.updateCharacteristic(Characteristic.Name, name);
     }
     service.subtype = subtype;
-    this.services.set(FakeAccessory.key(token, subtype), service);
+    this.serviceMap.set(FakeAccessory.key(token, subtype), service);
     return service;
   }
   removeService(token) {
-    for (const [key, service] of this.services) {
+    for (const [key, service] of this.serviceMap) {
       if (service === token || key === token) {
-        this.services.delete(key);
+        this.serviceMap.delete(key);
       }
     }
   }

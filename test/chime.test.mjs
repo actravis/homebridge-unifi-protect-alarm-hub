@@ -112,7 +112,7 @@ test('turning off the mute switch in config removes that service', () => {
 test('repeated discovery passes do not duplicate services', () => {
   const { apply, accessory } = setup();
   apply(); apply();
-  const switches = [...accessory.services.values()].filter((s) => s.token === Service.Switch);
+  const switches = accessory.services.filter((s) => s.token === Service.Switch);
   assert.equal(switches.length, 2);
 });
 

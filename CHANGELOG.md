@@ -83,6 +83,15 @@ side gained a substantial round of reliability and security work.
   network route to the camera itself. The URL is validated strictly before it becomes an ffmpeg
   argument — only `rtp://host:port` is accepted. A camera without a speaker, or any talkback
   failure, degrades to one-way audio rather than taking the live stream down.
+- **Doorbell screen messages (off by default).** Enable with `exposeDoorbellMessages` to get a switch
+  per message on doorbells with a screen: Protect's `Leave Package At Door` and `Do Not Disturb`,
+  plus any texts listed in `doorbellMessages`. Only one message displays at a time, so the switches
+  are mutually exclusive, and turning the active one off clears the screen. The console is the source
+  of truth — a message set in the Protect app appears on the matching switch.
+
+  Every message is set with `resetAt: null` so it stays until cleared; without that the console
+  stamps its own timestamp and the message disappears on its own, leaving the switch stuck on.
+  Clearing uses a `resetAt` in the past, which is the only mechanism the API offers.
 - **Doorbell chimes.** A chime can be exposed with two independent, optional controls:
   - a **Ring button** that rings it on demand or from an automation, enabled by setting
     `chimeTriggerId`;

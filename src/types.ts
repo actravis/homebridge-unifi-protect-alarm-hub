@@ -97,13 +97,34 @@ export interface CameraFeatureFlags {
   supportFullHdSnapshot?: boolean;
 }
 
+/**
+ * The doorbell screen's current message.
+ *
+ * `type` is `LEAVE_PACKAGE_AT_DOOR` | `DO_NOT_DISTURB` | `CUSTOM_MESSAGE`; an unknown value is
+ * rejected with HTTP 500 (AJV_PARSE_ERROR). A blank screen is reported as `{}`. `resetAt` in the
+ * PAST is what clears it — see doorbellMessages.ts for what does not work.
+ */
+export interface LcdMessage {
+  type?: string;
+  text?: string;
+  resetAt?: number | null;
+}
+
+/**
+ * The writable subset of a camera. Narrow on purpose: the API rejects unknown fields, and only
+ * `lcdMessage` has been verified to round-trip.
+ */
+export interface CameraSettingsPatch {
+  lcdMessage?: LcdMessage;
+}
+
 export interface Camera extends ProtectDevice {
   isMicEnabled?: boolean;
   micVolume?: number;
   videoMode?: string;
   hdrType?: string;
   hasPackageCamera?: boolean;
-  lcdMessage?: { type?: string; text?: string; resetAt?: number | null };
+  lcdMessage?: LcdMessage;
   ledSettings?: { isEnabled?: boolean };
   /** Which detections are currently enabled on the camera (subset of featureFlags). */
   smartDetectSettings?: { objectTypes?: string[]; audioTypes?: string[] };

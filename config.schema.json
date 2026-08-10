@@ -123,6 +123,21 @@
         "default": false,
         "description": "Add a \"Doorbell Trigger\" switch to every camera. Flip it from an automation to ring the doorbell \u2014 e.g. when your driveway camera detects a vehicle. Any camera becomes ringable (gains a doorbell notification)."
       },
+      "exposeDoorbellMessages": {
+        "title": "Doorbell Screen Message Switches",
+        "type": "boolean",
+        "default": false,
+        "description": "Add a switch per message for doorbells with a screen. Offers Protect's two presets (Leave Package At Door, Do Not Disturb) plus anything listed below. Only one message shows at a time, so turning one on turns the others off; turning the active one off clears the screen."
+      },
+      "doorbellMessages": {
+        "title": "Custom Doorbell Messages",
+        "type": "array",
+        "items": {
+          "type": "string",
+          "title": "Message"
+        },
+        "description": "Extra message texts to offer as switches. Blank and duplicate entries are ignored."
+      },
       "doorbellDeviceIds": {
         "title": "Force these cameras to be doorbells",
         "type": "array",
@@ -246,6 +261,8 @@
         "exposeObjectSensors",
         "exposeAudioSensors",
         "exposeDoorbellTriggers",
+        "exposeDoorbellMessages",
+        "doorbellMessages",
         "exposeCameraStreams",
         "exposeCameraAudio",
         "exposeTalkback",

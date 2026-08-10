@@ -85,7 +85,8 @@ test('CameraAccessory: a doorbell-trigger switch rings the doorbell and self-res
   const t = fakeTimers();
   const acc = new FakeAccessory('Driveway', 'u', 0);
   new CameraAccessory(makePlatform(), acc, { name: 'Driveway', serial: 'AA', isDoorbell: false, doorbellTrigger: true }, t);
-  const sw = acc.getService(Service.Switch);
+  // Subtyped now that doorbell-screen message switches share this accessory.
+  const sw = acc.getServiceById(Service.Switch, 'trigger');
   assert.ok(sw, 'a trigger switch is created');
   assert.ok(acc.getService(Service.Doorbell), 'a doorbell service exists so the camera can ring');
   // an automation flips the switch on (e.g. driveway vehicle detected):
@@ -257,4 +258,134 @@ test('AlarmSensorAccessory: an offline camera deactivates and clears the sensor'
   s.setOnline(false);
   assert.equal(svc.value(C.StatusActive), false);
   assert.equal(svc.value(C.SmokeDetected), C.SmokeDetected.SMOKE_NOT_DETECTED);
+});
+
+// --- Doorbell screen messages -------------------------------------------------
+// One switch per message, mutually exclusive because the screen shows one thing. Clearing works only
+// via a past `resetAt` (see doorbellMessages.ts for the alternatives that return HTTP 500).
+
+const MESSAGES = [
+  { key: 'LEAVE_PACKAGE_AT_DOOR', label: 'Leave Package At Door', type: 'LEAVE_PACKAGE_AT_DOOR' },
+  { key: 'custom:Back soon', label: 'Back soon', type: 'CUSTOM_MESSAGE', text: 'Back soon' },
+];
+
+function withMessages({ patchError, now = () => 1_000_000 } = {}) {
+  const patches = [];
+  const acc = new FakeAccessory('Front Door', 'u', 0);
+  const platform = makePlatform();
+  const handler = new CameraAccessory(platform, acc, {
+    name: 'Front Door', serial: 'bell1', isDoorbell: true,
+    messages: MESSAGES,
+    messageSink: {
+      async patchCamera(id, patch) {
+        patches.push({ id, patch });
+        if (patchError) {
+          throw patchError;
+        }
+      },
+    },
+    now,
+  });
+  const sw = (key) => acc.getServiceById(Service.Switch, `msg:${key}`);
+  return { handler, acc, platform, patches, sw };
+}
+
+test('a switch is created per configured message, with its label', () => {
+  const { sw } = withMessages();
+  assert.ok(sw('LEAVE_PACKAGE_AT_DOOR'));
+  assert.ok(sw('custom:Back soon'));
+  assert.equal(sw('custom:Back soon').value(C.Name), 'Back soon');
+});
+
+test('turning a preset on sends a bare type', async () => {
+  const { sw, patches } = withMessages();
+  await sw('LEAVE_PACKAGE_AT_DOOR').getCharacteristic(C.On).setHandler(true);
+  assert.deepEqual(patches, [{ id: 'bell1', patch: { lcdMessage: { type: 'LEAVE_PACKAGE_AT_DOOR', resetAt: null } } }]);
+});
+
+test('turning a custom message on sends type and text', async () => {
+  const { sw, patches } = withMessages();
+  await sw('custom:Back soon').getCharacteristic(C.On).setHandler(true);
+  assert.deepEqual(patches[0].patch, { lcdMessage: { type: 'CUSTOM_MESSAGE', text: 'Back soon', resetAt: null } });
+});
+
+// The screen shows one message, so HomeKit must not show two switches on.
+test('setting a second message turns the first switch off', async () => {
+  const { sw } = withMessages();
+  await sw('LEAVE_PACKAGE_AT_DOOR').getCharacteristic(C.On).setHandler(true);
+  assert.equal(sw('LEAVE_PACKAGE_AT_DOOR').value(C.On), true);
+
+  await sw('custom:Back soon').getCharacteristic(C.On).setHandler(true);
+  assert.equal(sw('custom:Back soon').value(C.On), true);
+  assert.equal(sw('LEAVE_PACKAGE_AT_DOOR').value(C.On), false, 'only one message can be displayed');
+});
+
+test('turning the active switch off clears the screen with a past resetAt', async () => {
+  const { sw, patches } = withMessages({ now: () => 5_000_000 });
+  await sw('custom:Back soon').getCharacteristic(C.On).setHandler(true);
+  await sw('custom:Back soon').getCharacteristic(C.On).setHandler(false);
+
+  const cleared = patches[1].patch.lcdMessage;
+  assert.ok(cleared.resetAt < 5_000_000, 'a past resetAt is the only thing that clears it');
+  assert.equal(cleared.type, 'CUSTOM_MESSAGE', 'type must still be present or validation fails');
+  assert.equal(cleared.text, 'Back soon');
+  assert.equal(sw('custom:Back soon').value(C.On), false);
+});
+
+// HomeKit sweeps "all off" across a room; that must not wipe a message another switch just set.
+test('turning an inactive switch off is a no-op, not a clear', async () => {
+  const { sw, patches } = withMessages();
+  await sw('custom:Back soon').getCharacteristic(C.On).setHandler(true);
+  await sw('LEAVE_PACKAGE_AT_DOOR').getCharacteristic(C.On).setHandler(false);
+
+  assert.equal(patches.length, 1, 'no second write');
+  assert.equal(sw('custom:Back soon').value(C.On), true, 'the active message survives');
+});
+
+test('a failed write surfaces an error rather than a false success', async () => {
+  const { sw, platform } = withMessages({ patchError: new Error('HTTP 500') });
+  await assert.rejects(() => sw('custom:Back soon').getCharacteristic(C.On).setHandler(true));
+  assert.ok(platform.log.entries.some((e) => e.level === 'error' && /HTTP 500/.test(e.msg)));
+});
+
+// The console is the source of truth: a message set in the Protect app should show up in HomeKit.
+test('a message set outside HomeKit is reflected on the right switch', () => {
+  const { handler, sw } = withMessages();
+  handler.updateMessages({ type: 'LEAVE_PACKAGE_AT_DOOR', text: 'LEAVE PACKAGE AT DOOR', resetAt: null });
+  assert.equal(sw('LEAVE_PACKAGE_AT_DOOR').value(C.On), true);
+
+  handler.updateMessages({});
+  assert.equal(sw('LEAVE_PACKAGE_AT_DOOR').value(C.On), false, 'a blank screen means every switch off');
+});
+
+test('an unrecognised message leaves every switch off rather than guessing', () => {
+  const { handler, sw } = withMessages();
+  handler.updateMessages({ type: 'CUSTOM_MESSAGE', text: 'Typed in the app' });
+  assert.equal(sw('custom:Back soon').value(C.On), false);
+  assert.equal(sw('LEAVE_PACKAGE_AT_DOOR').value(C.On), false);
+});
+
+test('no message switches when none are configured', () => {
+  const acc = new FakeAccessory('Front Door', 'u', 0);
+  new CameraAccessory(makePlatform(), acc, { name: 'Front Door', serial: 'b', isDoorbell: true });
+  assert.equal(acc.services.filter((s) => s.subtype?.startsWith('msg:')).length, 0);
+});
+
+// A cached accessory keeps services from a previous config; a switch for a removed message would
+// still write it.
+test('a switch for a message no longer configured is removed', () => {
+  const acc = new FakeAccessory('Front Door', 'u', 0);
+  const platform = makePlatform();
+  const sink = { async patchCamera() {} };
+  new CameraAccessory(platform, acc, {
+    name: 'Front Door', serial: 'b', isDoorbell: true, messages: MESSAGES, messageSink: sink,
+  });
+  assert.equal(acc.services.filter((s) => s.subtype?.startsWith('msg:')).length, 2);
+
+  // Re-created with only one message, as happens after a config edit + restart.
+  new CameraAccessory(platform, acc, {
+    name: 'Front Door', serial: 'b', isDoorbell: true, messages: [MESSAGES[0]], messageSink: sink,
+  });
+  const left = acc.services.filter((s) => s.subtype?.startsWith('msg:'));
+  assert.deepEqual(left.map((s) => s.subtype), ['msg:LEAVE_PACKAGE_AT_DOOR']);
 });

@@ -15,6 +15,7 @@ import { HubAccessory, ReadonlyContactAccessory, ZoneAccessory } from './accesso
 import { AlarmSensorAccessory, CameraAccessory, ObjectSensorAccessory } from './accessories/camera';
 import { ChimeAccessory } from './accessories/chime';
 import { chimeKey, planChimeAccessories } from './chimeDiscovery';
+import { planDoorbellMessages } from './doorbellMessages';
 import { planAccessories, type PlannedAccessory } from './discovery';
 import { basePollSeconds, effectivePollSeconds } from './pollPolicy';
 import { audioSensorKey, cameraKey, objectSensorKey, objectSensorName, planCameraAccessories } from './cameraDiscovery';
@@ -709,6 +710,11 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
           // transient — measured ~7s of backoff, all of it blocking video from starting. On observed
           // hardware only the doorbell has a speaker.
           talkback: this.config.exposeTalkback === true && !!this.audioCodec && plan.hasSpeaker,
+          // Screen messages only make sense on a device with a screen. planDoorbellMessages
+          // returns nothing unless the feature is switched on, so a non-doorbell costs nothing.
+          messages: plan.isDoorbell ? planDoorbellMessages(this.config) : [],
+          messageSink: client,
+
         };
         // Cameras are bridged like everything else: they appear automatically with the bridge,
         // are cached/restored across restarts, and prune normally. (Publishing them as external
@@ -727,6 +733,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
         this.cameraHandlers.get(camId)?.setName(plan.name);
       }
       this.cameraHandlers.get(camId)?.setOnline(plan.online);
+      // The console is the source of truth for the screen: a message set in the Protect app should
+      // show up on the matching HomeKit switch.
+      this.cameraHandlers.get(camId)?.updateMessages(plan.lcdMessage);
       for (const type of plan.objectTypes) {
         const objId = uuid.generate(objectSensorKey(plan.deviceId, type));
         desired.add(objId);

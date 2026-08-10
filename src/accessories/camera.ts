@@ -4,6 +4,15 @@ import type { DetectionKind } from '../cameraEvents';
 import type { SensorKind } from '../detectionKinds';
 import { ProtectStreamingDelegate, type StreamSource } from '../streaming/streamingDelegate';
 import { buildCameraController } from '../streaming/cameraOptions';
+import {
+  activeMessageKey, clearMessagePatch, setMessagePatch, type MessagePlan,
+} from '../doorbellMessages';
+import type { LcdMessage } from '../types';
+
+/** HAP subtype for the doorbell-trigger switch, so message switches can coexist with it. */
+const TRIGGER_SUBTYPE = 'trigger';
+/** HAP subtype prefix for a doorbell-screen message switch. */
+const MESSAGE_SUBTYPE = 'msg';
 import { resolveFfmpegPath } from '../streaming/ffmpegPath';
 import type { AudioCodecChoice } from '../streaming/audioCodec';
 
@@ -90,6 +99,14 @@ export class CameraAccessory {
   private readonly doorbell?: Service;
   /** The optional "ring from an automation" switch, kept so a rename can relabel it. */
   private trigger?: Service;
+  /** Doorbell-screen message switches by plan key. */
+  private readonly messageServices = new Map<string, Service>();
+  /** Which message the console currently displays, or undefined for a blank screen. */
+  private activeMessage?: string;
+  /** The console's raw lcdMessage; a clear must echo its type/text back or validation fails. */
+  private currentMessage?: LcdMessage;
+  /** Set while a screen write is in flight, so a discovery pass cannot flap the switches. */
+  private writingMessage = false;
   /** Present only when streaming is enabled; retained so shutdown can stop live sessions. */
   private readonly streaming?: ProtectStreamingDelegate;
   /** Protect's reported reachability, from the last discovery pass. */
@@ -100,13 +117,20 @@ export class CameraAccessory {
   constructor(
     private readonly platform: UnifiProtectPlatform,
     accessory: PlatformAccessory,
-    opts: {
+    // Retained: the message switches read their plans, sink and clock from here after construction.
+    private readonly opts: {
       name: string;
       serial: string;
       isDoorbell: boolean;
       doorbellTrigger?: boolean;
       /** Enable two-way audio (talkback) for this camera. */
       talkback?: boolean;
+      /** Doorbell-screen message switches to expose (empty for none). */
+      messages?: MessagePlan[];
+      /** Writes the screen message. Required when `messages` is non-empty. */
+      messageSink?: { patchCamera(id: string, patch: { lcdMessage?: LcdMessage }): Promise<unknown> };
+      /** Clock injection so the clear-patch timestamp is testable. */
+      now?: () => number;
       /** Attach a HomeKit CameraController (camera tile, snapshots, live view). */
       streaming?: boolean;
       /** Snapshot + RTSPS source (the ProtectClient). Required when `streaming` is set. */
@@ -141,7 +165,16 @@ export class CameraAccessory {
       }
     }
     if (opts.doorbellTrigger) {
-      const sw = accessory.getService(Service.Switch) ?? accessory.addService(Service.Switch);
+      // Subtyped now that message switches share this accessory: a bare getService(Service.Switch)
+      // would otherwise match whichever Switch happened to come first. A cached accessory from
+      // before this change carries a subtype-less Switch, so migrate it rather than leaving a
+      // duplicate tile that nothing drives.
+      const legacy = accessory.getService(Service.Switch);
+      if (legacy && legacy.subtype === undefined) {
+        accessory.removeService(legacy);
+      }
+      const sw = accessory.getServiceById(Service.Switch, TRIGGER_SUBTYPE)
+        ?? accessory.addService(Service.Switch, `${opts.name} Doorbell Trigger`, TRIGGER_SUBTYPE);
       this.trigger = sw;
       sw.updateCharacteristic(Characteristic.Name, `${opts.name} Doorbell Trigger`);
       sw.getCharacteristic(Characteristic.On).onSet((value) => {
@@ -151,6 +184,8 @@ export class CameraAccessory {
         }
       });
     }
+
+    this.buildMessageSwitches(accessory, opts.messages ?? []);
 
     if (opts.streaming && opts.source) {
       const delegate = new ProtectStreamingDelegate({
@@ -183,6 +218,101 @@ export class CameraAccessory {
    * reads the service's Name characteristic too, and the alarm-side handlers already keep the
    * two in step on every refresh. The doorbell-trigger switch keeps its own derived label.
    */
+  /**
+   * One switch per configured doorbell-screen message, mutually exclusive.
+   *
+   * Only one message can be displayed, so switching one on turns the others off in HomeKit. The
+   * console is the source of truth: `update` reflects whatever it reports, including a message set
+   * from the Protect app.
+   */
+  private buildMessageSwitches(accessory: PlatformAccessory, plans: MessagePlan[]): void {
+    const { Service, Characteristic } = this.platform;
+    const wanted = new Set(plans.map((p) => `${MESSAGE_SUBTYPE}:${p.key}`));
+    // Drop switches for messages no longer configured, or a cached accessory keeps a tile that
+    // writes a message the user removed.
+    for (const service of [...accessory.services]) {
+      const sub = service.subtype;
+      if (sub?.startsWith(`${MESSAGE_SUBTYPE}:`) && !wanted.has(sub)) {
+        accessory.removeService(service);
+      }
+    }
+    for (const plan of plans) {
+      const subtype = `${MESSAGE_SUBTYPE}:${plan.key}`;
+      const existing = accessory.getServiceById(Service.Switch, subtype);
+      const svc = existing ?? accessory.addService(Service.Switch, plan.label, subtype);
+      this.messageServices.set(plan.key, svc);
+      if (!existing) {
+        svc
+          .getCharacteristic(Characteristic.On)
+          .onGet(() => this.activeMessage === plan.key)
+          .onSet((value) => this.writeMessage(plan, value === true));
+      }
+    }
+  }
+
+  /** Apply the screen state the console reports. */
+  updateMessages(current: LcdMessage | undefined): void {
+    const plans = this.opts.messages ?? [];
+    if (plans.length === 0) {
+      return;
+    }
+    // Don't fight our own in-flight write: the console may still report the previous message.
+    if (this.writingMessage) {
+      return;
+    }
+    this.activeMessage = activeMessageKey(plans, current);
+    this.currentMessage = current;
+    this.reflectMessageSwitches();
+  }
+
+  private reflectMessageSwitches(): void {
+    const On = this.platform.Characteristic.On;
+    for (const [key, svc] of this.messageServices) {
+      svc.updateCharacteristic(On, this.activeMessage === key);
+    }
+  }
+
+  /**
+   * Set or clear the screen.
+   *
+   * Errors surface as a HAP failure rather than a silent no-op: the whole point of the switch is that
+   * the screen changed, so a write that did not land must not read as success.
+   */
+  private async writeMessage(plan: MessagePlan, on: boolean): Promise<void> {
+    const { hap } = this.platform.api;
+    const sink = this.opts.messageSink;
+    if (!sink) {
+      throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+    // Turning off a switch that is not the active message is a no-op, not a clear — otherwise
+    // HomeKit's own "all off" sweep would wipe a message the user just set from another switch.
+    if (!on && this.activeMessage !== plan.key) {
+      return;
+    }
+    const patch = on
+      ? setMessagePatch(plan)
+      : clearMessagePatch(this.currentMessage, (this.opts.now ?? Date.now)());
+    this.writingMessage = true;
+    try {
+      await sink.patchCamera(this.opts.serial, patch);
+      this.activeMessage = on ? plan.key : undefined;
+      this.currentMessage = patch.lcdMessage;
+      this.reflectMessageSwitches();
+      this.platform.log.info(
+        on
+          ? `Doorbell screen on "${this.opts.name}" set to "${plan.label}".`
+          : `Doorbell screen on "${this.opts.name}" cleared.`,
+      );
+    } catch (err) {
+      this.platform.log.error(
+        `Could not change the doorbell screen on "${this.opts.name}": ${(err as Error).message}`,
+      );
+      throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    } finally {
+      this.writingMessage = false;
+    }
+  }
+
   setName(name: string): void {
     this.motion.setName(name);
     this.trigger?.updateCharacteristic(this.platform.Characteristic.Name, `${name} Doorbell Trigger`);

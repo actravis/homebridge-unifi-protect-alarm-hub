@@ -1,7 +1,8 @@
 import type { TLSSocket } from 'node:tls';
 import { Agent, buildConnector, fetch, WebSocket } from 'undici';
 import type {
-  AlarmHub, Camera, Chime, ChimeSettingsPatch, ProtectEvent, RtspsStreams, TalkbackSession,
+  AlarmHub, Camera, CameraSettingsPatch, Chime, ChimeSettingsPatch, ProtectEvent, RtspsStreams,
+  TalkbackSession,
 } from '../types';
 import { computeRetryDelay, exponentialBackoff, jitter, reconnectDelay, reserveSlot } from './timing';
 
@@ -237,6 +238,17 @@ export class ProtectClient {
 
   getCameras(): Promise<Camera[]> {
     return this.request<Camera[]>('/cameras');
+  }
+
+  /**
+   * Update a camera's writable settings. Only `lcdMessage` is verified to round-trip; the API
+   * rejects unknown fields with HTTP 500 rather than ignoring them.
+   */
+  patchCamera(id: string, patch: CameraSettingsPatch): Promise<Camera> {
+    return this.request<Camera>(`/cameras/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: patch,
+    });
   }
 
   /**
