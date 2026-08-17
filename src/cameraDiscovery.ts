@@ -17,6 +17,14 @@ export interface CameraPlan {
   /** The doorbell screen's current message, so the message switches can reflect the console. */
   lcdMessage?: LcdMessage;
   /**
+   * True when the camera has a controllable status light. Only some models do — on the observed
+   * console just the doorbell — and offering the switch elsewhere would be a control that cannot
+   * work. Comes from data `/cameras` already returns, so it costs no extra request.
+   */
+  hasStatusLed: boolean;
+  /** Whether that light is currently on, so the switch reflects the console rather than guessing. */
+  statusLedOn: boolean;
+  /**
    * True when the camera has a speaker, i.e. talkback is even possible.
    *
    * Decided here, from data `/cameras` already returns, so no extra request is ever made to find
@@ -137,6 +145,10 @@ export function planCameraAccessories(cameras: Camera[], config: CameraPlanConfi
       online: isCameraOnline(camera),
       hasSpeaker: camera.featureFlags?.hasSpeaker === true,
       lcdMessage: camera.lcdMessage,
+      hasStatusLed: camera.featureFlags?.hasLedStatus === true,
+      // Absent is treated as on, matching Protect's default; a missing field must not make the
+      // switch claim the light is off.
+      statusLedOn: camera.ledSettings?.isEnabled !== false,
       disabledObjectTypes: enabled ? supported.filter((type) => !enabled.includes(type)) : [],
     };
   });

@@ -56,6 +56,11 @@ export interface ProtectConfig extends PlatformConfig {
   exposeDoorbellMessages?: boolean;
   /** Extra custom message texts to offer as switches (blank and duplicate entries are ignored). */
   doorbellMessages?: string[];
+  /**
+   * Add a "Status Light" switch for cameras with a controllable LED — opt-in. Only models reporting
+   * `hasLedStatus` get one; the rest cannot turn it off, so no switch is created for them.
+   */
+  exposeStatusLed?: boolean;
   /** Device IDs to force-treat as doorbells, overriding the LCD-screen heuristic. */
   doorbellDeviceIds?: string[];
   /** Master toggle for chime accessories — default on; also needs a ring trigger and/or mute. */

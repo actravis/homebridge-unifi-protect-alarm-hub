@@ -83,6 +83,14 @@ side gained a substantial round of reliability and security work.
   network route to the camera itself. The URL is validated strictly before it becomes an ffmpeg
   argument — only `rtp://host:port` is accepted. A camera without a speaker, or any talkback
   failure, degrades to one-way audio rather than taking the live stream down.
+- **Status light switch (off by default).** Enable with `exposeStatusLed` to turn a camera's status
+  LED on or off. Only cameras reporting a controllable LED get a switch — capability comes from data
+  discovery already fetches, so it costs no extra request. Writes send only `isEnabled`, which the
+  console merges, leaving your `welcomeLed` and `floodLed` settings untouched.
+
+  Microphone mute was investigated and deliberately NOT added: `isMicEnabled` is read-only, and
+  `micVolume: 0` is rejected (HTTP 500) while other values apply. A "Microphone" switch could only
+  have turned the mic down, not off, which would misrepresent what it does.
 - **Doorbell screen messages (off by default).** Enable with `exposeDoorbellMessages` to get a switch
   per message on doorbells with a screen: Protect's `Leave Package At Door` and `Do Not Disturb`,
   plus any texts listed in `doorbellMessages`. Only one message displays at a time, so the switches

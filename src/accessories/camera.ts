@@ -7,12 +7,14 @@ import { buildCameraController } from '../streaming/cameraOptions';
 import {
   activeMessageKey, clearMessagePatch, setMessagePatch, type MessagePlan,
 } from '../doorbellMessages';
-import type { LcdMessage } from '../types';
+import type { CameraSettingsPatch, LcdMessage } from '../types';
 
 /** HAP subtype for the doorbell-trigger switch, so message switches can coexist with it. */
 const TRIGGER_SUBTYPE = 'trigger';
 /** HAP subtype prefix for a doorbell-screen message switch. */
 const MESSAGE_SUBTYPE = 'msg';
+/** HAP subtype for the status-light switch. */
+const LED_SUBTYPE = 'led';
 import { resolveFfmpegPath } from '../streaming/ffmpegPath';
 import type { AudioCodecChoice } from '../streaming/audioCodec';
 
@@ -107,6 +109,11 @@ export class CameraAccessory {
   private currentMessage?: LcdMessage;
   /** Set while a screen write is in flight, so a discovery pass cannot flap the switches. */
   private writingMessage = false;
+  /** The status-light switch, when this camera has a controllable LED. */
+  private ledService?: Service;
+  private ledOn = true;
+  /** Set while an LED write is in flight, so a discovery pass cannot flap the switch. */
+  private writingLed = false;
   /** Present only when streaming is enabled; retained so shutdown can stop live sessions. */
   private readonly streaming?: ProtectStreamingDelegate;
   /** Protect's reported reachability, from the last discovery pass. */
@@ -127,8 +134,13 @@ export class CameraAccessory {
       talkback?: boolean;
       /** Doorbell-screen message switches to expose (empty for none). */
       messages?: MessagePlan[];
-      /** Writes the screen message. Required when `messages` is non-empty. */
-      messageSink?: { patchCamera(id: string, patch: { lcdMessage?: LcdMessage }): Promise<unknown> };
+      /** Expose a status-light switch. Only set for cameras that actually have a controllable LED. */
+      statusLed?: boolean;
+      /**
+       * Writes camera settings (screen message, status light). Required when `messages` is non-empty
+       * or `statusLed` is set. ProtectClient satisfies this.
+       */
+      messageSink?: { patchCamera(id: string, patch: CameraSettingsPatch): Promise<unknown> };
       /** Clock injection so the clear-patch timestamp is testable. */
       now?: () => number;
       /** Attach a HomeKit CameraController (camera tile, snapshots, live view). */
@@ -186,6 +198,7 @@ export class CameraAccessory {
     }
 
     this.buildMessageSwitches(accessory, opts.messages ?? []);
+    this.buildStatusLedSwitch(accessory, opts.statusLed === true);
 
     if (opts.streaming && opts.source) {
       const delegate = new ProtectStreamingDelegate({
@@ -247,6 +260,70 @@ export class CameraAccessory {
           .onGet(() => this.activeMessage === plan.key)
           .onSet((value) => this.writeMessage(plan, value === true));
       }
+    }
+  }
+
+  /**
+   * Add or remove the status-light switch.
+   *
+   * Removing matters: a cached accessory from when the feature was on (or from a camera whose model
+   * cannot control its LED) would otherwise keep a switch whose writes the console ignores.
+   */
+  private buildStatusLedSwitch(accessory: PlatformAccessory, wanted: boolean): void {
+    const { Service, Characteristic } = this.platform;
+    const existing = accessory.getServiceById(Service.Switch, LED_SUBTYPE);
+    if (!wanted) {
+      if (existing) {
+        accessory.removeService(existing);
+      }
+      this.ledService = undefined;
+      return;
+    }
+    const svc = existing ?? accessory.addService(Service.Switch, `${this.opts.name} Status Light`, LED_SUBTYPE);
+    if (!existing) {
+      svc
+        .getCharacteristic(Characteristic.On)
+        .onGet(() => this.ledOn)
+        .onSet((value) => this.writeStatusLed(value === true));
+    }
+    this.ledService = svc;
+  }
+
+  /** Apply the status-light state the console reports. */
+  updateStatusLed(on: boolean): void {
+    // Don't fight our own in-flight write: the console may still report the previous value.
+    if (!this.ledService || this.writingLed) {
+      return;
+    }
+    this.ledOn = on;
+    this.ledService.updateCharacteristic(this.platform.Characteristic.On, on);
+  }
+
+  /**
+   * Turn the status light on or off.
+   *
+   * Only `isEnabled` is sent: a partial `ledSettings` write is merged by the console (verified), so
+   * `welcomeLed` and `floodLed` keep whatever the user configured in Protect.
+   */
+  private async writeStatusLed(on: boolean): Promise<void> {
+    const { hap } = this.platform.api;
+    const sink = this.opts.messageSink;
+    if (!sink) {
+      throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+    this.writingLed = true;
+    try {
+      await sink.patchCamera(this.opts.serial, { ledSettings: { isEnabled: on } });
+      this.ledOn = on;
+      this.ledService?.updateCharacteristic(this.platform.Characteristic.On, on);
+      this.platform.log.info(`Status light on "${this.opts.name}" turned ${on ? 'on' : 'off'}.`);
+    } catch (err) {
+      this.platform.log.error(
+        `Could not change the status light on "${this.opts.name}": ${(err as Error).message}`,
+      );
+      throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    } finally {
+      this.writingLed = false;
     }
   }
 

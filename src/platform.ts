@@ -714,6 +714,8 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
           // returns nothing unless the feature is switched on, so a non-doorbell costs nothing.
           messages: plan.isDoorbell ? planDoorbellMessages(this.config) : [],
           messageSink: client,
+          // Only cameras that report a controllable LED; the rest silently ignore the write.
+          statusLed: this.config.exposeStatusLed === true && plan.hasStatusLed,
 
         };
         // Cameras are bridged like everything else: they appear automatically with the bridge,
@@ -736,6 +738,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       // The console is the source of truth for the screen: a message set in the Protect app should
       // show up on the matching HomeKit switch.
       this.cameraHandlers.get(camId)?.updateMessages(plan.lcdMessage);
+      this.cameraHandlers.get(camId)?.updateStatusLed(plan.statusLedOn);
       for (const type of plan.objectTypes) {
         const objId = uuid.generate(objectSensorKey(plan.deviceId, type));
         desired.add(objId);

@@ -56,6 +56,9 @@ plugin. The two coexist fine.
     (person / vehicle / animal / package), driven by the realtime events feed.
   - **Doorbell** — ring events for doorbell cameras, and an optional per-camera trigger
     switch so any camera can ring the doorbell from an automation.
+  - **Status light** — an optional switch (`exposeStatusLed`) to turn a camera's status LED off.
+    Only cameras that report a controllable LED get one; on the rest the console ignores the write,
+    so no switch is created.
   - **Doorbell screen messages** — optional switches (`exposeDoorbellMessages`) for Protect's two
     presets plus your own texts (`doorbellMessages`). One message shows at a time, so turning one on
     turns the others off; turning the active one off clears the screen. A message set in the Protect

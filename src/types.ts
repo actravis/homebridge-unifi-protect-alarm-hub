@@ -116,6 +116,12 @@ export interface LcdMessage {
  */
 export interface CameraSettingsPatch {
   lcdMessage?: LcdMessage;
+  /**
+   * Status-light settings. A PARTIAL write is MERGED here — verified: sending only `isEnabled`
+   * left `welcomeLed` and `floodLed` untouched. That is the opposite of a chime's `ringSettings`,
+   * which replaces the whole array, so the two must not be reasoned about interchangeably.
+   */
+  ledSettings?: { isEnabled?: boolean };
 }
 
 export interface Camera extends ProtectDevice {

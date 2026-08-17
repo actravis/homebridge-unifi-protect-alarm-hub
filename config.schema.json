@@ -138,6 +138,12 @@
         },
         "description": "Extra message texts to offer as switches. Blank and duplicate entries are ignored."
       },
+      "exposeStatusLed": {
+        "title": "Status Light Switch",
+        "type": "boolean",
+        "default": false,
+        "description": "Add a switch to turn a camera's status light on or off. Only cameras that report a controllable LED get one \u2014 on many models the light cannot be changed, so no switch is created for them."
+      },
       "doorbellDeviceIds": {
         "title": "Force these cameras to be doorbells",
         "type": "array",
@@ -263,6 +269,7 @@
         "exposeDoorbellTriggers",
         "exposeDoorbellMessages",
         "doorbellMessages",
+        "exposeStatusLed",
         "exposeCameraStreams",
         "exposeCameraAudio",
         "exposeTalkback",

@@ -186,3 +186,35 @@ test('a camera without a speaker is not, and an absent flag is treated as no spe
   );
   assert.deepEqual(plans.map((p) => p.hasSpeaker), [false, false, false]);
 });
+
+// The status light is only controllable on some models. Offering the switch elsewhere would be a
+// control whose writes the console silently ignores, so capability is decided once here from data
+// /cameras already returns.
+test('a camera reporting a controllable LED is planned as status-led capable', () => {
+  const [plan] = planCameraAccessories(
+    [{ id: 'c1', modelKey: 'camera', name: 'Front Door', featureFlags: { hasLedStatus: true } }],
+    {},
+  );
+  assert.equal(plan.hasStatusLed, true);
+});
+
+test('a camera without a controllable LED is not, and an absent flag means no', () => {
+  const plans = planCameraAccessories(
+    [
+      { id: 'c1', modelKey: 'camera', name: 'A', featureFlags: { hasLedStatus: false } },
+      { id: 'c2', modelKey: 'camera', name: 'B', featureFlags: {} },
+      { id: 'c3', modelKey: 'camera', name: 'C' },
+    ],
+    {},
+  );
+  assert.deepEqual(plans.map((p) => p.hasStatusLed), [false, false, false]);
+});
+
+test('the light reads as on unless the console says otherwise', () => {
+  const cam = (ledSettings) => ({ id: 'c', modelKey: 'camera', name: 'A', featureFlags: { hasLedStatus: true }, ledSettings });
+  assert.equal(planCameraAccessories([cam({ isEnabled: true })], {})[0].statusLedOn, true);
+  assert.equal(planCameraAccessories([cam({ isEnabled: false })], {})[0].statusLedOn, false);
+  // A missing field must not make the switch claim the light is off.
+  assert.equal(planCameraAccessories([cam({})], {})[0].statusLedOn, true);
+  assert.equal(planCameraAccessories([cam(undefined)], {})[0].statusLedOn, true);
+});

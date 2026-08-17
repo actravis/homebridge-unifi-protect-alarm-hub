@@ -389,3 +389,95 @@ test('a switch for a message no longer configured is removed', () => {
   const left = acc.services.filter((s) => s.subtype?.startsWith('msg:'));
   assert.deepEqual(left.map((s) => s.subtype), ['msg:LEAVE_PACKAGE_AT_DOOR']);
 });
+
+// --- Status light -------------------------------------------------------------
+
+function withStatusLed({ patchError, statusLed = true } = {}) {
+  const patches = [];
+  const acc = new FakeAccessory('Front Door', 'u', 0);
+  const platform = makePlatform();
+  const handler = new CameraAccessory(platform, acc, {
+    name: 'Front Door', serial: 'bell1', isDoorbell: true, statusLed,
+    messageSink: {
+      async patchCamera(id, patch) {
+        patches.push({ id, patch });
+        if (patchError) {
+          throw patchError;
+        }
+      },
+    },
+  });
+  return { handler, acc, platform, patches, sw: () => acc.getServiceById(Service.Switch, 'led') };
+}
+
+test('a status-light switch is created, labelled, and defaults to on', () => {
+  const { sw } = withStatusLed();
+  assert.ok(sw());
+  assert.equal(sw().value(C.Name), 'Front Door Status Light');
+});
+
+// Only isEnabled is sent: the console MERGES a partial ledSettings write, so welcomeLed and floodLed
+// keep whatever the user set in Protect. (A chime's ringSettings replaces instead — do not confuse.)
+test('turning the light off sends only isEnabled', async () => {
+  const { sw, patches } = withStatusLed();
+  await sw().getCharacteristic(C.On).setHandler(false);
+  assert.deepEqual(patches, [{ id: 'bell1', patch: { ledSettings: { isEnabled: false } } }]);
+});
+
+test('turning it back on sends isEnabled true', async () => {
+  const { sw, patches } = withStatusLed();
+  await sw().getCharacteristic(C.On).setHandler(false);
+  await sw().getCharacteristic(C.On).setHandler(true);
+  assert.deepEqual(patches[1].patch, { ledSettings: { isEnabled: true } });
+  assert.equal(sw().value(C.On), true);
+});
+
+test('a failed write surfaces an error rather than a false success', async () => {
+  const { sw, platform } = withStatusLed({ patchError: new Error('HTTP 500') });
+  await assert.rejects(() => sw().getCharacteristic(C.On).setHandler(false));
+  assert.ok(platform.log.entries.some((e) => e.level === 'error' && /HTTP 500/.test(e.msg)));
+});
+
+test('a change made in Protect is reflected on the switch', () => {
+  const { handler, sw } = withStatusLed();
+  handler.updateStatusLed(false);
+  assert.equal(sw().value(C.On), false);
+  handler.updateStatusLed(true);
+  assert.equal(sw().value(C.On), true);
+});
+
+test('no switch for a camera that cannot control its light', () => {
+  const { sw } = withStatusLed({ statusLed: false });
+  assert.equal(sw(), undefined);
+});
+
+// A cached accessory would otherwise keep a switch whose writes the console ignores.
+test('a cached status-light switch is removed when the camera cannot control it', () => {
+  const acc = new FakeAccessory('Front Door', 'u', 0);
+  const platform = makePlatform();
+  const sink = { async patchCamera() {} };
+  new CameraAccessory(platform, acc, { name: 'Front Door', serial: 'b', isDoorbell: true, statusLed: true, messageSink: sink });
+  assert.ok(acc.getServiceById(Service.Switch, 'led'));
+
+  new CameraAccessory(platform, acc, { name: 'Front Door', serial: 'b', isDoorbell: true, statusLed: false, messageSink: sink });
+  assert.equal(acc.getServiceById(Service.Switch, 'led'), undefined);
+});
+
+// Discovery runs every few minutes and could report the pre-write value.
+test('a discovery pass mid-write does not flap the switch', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const acc = new FakeAccessory('Front Door', 'u', 0);
+  const handler = new CameraAccessory(makePlatform(), acc, {
+    name: 'Front Door', serial: 'b', isDoorbell: true, statusLed: true,
+    messageSink: { async patchCamera() { await gate; } },
+  });
+  const sw = acc.getServiceById(Service.Switch, 'led');
+
+  const pending = sw.getCharacteristic(C.On).setHandler(false);
+  handler.updateStatusLed(true);          // stale snapshot arrives mid-write
+  assert.notEqual(sw.value(C.On), true, 'the in-flight write must win over a stale snapshot');
+  release();
+  await pending;
+  assert.equal(sw.value(C.On), false);
+});

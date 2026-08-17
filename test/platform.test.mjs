@@ -811,3 +811,32 @@ test('exposeTalkback:false declares twoWayAudio nowhere, speaker or not', async 
   const ctl = api.registered.find((a) => a.displayName === 'Front Door')?.controller;
   assert.equal(ctl?.config?.streamingOptions?.audio?.twoWayAudio, false);
 });
+
+// The status light is controllable on only some models; on the rest the console ignores the write, so
+// the switch must not exist there at all.
+test('a status-light switch appears only on cameras that can control their LED', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false, exposeStatusLed: true },
+    {
+      hubs: [hub()],
+      cameras: [
+        { id: 'bell', modelKey: 'camera', name: 'Front Door', featureFlags: { hasLedStatus: true } },
+        { id: 'plain', modelKey: 'camera', name: 'Gatehouse', featureFlags: { hasLedStatus: false } },
+      ],
+    },
+  );
+  const led = (name) =>
+    api.registered.find((a) => a.displayName === name)?.getServiceById(Service.Switch, 'led');
+
+  assert.ok(led('Front Door'), 'the doorbell reports a controllable LED');
+  assert.equal(led('Gatehouse'), undefined, 'a camera that cannot must get no switch');
+});
+
+test('exposeStatusLed:false creates no switch even on a capable camera', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [{ id: 'bell', modelKey: 'camera', name: 'Front Door', featureFlags: { hasLedStatus: true } }] },
+  );
+  const acc = api.registered.find((a) => a.displayName === 'Front Door');
+  assert.equal(acc?.getServiceById(Service.Switch, 'led'), undefined);
+});
