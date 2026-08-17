@@ -126,6 +126,17 @@ The webhook requires your API key, so the Trigger ID is not on its own enough fo
 network to fire it. The mute switch (`exposeChimeMute`) needs no setup; it uses the chime's normal
 settings endpoint.
 
+## Scale
+
+This plugin creates up to **6 HomeKit accessories per camera** when object and audio sensors are
+enabled — the camera itself, plus one per detection type — and one per alarm zone. HomeKit's limit is
+**149 accessories per one bridge**, so roughly 20 cameras alongside a full alarm hub reaches it. The
+plugin warns as it approaches; past the limit HomeKit silently stops accepting accessories. Turning
+off `exposeObjectSensors` and/or `exposeAudioSensors` drops it to one accessory per camera.
+
+Discovery itself does not scale with device count: one request each for cameras, chimes and hubs per
+pass, regardless of how many devices exist. Per-camera requests happen only when a stream starts.
+
 ## Limitations
 
 - **Outputs are read-only.** UniFi does not yet expose a way to trigger alarm-hub outputs

@@ -481,3 +481,84 @@ test('a discovery pass mid-write does not flap the switch', async () => {
   await pending;
   assert.equal(sw.value(C.On), false);
 });
+
+// Two quick taps used to fire concurrent PATCHes; whichever landed last won, so HomeKit could show a
+// different message than the console until the next discovery pass minutes later.
+test('rapid message presses apply in order, and the last one wins', async () => {
+  const order = [];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const acc = new FakeAccessory('Front Door', 'u', 0);
+  const handler = new CameraAccessory(makePlatform(), acc, {
+    name: 'Front Door', serial: 'b', isDoorbell: true, messages: MESSAGES,
+    messageSink: {
+      async patchCamera(_id, patch) {
+        order.push(patch.lcdMessage.type === 'CUSTOM_MESSAGE' ? patch.lcdMessage.text : patch.lcdMessage.type);
+        if (order.length === 1) {
+          await gate; // hold the first write open so the second must queue
+        }
+      },
+    },
+  });
+  const sw = (k) => acc.getServiceById(Service.Switch, `msg:${k}`);
+
+  // The queue chains off a resolved promise, so a write starts on a microtask, not synchronously.
+  const tick = () => new Promise((r) => setImmediate(r));
+  const first = sw('LEAVE_PACKAGE_AT_DOOR').getCharacteristic(C.On).setHandler(true);
+  await tick();
+  assert.deepEqual(order, ['LEAVE_PACKAGE_AT_DOOR'], 'the first write started');
+  const second = sw('custom:Back soon').getCharacteristic(C.On).setHandler(true);
+  await tick();
+  assert.deepEqual(order, ['LEAVE_PACKAGE_AT_DOOR'], 'the second must wait, not race');
+  release();
+  await Promise.all([first, second]);
+
+  assert.deepEqual(order, ['LEAVE_PACKAGE_AT_DOOR', 'Back soon'], 'applied in the order pressed');
+  assert.equal(sw('custom:Back soon').value(C.On), true, 'the last press wins');
+  assert.equal(sw('LEAVE_PACKAGE_AT_DOOR').value(C.On), false);
+  handler.updateMessages({ type: 'CUSTOM_MESSAGE', text: 'Back soon' });
+});
+
+// A failed write must not wedge the queue for everything after it.
+test('a failed write does not block the next one', async () => {
+  let n = 0;
+  const acc = new FakeAccessory('Front Door', 'u', 0);
+  new CameraAccessory(makePlatform(), acc, {
+    name: 'Front Door', serial: 'b', isDoorbell: true, messages: MESSAGES,
+    messageSink: {
+      async patchCamera() {
+        n += 1;
+        if (n === 1) {
+          throw new Error('HTTP 500');
+        }
+      },
+    },
+  });
+  const sw = (k) => acc.getServiceById(Service.Switch, `msg:${k}`);
+  await assert.rejects(() => sw('LEAVE_PACKAGE_AT_DOOR').getCharacteristic(C.On).setHandler(true));
+  await sw('custom:Back soon').getCharacteristic(C.On).setHandler(true);
+  assert.equal(n, 2, 'the queue kept moving after a failure');
+  assert.equal(sw('custom:Back soon').value(C.On), true);
+});
+
+// The guard must hold for the whole queue, not just the write currently in flight.
+test('a discovery pass while writes are queued does not flap the switches', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const acc = new FakeAccessory('Front Door', 'u', 0);
+  const handler = new CameraAccessory(makePlatform(), acc, {
+    name: 'Front Door', serial: 'b', isDoorbell: true, messages: MESSAGES,
+    messageSink: { async patchCamera() { await gate; } },
+  });
+  const sw = (k) => acc.getServiceById(Service.Switch, `msg:${k}`);
+
+  const a = sw('LEAVE_PACKAGE_AT_DOOR').getCharacteristic(C.On).setHandler(true);
+  const b = sw('custom:Back soon').getCharacteristic(C.On).setHandler(true);
+  // A stale snapshot that matches a real plan, arriving while both writes are still queued.
+  handler.updateMessages({ type: 'LEAVE_PACKAGE_AT_DOOR', text: 'LEAVE PACKAGE AT DOOR' });
+  release();
+  await Promise.all([a, b]);
+
+  assert.equal(sw('custom:Back soon').value(C.On), true, 'the queued writes win over the stale snapshot');
+  assert.equal(sw('LEAVE_PACKAGE_AT_DOOR').value(C.On), false);
+});

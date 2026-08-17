@@ -38,6 +38,11 @@ interface AccessorySpec {
  */
 const STALE_AFTER_FAILURES = 3;
 
+/** HomeKit's hard limit on accessories behind a single bridge. */
+const ACCESSORY_LIMIT = 149;
+/** Warn from here, leaving headroom to act before accessories start being dropped. */
+const ACCESSORY_WARN_AT = 130;
+
 /**
  * How often to re-discover the non-alarm devices (cameras, chimes).
  *
@@ -88,6 +93,8 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   private readonly alarmHandlers = new Map<string, AlarmSensorAccessory>();
   private readonly chimeHandlers = new Map<string, ChimeAccessory>();
   private chimeDiscoveryOk = true;
+  /** The accessory-budget warning is reported once, not on every discovery pass. */
+  private warnedAccessoryBudget = false;
   /** Talkback-without-audio is warned about once, not on every discovery pass. */
   private warnedTalkback = false;
   private disposeEvents?: () => void;
@@ -535,6 +542,29 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   private async syncDevices(): Promise<void> {
     await this.syncCameras();
     await this.syncChimes();
+    this.checkAccessoryBudget();
+  }
+
+  /**
+   * Warn as the bridge approaches HomeKit's per-bridge accessory limit.
+   *
+   * HAP allows 149 accessories on one bridge. This plugin creates up to 6 per camera with object and
+   * audio sensors enabled (the camera, one sensor per detection type), plus one per alarm zone — so a
+   * 20-camera site with a full alarm hub lands around 146. Past the limit HomeKit simply stops
+   * accepting accessories, which reads as "some cameras are missing" with nothing to explain it.
+   * Warning once, with the two settings that actually reduce the count, beats a silent ceiling.
+   */
+  private checkAccessoryBudget(): void {
+    const count = this.accessories.size;
+    if (count < ACCESSORY_WARN_AT || this.warnedAccessoryBudget) {
+      return;
+    }
+    this.warnedAccessoryBudget = true;
+    this.log.warn(
+      `This bridge now has ${count} accessories; HomeKit's limit is ${ACCESSORY_LIMIT} per bridge. ` +
+        'Past it, accessories are silently dropped. Turn off exposeObjectSensors and/or ' +
+        'exposeAudioSensors to reduce the count (they add one accessory per detection type per camera).',
+    );
   }
 
   /**

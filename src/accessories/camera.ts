@@ -107,13 +107,18 @@ export class CameraAccessory {
   private activeMessage?: string;
   /** The console's raw lcdMessage; a clear must echo its type/text back or validation fails. */
   private currentMessage?: LcdMessage;
-  /** Set while a screen write is in flight, so a discovery pass cannot flap the switches. */
-  private writingMessage = false;
+  /**
+   * Serialises setting writes and doubles as the discovery guard.
+   *
+   * Two quick taps used to fire concurrent PATCHes: whichever response landed last won, so HomeKit
+   * could show a different message than the console until the next discovery pass minutes later.
+   * Writes now queue, so they apply in the order pressed and the last press wins.
+   */
+  private writeChain: Promise<unknown> = Promise.resolve();
+  private pendingWrites = 0;
   /** The status-light switch, when this camera has a controllable LED. */
   private ledService?: Service;
   private ledOn = true;
-  /** Set while an LED write is in flight, so a discovery pass cannot flap the switch. */
-  private writingLed = false;
   /** Present only when streaming is enabled; retained so shutdown can stop live sessions. */
   private readonly streaming?: ProtectStreamingDelegate;
   /** Protect's reported reachability, from the last discovery pass. */
@@ -289,10 +294,26 @@ export class CameraAccessory {
     this.ledService = svc;
   }
 
+  /**
+   * Queue a settings write, so concurrent taps apply in order rather than racing.
+   *
+   * Each write waits for the previous one — including a failed one, hence the two-arm `then` — and
+   * `pendingWrites` stays above zero until the queue drains, which is what keeps a discovery pass
+   * from overwriting state mid-sequence.
+   */
+  private enqueueWrite<T>(work: () => Promise<T>): Promise<T> {
+    this.pendingWrites += 1;
+    const run = this.writeChain.then(work, work);
+    this.writeChain = run.catch(() => undefined);
+    return run.finally(() => {
+      this.pendingWrites -= 1;
+    });
+  }
+
   /** Apply the status-light state the console reports. */
   updateStatusLed(on: boolean): void {
     // Don't fight our own in-flight write: the console may still report the previous value.
-    if (!this.ledService || this.writingLed) {
+    if (!this.ledService || this.pendingWrites > 0) {
       return;
     }
     this.ledOn = on;
@@ -311,20 +332,17 @@ export class CameraAccessory {
     if (!sink) {
       throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
-    this.writingLed = true;
-    try {
+    await this.enqueueWrite(async () => {
       await sink.patchCamera(this.opts.serial, { ledSettings: { isEnabled: on } });
       this.ledOn = on;
       this.ledService?.updateCharacteristic(this.platform.Characteristic.On, on);
       this.platform.log.info(`Status light on "${this.opts.name}" turned ${on ? 'on' : 'off'}.`);
-    } catch (err) {
+    }).catch((err: unknown) => {
       this.platform.log.error(
         `Could not change the status light on "${this.opts.name}": ${(err as Error).message}`,
       );
       throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-    } finally {
-      this.writingLed = false;
-    }
+    });
   }
 
   /** Apply the screen state the console reports. */
@@ -334,7 +352,7 @@ export class CameraAccessory {
       return;
     }
     // Don't fight our own in-flight write: the console may still report the previous message.
-    if (this.writingMessage) {
+    if (this.pendingWrites > 0) {
       return;
     }
     this.activeMessage = activeMessageKey(plans, current);
@@ -366,11 +384,11 @@ export class CameraAccessory {
     if (!on && this.activeMessage !== plan.key) {
       return;
     }
-    const patch = on
-      ? setMessagePatch(plan)
-      : clearMessagePatch(this.currentMessage, (this.opts.now ?? Date.now)());
-    this.writingMessage = true;
-    try {
+    await this.enqueueWrite(async () => {
+      // Built inside the queued task: `currentMessage` may have changed while this write waited.
+      const patch = on
+        ? setMessagePatch(plan)
+        : clearMessagePatch(this.currentMessage, (this.opts.now ?? Date.now)());
       await sink.patchCamera(this.opts.serial, patch);
       this.activeMessage = on ? plan.key : undefined;
       this.currentMessage = patch.lcdMessage;
@@ -380,14 +398,12 @@ export class CameraAccessory {
           ? `Doorbell screen on "${this.opts.name}" set to "${plan.label}".`
           : `Doorbell screen on "${this.opts.name}" cleared.`,
       );
-    } catch (err) {
+    }).catch((err: unknown) => {
       this.platform.log.error(
         `Could not change the doorbell screen on "${this.opts.name}": ${(err as Error).message}`,
       );
       throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-    } finally {
-      this.writingMessage = false;
-    }
+    });
   }
 
   setName(name: string): void {

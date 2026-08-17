@@ -251,10 +251,30 @@
       "expanded": false,
       "items": [
         "exposeAlarm",
-        "glassBreakAs",
-        "exposeOutputs",
-        "exposeEmergencyInput",
-        "sirenOutputChannels"
+        {
+          "key": "glassBreakAs",
+          "condition": {
+            "functionBody": "return model.exposeAlarm !== false;"
+          }
+        },
+        {
+          "key": "exposeOutputs",
+          "condition": {
+            "functionBody": "return model.exposeAlarm !== false;"
+          }
+        },
+        {
+          "key": "exposeEmergencyInput",
+          "condition": {
+            "functionBody": "return model.exposeAlarm !== false;"
+          }
+        },
+        {
+          "key": "sirenOutputChannels",
+          "condition": {
+            "functionBody": "return model.exposeAlarm !== false;"
+          }
+        }
       ]
     },
     {
@@ -268,16 +288,59 @@
         "exposeAudioSensors",
         "exposeDoorbellTriggers",
         "exposeDoorbellMessages",
-        "doorbellMessages",
+        {
+          "key": "doorbellMessages",
+          "condition": {
+            "functionBody": "return model.exposeDoorbellMessages === true;"
+          }
+        },
         "exposeStatusLed",
-        "exposeCameraStreams",
-        "exposeCameraAudio",
-        "exposeTalkback",
-        "doorbellDeviceIds",
-        "exposeChimes",
-        "chimeTriggerId",
-        "exposeChimeMute"
+        "doorbellDeviceIds"
       ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Live video",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        "exposeCameraStreams",
+        {
+          "key": "exposeCameraAudio",
+          "condition": {
+            "functionBody": "return model.exposeCameraStreams !== false;"
+          }
+        },
+        {
+          "key": "exposeTalkback",
+          "condition": {
+            "functionBody": "return model.exposeCameraStreams !== false && model.exposeCameraAudio === true;"
+          }
+        }
+      ],
+      "description": "Live streaming, camera audio and two-way talkback."
+    },
+    {
+      "type": "fieldset",
+      "title": "Chimes",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        "exposeChimes",
+        {
+          "key": "chimeTriggerId",
+          "condition": {
+            "functionBody": "return model.exposeChimes !== false;"
+          }
+        },
+        {
+          "key": "exposeChimeMute",
+          "condition": {
+            "functionBody": "return model.exposeChimes !== false;"
+          }
+        }
+      ],
+      "description": "Doorbell chimes. Ringing needs an Alarm Manager Trigger ID \u2014 see the README."
     },
     {
       "type": "fieldset",
@@ -287,7 +350,12 @@
       "items": [
         "refreshInterval",
         "useRealtime",
-        "realtimeIdleTimeout",
+        {
+          "key": "realtimeIdleTimeout",
+          "condition": {
+            "functionBody": "return model.useRealtime !== false;"
+          }
+        },
         "trustSelfSignedCert",
         "certificateSha256",
         "name"

@@ -82,3 +82,49 @@ test('runtime dependencies stay minimal and auditable', () => {
   assert.deepEqual(Object.keys(pkg.dependencies), ['undici']);
   assert.deepEqual(Object.keys(pkg.optionalDependencies), ['ffmpeg-for-homebridge']);
 });
+
+// A layout condition runs as a function body in the Homebridge config UI. An unqualified key is a
+// ReferenceError there, which breaks the settings screen with nothing in the plugin's own logs —
+// and it happened: `exposeTalkback` shipped with `&& exposeCameraAudio` missing its `model.`.
+test('every layout condition references config keys through `model.`', () => {
+  const properties = Object.keys(schema.schema.properties);
+  const conditions = [];
+  const walk = (node) => {
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+    } else if (node && typeof node === 'object') {
+      if (node.condition?.functionBody) {
+        conditions.push({ key: node.key, body: node.condition.functionBody });
+      }
+      Object.values(node).forEach(walk);
+    }
+  };
+  walk(schema.layout);
+  assert.ok(conditions.length > 0, 'expected some conditional fields');
+
+  for (const { key, body } of conditions) {
+    for (const prop of properties) {
+      // Every mention of a real config key must be immediately preceded by `model.`
+      const bare = new RegExp(`(?<!model\\.)\\b${prop}\\b`);
+      assert.ok(!bare.test(body), `condition for "${key}" references "${prop}" without model.: ${body}`);
+    }
+  }
+});
+
+// A condition guarding a key that does not exist would hide the field forever.
+test('every layout condition references only real config keys', () => {
+  const properties = new Set(Object.keys(schema.schema.properties));
+  const walk = (node) => {
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+    } else if (node && typeof node === 'object') {
+      if (node.condition?.functionBody) {
+        for (const ref of node.condition.functionBody.matchAll(/model\.([A-Za-z0-9_]+)/g)) {
+          assert.ok(properties.has(ref[1]), `condition for "${node.key}" references unknown key "${ref[1]}"`);
+        }
+      }
+      Object.values(node).forEach(walk);
+    }
+  };
+  walk(schema.layout);
+});

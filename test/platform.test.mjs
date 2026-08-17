@@ -840,3 +840,34 @@ test('exposeStatusLed:false creates no switch even on a capable camera', async (
   const acc = api.registered.find((a) => a.displayName === 'Front Door');
   assert.equal(acc?.getServiceById(Service.Switch, 'led'), undefined);
 });
+
+// Past HAP's 149-per-bridge limit HomeKit silently stops accepting accessories, which reads as
+// "some cameras are missing" with nothing to explain it. 6 accessories per camera with object and
+// audio sensors on means a 20-camera site plus a full alarm hub lands right at the edge.
+test('the bridge warns once as it approaches the HomeKit accessory limit', async () => {
+  const many = Array.from({ length: 40 }, (_, i) => ({
+    id: `cam${i}`, modelKey: 'camera', name: `Camera ${i}`,
+    featureFlags: { smartDetectTypes: ['person', 'vehicle', 'animal'] },
+    smartDetectSettings: { objectTypes: ['person', 'vehicle', 'animal'] },
+  }));
+  const { log, clock } = await startPlatform(
+    { exposeCameraStreams: false, exposeObjectSensors: true },
+    { hubs: [hub()], cameras: many },
+  );
+  const budget = () => logged(log, 'warn').filter((m) => /HomeKit's limit is 149/.test(m));
+  assert.equal(budget().length, 1, `expected one budget warning, got ${budget().length}`);
+  assert.match(budget()[0], /exposeObjectSensors/, 'says which setting reduces the count');
+
+  // A second discovery pass must not repeat it.
+  clock.cameraInterval().fn();
+  await flush();
+  assert.equal(budget().length, 1, 'warned once, not per pass');
+});
+
+test('a small bridge gets no budget warning', async () => {
+  const { log } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  assert.equal(logged(log, 'warn').filter((m) => /accessor/i.test(m)).length, 0);
+});
