@@ -240,6 +240,69 @@ test('pruning a camera shuts its handler down before dropping it', async () => {
   assert.deepEqual(stopped.sort(), [camUuid, objUuid].sort());
 });
 
+// --- Camera include/exclude filter -------------------------------------------
+// The point of the filter is splitting a large site across two child bridges, each with its own
+// 149-accessory budget — so it must gate accessory CREATION, not just visibility.
+
+test('only the included cameras get accessories', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false, includeCameras: ['Front Yard'] },
+    {
+      hubs: [hub()],
+      cameras: [
+        camera({ featureFlags: { smartDetectTypes: ['person'] } }),
+        camera({ id: 'cam-2', name: 'Back Yard', featureFlags: { smartDetectTypes: ['person'] } }),
+      ],
+    },
+  );
+  const registered = names(api.registered);
+  assert.ok(registered.includes('Front Yard'));
+  assert.ok(registered.includes('Front Yard Person'));
+  // Not just the camera: an excluded camera must produce none of its derived sensors either.
+  assert.ok(!registered.some((n) => n.startsWith('Back Yard')), `unexpected: ${registered.join(', ')}`);
+});
+
+test('excludeCameras drops a camera that would otherwise be exposed', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false, excludeCameras: ['cam-1'] },
+    { hubs: [hub()], cameras: [camera(), camera({ id: 'cam-2', name: 'Back Yard' })] },
+  );
+  assert.deepEqual(names(api.registered).filter((n) => n.includes('Yard')), ['Back Yard']);
+});
+
+// Excluding a camera that is already paired must reconcile it away, not orphan its tile.
+test('a camera added to the exclude list is pruned on the next discovery pass', async () => {
+  const { api, state, clock, platform } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
+  );
+  assert.ok(names(api.registered).includes('Front Yard'));
+
+  platform.config.excludeCameras = ['Front Yard'];
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.deepEqual(names(api.unregistered), ['Front Yard', 'Front Yard Person']);
+  assert.equal(state.cameras.length, 1, 'the camera is still on the console, only filtered out');
+});
+
+// A typo silently exposes nothing (include) or exposes something meant to stay private (exclude),
+// and both read as a plugin fault with nothing in the log to explain them.
+test('a filter entry matching no camera warns once, not once per discovery pass', async () => {
+  const { log, clock } = await startPlatform(
+    { exposeCameraStreams: false, includeCameras: ['Front Yard', 'Frnt Yrd'], excludeCameras: ['nosuch'] },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  clock.cameraInterval().fn();
+  await flush();
+
+  const warnings = logged(log, 'warn').filter((m) => /matches no camera/.test(m));
+  assert.equal(warnings.length, 2, `expected one per bad entry: ${warnings.join(' | ')}`);
+  assert.ok(warnings.some((m) => m.includes('frnt yrd')));
+  assert.ok(warnings.some((m) => m.includes('nosuch')));
+  assert.ok(!warnings.some((m) => m.includes('front yard')), 'a matching entry must not warn');
+});
+
 test('a camera renamed in Protect renames its services and its object sensors', async () => {
   const { api, state, clock } = await startPlatform(
     { exposeCameraStreams: false },
@@ -856,7 +919,14 @@ test('the bridge warns once as it approaches the HomeKit accessory limit', async
   );
   const budget = () => logged(log, 'warn').filter((m) => /HomeKit's limit is 149/.test(m));
   assert.equal(budget().length, 1, `expected one budget warning, got ${budget().length}`);
-  assert.match(budget()[0], /exposeObjectSensors/, 'says which setting reduces the count');
+  // The remedy that keeps every accessory must be named FIRST; losing sensors is the fallback.
+  assert.match(budget()[0], /child bridge/i, 'offers the split that keeps everything');
+  assert.match(budget()[0], /exposeCameras|exposeAlarm|includeCameras/, 'says how to split');
+  assert.match(budget()[0], /exposeObjectSensors/, 'still says which setting reduces the count');
+  assert.ok(
+    budget()[0].indexOf('child bridge') < budget()[0].indexOf('exposeObjectSensors'),
+    'the lossless fix must come before the lossy one',
+  );
 
   // A second discovery pass must not repeat it.
   clock.cameraInterval().fn();

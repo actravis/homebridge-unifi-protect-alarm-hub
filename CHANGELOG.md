@@ -111,7 +111,15 @@ side gained a substantial round of reliability and security work.
   button that cannot ring would fail silently inside an automation. Muting sets the ring volume to
   0 for every paired camera and restores the previous level on unmute, preserving each camera's
   chosen ringtone and repeat count.
-- New options: `exposeCameras`, `exposeObjectSensors`, `exposeAudioSensors`, `exposeCameraStreams`,
+- **Camera include/exclude filter.** `includeCameras` exposes only the cameras you list;
+  `excludeCameras` keeps cameras out entirely. Both match a camera's **name or device ID**,
+  case-insensitively, and an entry matching nothing is reported in the log — a typo in an include
+  list would otherwise expose no cameras at all, with nothing to explain it.
+
+  This is what makes a large site workable: HomeKit's 149-accessory limit is **per bridge**, so the
+  cameras can be split across two platform instances in separate Homebridge child bridges, each with
+  its own budget. See [Scale](README.md#scale) for the recipe. It doubles as a privacy control.
+- New options: `exposeCameras`, `includeCameras`, `excludeCameras`, `exposeObjectSensors`, `exposeAudioSensors`, `exposeCameraStreams`,
   `exposeCameraAudio`, `exposeTalkback`, `exposeChimes`, `chimeTriggerId`, `exposeChimeMute`,
   `exposeDoorbellTriggers`, `doorbellDeviceIds`, `exposeAlarm` (for a cameras-only setup), and
   `realtimeIdleTimeout`.

@@ -105,6 +105,24 @@
         "default": true,
         "description": "Create a motion sensor (and a doorbell for doorbell cameras) per camera, driven by the realtime feed. If you also run another UniFi Protect plugin, disable its motion/doorbell to avoid duplicates."
       },
+      "includeCameras": {
+        "title": "Only these cameras",
+        "type": "array",
+        "items": {
+          "title": "Camera name or device ID",
+          "type": "string"
+        },
+        "description": "Optional. Leave empty for all cameras. If you list any, only those are exposed. HomeKit allows 149 accessories per bridge and this plugin can create up to 6 per camera, so a large site can split its cameras across two platform instances, each in its own child bridge."
+      },
+      "excludeCameras": {
+        "title": "Never expose these cameras",
+        "type": "array",
+        "items": {
+          "title": "Camera name or device ID",
+          "type": "string"
+        },
+        "description": "Optional. Cameras to keep out of HomeKit entirely. Applied after the list above."
+      },
       "exposeObjectSensors": {
         "title": "Expose smart-detection sensors",
         "type": "boolean",
@@ -284,6 +302,18 @@
       "expanded": false,
       "items": [
         "exposeCameras",
+        {
+          "key": "includeCameras",
+          "condition": {
+            "functionBody": "return model.exposeCameras !== false;"
+          }
+        },
+        {
+          "key": "excludeCameras",
+          "condition": {
+            "functionBody": "return model.exposeCameras !== false;"
+          }
+        },
         "exposeObjectSensors",
         "exposeAudioSensors",
         "exposeDoorbellTriggers",

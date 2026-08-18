@@ -18,7 +18,14 @@ import { chimeKey, planChimeAccessories } from './chimeDiscovery';
 import { planDoorbellMessages } from './doorbellMessages';
 import { planAccessories, type PlannedAccessory } from './discovery';
 import { basePollSeconds, effectivePollSeconds } from './pollPolicy';
-import { audioSensorKey, cameraKey, objectSensorKey, objectSensorName, planCameraAccessories } from './cameraDiscovery';
+import {
+  audioSensorKey,
+  cameraKey,
+  objectSensorKey,
+  objectSensorName,
+  planCameraAccessories,
+  selectCameras,
+} from './cameraDiscovery';
 import { decodeCameraEvent } from './cameraEvents';
 import { alarmKindLabel, isAudioDetection, sensorKindsFor } from './detectionKinds';
 import { redactPayload } from './util';
@@ -110,6 +117,8 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   private readonly warnedUnrouted = new Set<string>();
   /** Cameras currently reported offline, so the log records transitions rather than every pass. */
   private readonly offlineCameras = new Set<string>();
+  /** Include/exclude entries already reported as matching nothing — warned once each. */
+  private readonly warnedUnmatchedCameras = new Set<string>();
   private cameraTimer?: NodeJS.Timeout;
   private firmware?: string;
   private refreshTimer?: NodeJS.Timeout;
@@ -552,7 +561,10 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
    * audio sensors enabled (the camera, one sensor per detection type), plus one per alarm zone — so a
    * 20-camera site with a full alarm hub lands around 146. Past the limit HomeKit simply stops
    * accepting accessories, which reads as "some cameras are missing" with nothing to explain it.
-   * Warning once, with the two settings that actually reduce the count, beats a silent ceiling.
+   *
+   * The limit is per BRIDGE, so the first remedy offered is splitting across child bridges — that
+   * keeps every accessory. Switching sensors off is named second because it costs the user
+   * functionality; leading with it steers people into losing features they could have kept.
    */
   private checkAccessoryBudget(): void {
     const count = this.accessories.size;
@@ -561,9 +573,13 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     }
     this.warnedAccessoryBudget = true;
     this.log.warn(
-      `This bridge now has ${count} accessories; HomeKit's limit is ${ACCESSORY_LIMIT} per bridge. ` +
-        'Past it, accessories are silently dropped. Turn off exposeObjectSensors and/or ' +
-        'exposeAudioSensors to reduce the count (they add one accessory per detection type per camera).',
+      `This bridge now has ${count} accessories; HomeKit's limit is ${ACCESSORY_LIMIT} per bridge, ` +
+        'and past it accessories are silently dropped. The limit is per bridge, so the fix that ' +
+        'keeps everything is to split this platform into two instances in separate Homebridge ' +
+        'child bridges — one for the alarm (exposeCameras: false) and one for the cameras ' +
+        '(exposeAlarm: false), or split the cameras themselves with includeCameras. See the ' +
+        'Scale section of the plugin README. Failing that, turning off exposeObjectSensors ' +
+        'and/or exposeAudioSensors reduces the count, at the cost of those sensors.',
     );
   }
 
@@ -710,7 +726,21 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     }
     const desired = new Set<string>();
 
-    for (const plan of planCameraAccessories(cameras, this.config)) {
+    // Filter BEFORE planning, so an excluded camera produces no accessories of any kind — and so
+    // its cached ones fall out of the prune loop below like any other camera that went away.
+    const { selected, unmatched } = selectCameras(cameras, this.config);
+    for (const entry of unmatched) {
+      if (this.warnedUnmatchedCameras.has(entry)) {
+        continue;
+      }
+      this.warnedUnmatchedCameras.add(entry);
+      this.log.warn(
+        `Camera filter entry "${entry}" matches no camera on this console. ` +
+          'Use the camera\'s name or device ID exactly as Protect reports it.',
+      );
+    }
+
+    for (const plan of planCameraAccessories(selected, this.config)) {
       const camId = uuid.generate(cameraKey(plan.deviceId));
       desired.add(camId);
       this.reportCameraReachability(plan.deviceId, plan.name, plan.online);
@@ -816,7 +846,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     }
     // Forget per-device warning/reachability state for cameras that no longer exist, so these
     // sets track the live camera list rather than everything ever seen.
-    const liveDevices = new Set(cameras.map((c) => c.id));
+    // Keyed off the SELECTED list, not every camera on the console: a filtered-out camera is never
+    // reported on again, so holding its warning state would keep it alive for the process lifetime.
+    const liveDevices = new Set(selected.map((c) => c.id));
     for (const set of [this.offlineCameras, this.warnedDisabledDetections, this.warnedRingDevices]) {
       for (const deviceId of set) {
         if (!liveDevices.has(deviceId)) {

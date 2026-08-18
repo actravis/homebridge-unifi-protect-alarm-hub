@@ -25,6 +25,14 @@ export interface ProtectConfig extends PlatformConfig {
 
   /** Expose cameras (overall motion + doorbell) — default on. */
   exposeCameras?: boolean;
+  /**
+   * If non-empty, expose ONLY these cameras (device ID or name, case-insensitive). Used to split a
+   * large site across two platform instances in separate child bridges, since HomeKit caps a bridge
+   * at 149 accessories; also works as a privacy control.
+   */
+  includeCameras?: string[];
+  /** Never expose these cameras (device ID or name, case-insensitive). Applied after the include list. */
+  excludeCameras?: string[];
   /** Expose per-type smart-detect sensors (person/vehicle/animal/package) — default on. */
   exposeObjectSensors?: boolean;
   /** Expose smoke/CO sensors driven by the cameras' audio detection — default off (experimental). */

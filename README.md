@@ -130,12 +130,79 @@ settings endpoint.
 
 This plugin creates up to **6 HomeKit accessories per camera** when object and audio sensors are
 enabled — the camera itself, plus one per detection type — and one per alarm zone. HomeKit's limit is
-**149 accessories per one bridge**, so roughly 20 cameras alongside a full alarm hub reaches it. The
-plugin warns as it approaches; past the limit HomeKit silently stops accepting accessories. Turning
-off `exposeObjectSensors` and/or `exposeAudioSensors` drops it to one accessory per camera.
+**149 accessories per one bridge**, so roughly 20 cameras alongside a full alarm hub reaches it. Past
+the limit HomeKit silently stops accepting accessories, which looks like devices going missing with
+nothing in any log to explain it — so the plugin warns once as it approaches, at 130.
 
-Discovery itself does not scale with device count: one request each for cameras, chimes and hubs per
-pass, regardless of how many devices exist. Per-camera requests happen only when a stream starts.
+The limit is **per bridge**, and the plugin does **not** split itself automatically. If you approach
+it, the fix that keeps every accessory is to run two platform instances in separate Homebridge
+[child bridges](https://github.com/homebridge/homebridge/wiki/Child-Bridges), each with its own
+budget. Existing accessories keep their identities, so nothing needs re-pairing.
+
+Discovery does not scale with device count either way: one request each for cameras, chimes and hubs
+per pass, regardless of how many devices exist. Per-camera requests happen only when a stream starts.
+
+### Split one: alarm on one bridge, cameras on another
+
+This is the simplest split and usually enough. No camera lists — just turn each domain off on the
+instance that shouldn't have it.
+
+```json
+{
+  "platforms": [
+    {
+      "platform": "UnifiProtectIntegration",
+      "name": "UniFi Protect Alarm",
+      "host": "192.168.1.1",
+      "apiKey": "…",
+      "exposeCameras": false,
+      "_bridge": { "username": "0E:2C:41:1A:BB:01", "port": 51820 }
+    },
+    {
+      "platform": "UnifiProtectIntegration",
+      "name": "UniFi Protect Cameras",
+      "host": "192.168.1.1",
+      "apiKey": "…",
+      "exposeAlarm": false,
+      "_bridge": { "username": "0E:2C:41:1A:BB:02", "port": 51821 }
+    }
+  ]
+}
+```
+
+### Split two: divide the cameras themselves
+
+Only needed when the cameras alone overflow one bridge — around 24 cameras with all sensors enabled,
+or 149 with them all off. Add `includeCameras` to each camera instance:
+
+```json
+{
+  "exposeAlarm": false,
+  "includeCameras": ["Front Door", "Driveway"],
+  "_bridge": { "username": "0E:2C:41:1A:BB:02", "port": 51821 }
+}
+```
+
+...with the remaining cameras listed on a third instance, on its own bridge again.
+
+Points that matter for either split:
+
+- Each `_bridge` needs its **own** `username` (any unused MAC-shaped value) and `port`. Homebridge
+  can generate these for you from the plugin's settings screen.
+- Expose the alarm on exactly **one** instance (`exposeAlarm: false` on the others), or you get
+  duplicate alarm accessories. The same goes for `exposeChimes`.
+- Each instance opens its own connection to the console, so keep the count small — two or three.
+- `includeCameras` and `excludeCameras` match a camera's **name or device ID**, case-insensitively.
+  An entry that matches nothing is reported in the log rather than silently ignored, since a typo in
+  an include list would otherwise expose no cameras at all.
+- **The alarm hub cannot be split.** There is no per-zone filter, so all of its accessories live on
+  whichever bridge exposes it. In practice a hub's zone count is bounded well under the limit.
+
+If you would rather trade features for headroom than add a bridge, turning off `exposeObjectSensors`
+and/or `exposeAudioSensors` drops each camera from up to 6 accessories to 1.
+
+`excludeCameras` also works on its own as a privacy control: a camera listed there is never exposed
+to HomeKit.
 
 ## Limitations
 

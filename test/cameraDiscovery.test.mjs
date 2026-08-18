@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { audioSensorKey, cameraKey, isDoorbell, objectSensorKey, planCameraAccessories } from '../dist/cameraDiscovery.js';
+import {
+  audioSensorKey,
+  cameraKey,
+  isDoorbell,
+  objectSensorKey,
+  planCameraAccessories,
+  selectCameras,
+} from '../dist/cameraDiscovery.js';
 
 const cam = (over = {}) => ({ id: 'c1', modelKey: 'camera', name: 'Front Door', featureFlags: {}, ...over });
 
@@ -217,4 +224,81 @@ test('the light reads as on unless the console says otherwise', () => {
   // A missing field must not make the switch claim the light is off.
   assert.equal(planCameraAccessories([cam({})], {})[0].statusLedOn, true);
   assert.equal(planCameraAccessories([cam(undefined)], {})[0].statusLedOn, true);
+});
+
+// --- selectCameras (the include/exclude filter) -------------------------------
+
+const three = [
+  { id: 'aaa', modelKey: 'camera', name: 'Front Door' },
+  { id: 'bbb', modelKey: 'camera', name: 'Side Yard' },
+  { id: 'ccc', modelKey: 'camera', name: 'Garage / Parking' },
+];
+const picked = (config) => selectCameras(three, config).selected.map((c) => c.id);
+
+test('no filter configured selects every camera', () => {
+  assert.deepEqual(picked({}), ['aaa', 'bbb', 'ccc']);
+  assert.deepEqual(picked({ includeCameras: [], excludeCameras: [] }), ['aaa', 'bbb', 'ccc']);
+  assert.deepEqual(selectCameras(three).selected.length, 3);
+});
+
+test('a non-empty include list selects only those cameras', () => {
+  assert.deepEqual(picked({ includeCameras: ['Front Door', 'ccc'] }), ['aaa', 'ccc']);
+});
+
+test('cameras match by device ID or by name', () => {
+  assert.deepEqual(picked({ includeCameras: ['bbb'] }), ['bbb']);
+  assert.deepEqual(picked({ includeCameras: ['Side Yard'] }), ['bbb']);
+});
+
+test('matching ignores case and surrounding whitespace', () => {
+  assert.deepEqual(picked({ includeCameras: ['  fRoNt DoOr  ', 'CCC'] }), ['aaa', 'ccc']);
+  assert.deepEqual(selectCameras([{ id: 'x', modelKey: 'camera', name: '  Padded  ' }], { includeCameras: ['padded'] }).selected.length, 1);
+});
+
+test('exclude is applied after include, so an entry in both is excluded', () => {
+  assert.deepEqual(picked({ includeCameras: ['aaa', 'bbb'], excludeCameras: ['Side Yard'] }), ['aaa']);
+});
+
+test('exclude alone drops just that camera', () => {
+  assert.deepEqual(picked({ excludeCameras: ['Garage / Parking'] }), ['aaa', 'bbb']);
+});
+
+// The config comes from a hand-edited config.json, so entries can be anything at all.
+test('blank and non-string entries are ignored, not treated as a filter', () => {
+  assert.deepEqual(picked({ includeCameras: ['', '   ', null, 42, {}, 'bbb'] }), ['bbb']);
+  // An include list of nothing BUT junk must not silently hide every camera.
+  assert.deepEqual(picked({ includeCameras: ['', '  '] }), ['aaa', 'bbb', 'ccc']);
+  assert.deepEqual(picked({ includeCameras: 'Front Door' }), ['aaa', 'bbb', 'ccc']);
+});
+
+test('a camera with no name is still selectable by ID', () => {
+  const unnamed = [{ id: 'zzz', modelKey: 'camera' }];
+  assert.deepEqual(selectCameras(unnamed, { includeCameras: ['zzz'] }).selected.length, 1);
+  assert.deepEqual(selectCameras(unnamed, { excludeCameras: ['zzz'] }).selected.length, 0);
+});
+
+// A typo in an include list otherwise exposes NO cameras, and a typo in an exclude list silently
+// exposes one meant to stay private — both look like plugin faults with nothing to explain them.
+test('entries matching no camera are reported as unmatched', () => {
+  const { unmatched } = selectCameras(three, { includeCameras: ['Front Dor'], excludeCameras: ['ddd'] });
+  assert.deepEqual(unmatched.sort(), ['ddd', 'front dor']);
+});
+
+test('entries that do match are not reported', () => {
+  assert.deepEqual(selectCameras(three, { includeCameras: ['AAA', 'Side Yard'], excludeCameras: ['ccc'] }).unmatched, []);
+});
+
+test('duplicate entries collapse, so a repeat is reported once', () => {
+  const { unmatched } = selectCameras(three, { includeCameras: ['nope', 'NOPE', ' nope '] });
+  assert.deepEqual(unmatched, ['nope']);
+  // Including across the two lists — the same typo pasted into both is still one problem.
+  assert.deepEqual(selectCameras(three, { includeCameras: ['nope'], excludeCameras: ['NOPE'] }).unmatched, ['nope']);
+});
+
+test('the filter never mutates or reorders the camera list it was given', () => {
+  const input = [...three];
+  const { selected } = selectCameras(input, { excludeCameras: ['bbb'] });
+  assert.deepEqual(input, three);
+  assert.notEqual(selected, input);
+  assert.deepEqual(selected.map((c) => c.id), ['aaa', 'ccc']);
 });

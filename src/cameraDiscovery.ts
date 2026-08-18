@@ -81,7 +81,69 @@ export function audioSensorKey(deviceId: string, kind: SensorKind): string {
   return `${deviceId}:audio:${kind}`;
 }
 
-export interface CameraPlanConfig {
+/**
+ * Restrict which cameras this platform instance manages.
+ *
+ * The reason this exists is HomeKit's 149-accessory-per-bridge limit. With object and audio sensors
+ * enabled this plugin creates up to 6 accessories per camera, so a large site hits the ceiling and
+ * HomeKit silently stops accepting accessories. Splitting the cameras across two platform instances,
+ * each in its own Homebridge child bridge, gives each its own budget — and that needs a filter.
+ *
+ * It doubles as a privacy control: a camera left out is not exposed to HomeKit at all.
+ */
+export interface CameraFilterConfig {
+  /** If non-empty, ONLY these cameras (device id or name, case-insensitive). */
+  includeCameras?: unknown;
+  /** Always excluded, applied after the include list. */
+  excludeCameras?: unknown;
+}
+
+/** Trimmed, lowercased, de-duplicated entries; anything not a non-empty string is dropped. */
+function entrySet(value: unknown): Set<string> {
+  const out = new Set<string>();
+  if (!Array.isArray(value)) {
+    return out;
+  }
+  for (const item of value) {
+    if (typeof item === 'string' && item.trim() !== '') {
+      out.add(item.trim().toLowerCase());
+    }
+  }
+  return out;
+}
+
+const matches = (camera: Camera, set: Set<string>): boolean =>
+  set.has(camera.id.toLowerCase()) || (camera.name !== undefined && set.has(camera.name.trim().toLowerCase()));
+
+/**
+ * Apply the include/exclude filter.
+ *
+ * Also reports entries that matched nothing, so the platform can say so: a typo in an include list
+ * would otherwise silently expose no cameras at all, and a typo in an exclude list would silently
+ * expose one the user meant to keep private.
+ */
+export function selectCameras(
+  cameras: Camera[],
+  config: CameraFilterConfig = {},
+): { selected: Camera[]; unmatched: string[] } {
+  const include = entrySet(config.includeCameras);
+  const exclude = entrySet(config.excludeCameras);
+  const selected = cameras.filter(
+    (c) => (include.size === 0 || matches(c, include)) && !matches(c, exclude),
+  );
+  const seen = new Set<string>();
+  for (const c of cameras) {
+    seen.add(c.id.toLowerCase());
+    if (c.name) {
+      seen.add(c.name.trim().toLowerCase());
+    }
+  }
+  // De-duplicated across BOTH lists: the same typo in each would otherwise be reported twice.
+  const unmatched = [...new Set([...include, ...exclude])].filter((e) => !seen.has(e));
+  return { selected, unmatched };
+}
+
+export interface CameraPlanConfig extends CameraFilterConfig {
   /** Master toggle for all camera accessories (default on). */
   exposeCameras?: boolean;
   /** Expose per-type smart-detect sensors (default on). */
