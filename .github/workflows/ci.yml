@@ -1,8 +1,12 @@
 name: CI
 
+# Every branch, not just main. Feature work here is long-lived — `cameras-and-streaming` reached 24
+# commits, all of it invisible to CI, because a main-only push trigger never fired and the workflow
+# file does not exist on main for workflow_dispatch to offer. A branch that cannot run CI is a branch
+# whose engines-floor claim is untested until merge day.
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 
@@ -11,9 +15,12 @@ on:
 permissions:
   contents: read
 
-# Superseded runs on the same branch are pointless; cancel them rather than queue them.
+# Superseded runs on the same branch are pointless; cancel them rather than queue them. Keyed on the
+# HEAD branch rather than github.ref so that a push run and a pull_request run for the same branch
+# share one group: with every branch now triggering on push, a same-repo PR would otherwise run the
+# whole matrix twice (github.ref is refs/heads/x for the push and refs/pull/N/merge for the PR).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.head.ref || github.ref }}
   cancel-in-progress: true
 
 # `npm ci --omit=optional` throughout: the only optional dependency is ffmpeg-for-homebridge,
