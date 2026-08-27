@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { AlarmSensorAccessory, CameraAccessory, ObjectSensorAccessory } from '../dist/accessories/camera.js';
+import { AlarmSensorAccessory, CameraAccessory } from '../dist/accessories/camera.js';
 import { Service, Characteristic as C, FakeAccessory, makePlatform } from './helpers/hap-mock.mjs';
 
 /** Fake timers that record scheduled callbacks so tests can fire the safety-clear on demand. */
@@ -184,27 +184,6 @@ test('CameraAccessory: an offline camera is not asked for snapshots at all', asy
 
   assert.match(err.message, /offline/);
   assert.equal(calls, 0, 'an offline camera must not generate console requests');
-});
-
-test('ObjectSensorAccessory: an offline camera deactivates its object sensors', () => {
-  const t = fakeTimers();
-  const acc = new FakeAccessory('Front Door Person', 'u', 0);
-  const sensor = new ObjectSensorAccessory(makePlatform(), acc, { name: 'Front Door Person', serial: 'AA:person' }, t);
-  const svc = acc.getService(Service.MotionSensor);
-  assert.equal(svc.value(C.StatusActive), true);
-  sensor.setOnline(false);
-  assert.equal(svc.value(C.StatusActive), false);
-});
-
-test('ObjectSensorAccessory: detection drives MotionDetected and safety-clears', () => {
-  const t = fakeTimers();
-  const acc = new FakeAccessory('Front Door Person', 'u', 0);
-  const sensor = new ObjectSensorAccessory(makePlatform(), acc, { name: 'Front Door Person', serial: 'AA:person' }, t);
-  const svc = acc.getService(Service.MotionSensor);
-  sensor.applyDetection(true);
-  assert.equal(svc.value(C.MotionDetected), true);
-  t.fireLast();
-  assert.equal(svc.value(C.MotionDetected), false);
 });
 
 // --- Audio alarm sensors -----------------------------------------------------
@@ -561,4 +540,188 @@ test('a discovery pass while writes are queued does not flap the switches', asyn
 
   assert.equal(sw('custom:Back soon').value(C.On), true, 'the queued writes win over the stale snapshot');
   assert.equal(sw('LEAVE_PACKAGE_AT_DOOR').value(C.On), false);
+});
+
+// --- Smart-detect sensors ----------------------------------------------------
+// The detections live on the camera accessory as CONTACT sensors, one accessory per camera. Contact
+// rather than motion is load-bearing: a camera accessory's MotionSensor is HomeKit's singular "this
+// camera detected motion" signal (it drives camera notifications and HKSV recording), so extra
+// motion services would make one physical event report several times.
+
+const withTypes = (t, types, name = 'Gatehouse') => {
+  const acc = new FakeAccessory(name, 'u', 0);
+  const cam = new CameraAccessory(
+    makePlatform(), acc, { name, serial: 'AA', isDoorbell: false, objectTypes: types }, t,
+  );
+  return { acc, cam };
+};
+const contact = (acc, type) => acc.getServiceById(Service.ContactSensor, `smartDetect.${type}`);
+
+test('one contact sensor per detection type, and exactly one motion sensor', () => {
+  const { acc } = withTypes(fakeTimers(), ['person', 'vehicle']);
+  assert.ok(contact(acc, 'person'), 'person contact sensor exists');
+  assert.ok(contact(acc, 'vehicle'), 'vehicle contact sensor exists');
+  assert.equal(acc.services.filter((s) => s.token === Service.MotionSensor).length, 1);
+  assert.equal(contact(acc, 'person').value(C.Name), 'Gatehouse Person');
+  assert.equal(contact(acc, 'vehicle').value(C.Name), 'Gatehouse Vehicle');
+});
+
+test('no objectTypes means no contact sensors at all (motion only)', () => {
+  const { acc } = withTypes(fakeTimers(), []);
+  assert.equal(acc.services.filter((s) => s.token === Service.ContactSensor).length, 0);
+});
+
+test('a smart detection trips its own contact sensor and nothing else', () => {
+  const { acc, cam } = withTypes(fakeTimers(), ['person', 'vehicle']);
+  cam.applyObjectDetection('person', true);
+
+  assert.equal(contact(acc, 'person').value(C.ContactSensorState), C.ContactSensorState.CONTACT_NOT_DETECTED);
+  assert.equal(contact(acc, 'vehicle').value(C.ContactSensorState), C.ContactSensorState.CONTACT_DETECTED);
+  // The camera's own motion sensor is NOT tripped by an object detection routed here — that
+  // signal belongs to the camera's motion event, and double-reporting is the thing being avoided.
+  assert.equal(acc.getService(Service.MotionSensor).value(C.MotionDetected), false);
+
+  cam.applyObjectDetection('person', false);
+  assert.equal(contact(acc, 'person').value(C.ContactSensorState), C.ContactSensorState.CONTACT_DETECTED);
+});
+
+test('hasObjectSensor reports only the types this camera actually carries', () => {
+  const { cam } = withTypes(fakeTimers(), ['person']);
+  assert.equal(cam.hasObjectSensor('person'), true);
+  assert.equal(cam.hasObjectSensor('vehicle'), false);
+  // Guards the routing fallback: an unknown type must not be swallowed here.
+  assert.equal(cam.hasObjectSensor('constructor'), false);
+});
+
+// A missed 'end' would otherwise leave a detection latched, firing automations forever.
+test('a smart detection safety-clears like the motion sensor does', () => {
+  const t = fakeTimers();
+  const { acc, cam } = withTypes(t, ['person']);
+  cam.applyObjectDetection('person', true);
+  assert.equal(contact(acc, 'person').value(C.ContactSensorState), C.ContactSensorState.CONTACT_NOT_DETECTED);
+
+  t.fireLast();
+  assert.equal(contact(acc, 'person').value(C.ContactSensorState), C.ContactSensorState.CONTACT_DETECTED);
+});
+
+test('an offline camera deactivates its detection sensors and clears a latched one', () => {
+  const { acc, cam } = withTypes(fakeTimers(), ['person']);
+  cam.applyObjectDetection('person', true);
+  cam.setOnline(false);
+
+  assert.equal(contact(acc, 'person').value(C.StatusActive), false);
+  assert.equal(contact(acc, 'person').value(C.ContactSensorState), C.ContactSensorState.CONTACT_DETECTED);
+
+  cam.setOnline(true);
+  assert.equal(contact(acc, 'person').value(C.StatusActive), true);
+});
+
+test('a camera rename renames its detection sensors too', () => {
+  const { acc, cam } = withTypes(fakeTimers(), ['person']);
+  cam.setName('Gate House');
+  assert.equal(contact(acc, 'person').value(C.Name), 'Gate House Person');
+  assert.equal(contact(acc, 'person').value(C.ConfiguredName), 'Gate House Person');
+});
+
+// REGRESSION: with only `Name` set, the Home app listed these as "Contact Sensor 1/2/3" — it reads
+// ConfiguredName for services it shows as separate controls under one accessory. Caught in the
+// real Home app, not by any test, because the HAP structure looked correct either way.
+test('detection sensors carry ConfiguredName, which is what the Home app displays', () => {
+  const { acc } = withTypes(fakeTimers(), ['person', 'vehicle']);
+  assert.equal(contact(acc, 'person').value(C.ConfiguredName), 'Gatehouse Person');
+  assert.equal(contact(acc, 'vehicle').value(C.ConfiguredName), 'Gatehouse Vehicle');
+});
+
+// Turning a detection type off in Protect must not leave a control
+// that HomeKit still shows and nothing can ever drive.
+test('a contact sensor for a type no longer wanted is removed on the next construction', () => {
+  const acc = new FakeAccessory('Gatehouse', 'u', 0);
+  const opts = { name: 'Gatehouse', serial: 'AA', isDoorbell: false };
+  new CameraAccessory(makePlatform(), acc, { ...opts, objectTypes: ['person', 'vehicle'] }, fakeTimers());
+  assert.ok(contact(acc, 'vehicle'));
+
+  new CameraAccessory(makePlatform(), acc, { ...opts, objectTypes: ['person'] }, fakeTimers());
+  assert.ok(contact(acc, 'person'), 'the still-wanted sensor survives');
+  assert.equal(contact(acc, 'vehicle'), undefined, 'the dropped one is removed');
+
+  new CameraAccessory(makePlatform(), acc, { ...opts, objectTypes: [] }, fakeTimers());
+  assert.equal(acc.services.filter((s) => s.token === Service.ContactSensor).length, 0);
+});
+
+// --- Restored-from-cache state ------------------------------------------------
+// Homebridge restores an accessory's cached characteristic VALUES. A detection that was still live
+// when Homebridge stopped therefore comes back latched, and the safety timeout cannot help: it only
+// covers detections seen in the current session. These simulate the restore by pre-setting the
+// characteristic before construction, which is the shape the real bug had.
+
+test('a camera restored with motion latched ON is cleared at construction', () => {
+  const acc = new FakeAccessory('Gatehouse', 'u', 0);
+  acc.addService(Service.MotionSensor).updateCharacteristic(C.MotionDetected, true);
+
+  new CameraAccessory(makePlatform(), acc, { name: 'Gatehouse', serial: 'AA', isDoorbell: false }, fakeTimers());
+
+  assert.equal(acc.getService(Service.MotionSensor).value(C.MotionDetected), false);
+});
+
+test('a contact sensor restored TRIPPED is cleared at construction', () => {
+  const acc = new FakeAccessory('Gatehouse', 'u', 0);
+  acc.addService(Service.ContactSensor, 'Gatehouse Person', 'smartDetect.person')
+    .updateCharacteristic(C.ContactSensorState, C.ContactSensorState.CONTACT_NOT_DETECTED);
+
+  new CameraAccessory(
+    makePlatform(), acc,
+    { name: 'Gatehouse', serial: 'AA', isDoorbell: false, objectTypes: ['person'] },
+    fakeTimers(),
+  );
+
+  assert.equal(
+    acc.getServiceById(Service.ContactSensor, 'smartDetect.person').value(C.ContactSensorState),
+    C.ContactSensorState.CONTACT_DETECTED,
+  );
+});
+
+// setObjectTypes runs on EVERY discovery pass now. If it rebuilt the services or their controllers,
+// a detection that was live would be cleared every few minutes, and any pending safety-clear lost.
+test('reconciling unchanged types is idempotent and preserves a live detection', () => {
+  const { acc, cam } = withTypes(fakeTimers(), ['person', 'vehicle']);
+  const before = acc.getServiceById(Service.ContactSensor, 'smartDetect.person');
+  cam.applyObjectDetection('person', true);
+
+  cam.setObjectTypes(['person', 'vehicle']); // a later discovery pass, nothing changed
+
+  assert.equal(
+    acc.getServiceById(Service.ContactSensor, 'smartDetect.person'), before,
+    'the same service object must be reused, not replaced',
+  );
+  assert.equal(
+    before.value(C.ContactSensorState), C.ContactSensorState.CONTACT_NOT_DETECTED,
+    'a live detection must survive a discovery pass',
+  );
+});
+
+test('reconciling adds a newly-enabled type and drops a removed one', () => {
+  const { acc, cam } = withTypes(fakeTimers(), ['person']);
+
+  cam.setObjectTypes(['person', 'animal']);
+  assert.ok(contact(acc, 'animal'), 'a type enabled in Protect appears without a restart');
+
+  cam.setObjectTypes(['animal']);
+  assert.equal(contact(acc, 'person'), undefined, 'a removed type leaves no dead control');
+  // And routing must agree with what actually exists.
+  assert.equal(cam.hasObjectSensor('person'), false);
+  assert.equal(cam.hasObjectSensor('animal'), true);
+});
+
+// REGRESSION: `opts.name` is the name at CONSTRUCTION. A handler outlives a rename in Protect, so
+// anything deriving a label from it produced the OLD camera name — visible when a detection type is
+// enabled in Protect after a rename: the new sensor disagreed with its siblings.
+test('a sensor added AFTER a rename uses the new camera name', () => {
+  const { acc, cam } = withTypes(fakeTimers(), ['person']);
+
+  cam.setName('Back Gate');
+  cam.setObjectTypes(['person', 'animal']); // a type enabled in Protect after the rename
+
+  assert.equal(contact(acc, 'person').value(C.Name), 'Back Gate Person', 'existing sensor follows');
+  assert.equal(contact(acc, 'animal').value(C.Name), 'Back Gate Animal', 'and so does a new one');
+  assert.equal(contact(acc, 'animal').value(C.ConfiguredName), 'Back Gate Animal');
 });

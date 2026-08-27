@@ -1,4 +1,4 @@
-import type { Characteristic, PlatformAccessory, Service, WithUUID } from 'homebridge';
+import type { Characteristic, CharacteristicValue, PlatformAccessory, Service, WithUUID } from 'homebridge';
 import type { UnifiProtectPlatform } from '../platform';
 import type { DetectionKind } from '../cameraEvents';
 import type { SensorKind } from '../detectionKinds';
@@ -7,6 +7,7 @@ import { buildCameraController } from '../streaming/cameraOptions';
 import {
   activeMessageKey, clearMessagePatch, setMessagePatch, type MessagePlan,
 } from '../doorbellMessages';
+import { objectSensorName } from '../cameraDiscovery';
 import type { CameraSettingsPatch, LcdMessage } from '../types';
 
 /** HAP subtype for the doorbell-trigger switch, so message switches can coexist with it. */
@@ -33,18 +34,66 @@ export const REAL_TIMERS: Timers = {
   clear: (handle) => clearTimeout(handle),
 };
 
-/** If an 'end' event is missed (e.g. lost across a reconnect), clear motion after this long. */
+/** If an 'end' event is missed (e.g. lost across a reconnect), clear the detection after this long. */
 const MOTION_SAFETY_CLEAR_MS = 60_000;
+
+/**
+ * A characteristic that latches when a detection starts and auto-clears if its 'end' never arrives.
+ *
+ * ONE implementation for all three kinds of detection sensor — motion, the per-type contact sensors,
+ * and the smoke/CO alarms. They differ only in which characteristic they drive and what its
+ * "tripped" and "clear" values are; the auto-clear is the part worth not duplicating, because a
+ * missed 'end' event leaves a sensor stuck reporting a detection and firing automations forever, and
+ * three separate copies of that reasoning had already accumulated.
+ */
+class LatchingCharacteristic {
+  private handle?: ReturnType<typeof setTimeout>;
+
+  constructor(
+    private readonly service: Service,
+    private readonly characteristic: WithUUID<new () => Characteristic>,
+    private readonly trippedValue: CharacteristicValue,
+    private readonly clearValue: CharacteristicValue,
+    private readonly timers: Timers,
+  ) {}
+
+  set(active: boolean): void {
+    this.cancel();
+    this.service.updateCharacteristic(this.characteristic, active ? this.trippedValue : this.clearValue);
+    if (active) {
+      this.handle = this.timers.set(() => {
+        this.handle = undefined;
+        this.service.updateCharacteristic(this.characteristic, this.clearValue);
+      }, MOTION_SAFETY_CLEAR_MS);
+    }
+  }
+
+  /** Seed the cleared value without arming a timer — for construction, see CameraAccessory. */
+  seedClear(): void {
+    this.service.updateCharacteristic(this.characteristic, this.clearValue);
+  }
+
+  /** Cancel any pending safety-clear (shutdown, or a superseding write). */
+  cancel(): void {
+    if (this.handle) {
+      this.timers.clear(this.handle);
+      this.handle = undefined;
+    }
+  }
+}
 
 /** A MotionDetected characteristic driven by start/end detections, with a safety auto-clear. */
 class MotionController {
-  private handle?: ReturnType<typeof setTimeout>;
+  private readonly latch: LatchingCharacteristic;
 
   constructor(
     private readonly platform: UnifiProtectPlatform,
     private readonly service: Service,
-    private readonly timers: Timers,
-  ) {}
+    timers: Timers,
+  ) {
+    const C = platform.Characteristic;
+    this.latch = new LatchingCharacteristic(service, C.MotionDetected, true, false, timers);
+  }
 
   /**
    * Flag whether this sensor's readings can be trusted. An unreachable camera sends no
@@ -65,26 +114,90 @@ class MotionController {
 
   /** Cancel any pending safety-clear (shutdown). */
   dispose(): void {
-    if (this.handle) {
-      this.timers.clear(this.handle);
-      this.handle = undefined;
-    }
+    this.latch.cancel();
   }
 
   set(active: boolean): void {
-    const C = this.platform.Characteristic;
-    if (this.handle) {
-      this.timers.clear(this.handle);
-      this.handle = undefined;
+    this.latch.set(active);
+  }
+}
+
+/** HAP subtype prefix for a consolidated smart-detect contact sensor. */
+const SMART_DETECT_SUBTYPE = 'smartDetect';
+
+/**
+ * Label a service the Home app will show as its own control.
+ *
+ * `Name` alone is NOT enough for a grouped sub-service: the Home app reads **ConfiguredName** for
+ * services it lists individually under one accessory, and without it falls back to a generic label
+ * — the consolidated detections showed up as "Contact Sensor 1/2/3". ConfiguredName is optional on
+ * ContactSensor, so it has to be added before it can be written.
+ */
+function setServiceName(
+  platform: UnifiProtectPlatform,
+  service: Service,
+  name: string,
+): void {
+  const { Characteristic } = platform;
+  service.updateCharacteristic(Characteristic.Name, name);
+  if (!service.testCharacteristic(Characteristic.ConfiguredName)) {
+    service.addOptionalCharacteristic(Characteristic.ConfiguredName);
+  }
+  service.updateCharacteristic(Characteristic.ConfiguredName, name);
+}
+
+/**
+ * A ContactSensorState driven by start/end detections, with the same safety auto-clear as
+ * {@link MotionController}.
+ *
+ * Contact, not motion, is deliberate and is the whole reason consolidation is safe. A camera
+ * accessory's MotionSensor is a privileged, singular signal in HomeKit — it *is* "this camera
+ * detected motion", and it drives the camera's notifications and (once implemented) HKSV recording.
+ * Adding a MotionSensor service per detection type would make five services all claim to be that
+ * camera's motion, so one physical event double-reports. Contact sensors say "which object" without
+ * competing for that meaning. This mirrors homebridge-unifi-protect, which reaches the same shape.
+ */
+class ContactController {
+  private readonly latch: LatchingCharacteristic;
+
+  constructor(
+    private readonly platform: UnifiProtectPlatform,
+    private readonly service: Service,
+    timers: Timers,
+  ) {
+    const C = platform.Characteristic;
+    // CONTACT_NOT_DETECTED ("open") is the tripped state; CONTACT_DETECTED ("closed") is clear.
+    this.latch = new LatchingCharacteristic(
+      service,
+      C.ContactSensorState,
+      C.ContactSensorState.CONTACT_NOT_DETECTED,
+      C.ContactSensorState.CONTACT_DETECTED,
+      timers,
+    );
+  }
+
+  setActive(active: boolean): void {
+    this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, active);
+    if (!active) {
+      this.set(false);
     }
-    this.service.updateCharacteristic(C.MotionDetected, active);
-    if (active) {
-      // Guard against a missed 'end' leaving the sensor stuck on.
-      this.handle = this.timers.set(() => {
-        this.handle = undefined;
-        this.service.updateCharacteristic(C.MotionDetected, false);
-      }, MOTION_SAFETY_CLEAR_MS);
-    }
+  }
+
+  setName(name: string): void {
+    setServiceName(this.platform, this.service, name);
+  }
+
+  dispose(): void {
+    this.latch.cancel();
+  }
+
+  set(active: boolean): void {
+    this.latch.set(active);
+  }
+
+  /** Seed the cleared state at construction; see CameraAccessory for why that is necessary. */
+  seedClear(): void {
+    this.latch.seedClear();
   }
 }
 
@@ -93,6 +206,13 @@ class MotionController {
  * snapshots/live video, and — for doorbells — a Doorbell service, so a motion or ring
  * notification carries a snapshot from the same accessory. Driven by decoded realtime
  * detections, with reachability from periodic discovery.
+ *
+ * The per-type smart detections live here too, as ContactSensor services — see
+ * {@link ContactController} for why contact and not motion. One accessory per camera rather than one
+ * per detection type is what keeps a large site under HomeKit's 149-per-bridge ceiling: it is the
+ * difference between 5 accessories per camera and 1. The smoke/CO sensors are deliberately NOT
+ * folded in (see {@link AlarmSensorAccessory}), so with `exposeAudioSensors` on a camera is 1 plus
+ * up to 2.
  */
 export class CameraAccessory {
   /** True if this accessory has a Doorbell service (physical doorbell OR trigger-enabled). */
@@ -101,6 +221,15 @@ export class CameraAccessory {
   private readonly doorbell?: Service;
   /** The optional "ring from an automation" switch, kept so a rename can relabel it. */
   private trigger?: Service;
+  /** Consolidated smart-detect contact sensors by object type (empty unless consolidating). */
+  private readonly objectSensors = new Map<string, ContactController>();
+  /**
+   * The camera's CURRENT name. `opts.name` is only its name at construction: a handler outlives a
+   * rename in Protect, and `setName` relabels services without touching `opts`. Anything that
+   * derives a label or a log line from the camera's name must read this instead, or a sensor added
+   * after a rename is labelled from the old name while its siblings show the new one.
+   */
+  private displayName: string;
   /** Doorbell-screen message switches by plan key. */
   private readonly messageServices = new Map<string, Service>();
   /** Which message the console currently displays, or undefined for a blank screen. */
@@ -128,7 +257,7 @@ export class CameraAccessory {
 
   constructor(
     private readonly platform: UnifiProtectPlatform,
-    accessory: PlatformAccessory,
+    private readonly accessory: PlatformAccessory,
     // Retained: the message switches read their plans, sink and clock from here after construction.
     private readonly opts: {
       name: string;
@@ -157,15 +286,32 @@ export class CameraAccessory {
        * advertises it) and the delegate (which sends it) — they must never disagree.
        */
       audioCodec?: AudioCodecChoice;
+      /**
+       * Smart-detect types to expose as ContactSensor services on this accessory. Empty or absent
+       * means this camera reports overall motion only (`exposeObjectSensors: false`, or a camera
+       * whose model supports no smart detection).
+       */
+      objectTypes?: string[];
     },
-    timers: Timers = REAL_TIMERS,
+    // Retained rather than used only here: `setObjectTypes` runs again on every discovery pass and
+    // builds controllers of its own, which must share the injected clock. Taking them as a second
+    // parameter there instead let a caller silently hand a sensor real 60s timers while its
+    // siblings had the test's — the safety-clear then simply could not be exercised.
+    private readonly timers: Timers = REAL_TIMERS,
   ) {
     const { Service, Characteristic } = platform;
+    this.displayName = opts.name;
     platform.applyInfo(accessory, opts.serial, 'UniFi Protect Camera');
     const motionSvc = accessory.getService(Service.MotionSensor) ?? accessory.addService(Service.MotionSensor);
     motionSvc.updateCharacteristic(Characteristic.Name, opts.name);
     motionSvc.updateCharacteristic(Characteristic.StatusActive, true);
+    // Seed the cleared state: Homebridge restores an accessory's cached characteristic values, so a
+    // detection that was still live when it stopped would come back latched with no 'end' event
+    // left to clear it. The safety timeout only covers detections seen in THIS session.
+    motionSvc.updateCharacteristic(Characteristic.MotionDetected, false);
     this.motion = new MotionController(platform, motionSvc, timers);
+
+    this.setObjectTypes(opts.objectTypes ?? []);
 
     // A doorbell service is present for real doorbells and for trigger-enabled cameras (so any
     // camera can "ring" from an automation, e.g. driveway camera → vehicle → ring).
@@ -284,7 +430,7 @@ export class CameraAccessory {
       this.ledService = undefined;
       return;
     }
-    const svc = existing ?? accessory.addService(Service.Switch, `${this.opts.name} Status Light`, LED_SUBTYPE);
+    const svc = existing ?? accessory.addService(Service.Switch, `${this.displayName} Status Light`, LED_SUBTYPE);
     if (!existing) {
       svc
         .getCharacteristic(Characteristic.On)
@@ -336,10 +482,10 @@ export class CameraAccessory {
       await sink.patchCamera(this.opts.serial, { ledSettings: { isEnabled: on } });
       this.ledOn = on;
       this.ledService?.updateCharacteristic(this.platform.Characteristic.On, on);
-      this.platform.log.info(`Status light on "${this.opts.name}" turned ${on ? 'on' : 'off'}.`);
+      this.platform.log.info(`Status light on "${this.displayName}" turned ${on ? 'on' : 'off'}.`);
     }).catch((err: unknown) => {
       this.platform.log.error(
-        `Could not change the status light on "${this.opts.name}": ${(err as Error).message}`,
+        `Could not change the status light on "${this.displayName}": ${(err as Error).message}`,
       );
       throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     });
@@ -395,20 +541,25 @@ export class CameraAccessory {
       this.reflectMessageSwitches();
       this.platform.log.info(
         on
-          ? `Doorbell screen on "${this.opts.name}" set to "${plan.label}".`
-          : `Doorbell screen on "${this.opts.name}" cleared.`,
+          ? `Doorbell screen on "${this.displayName}" set to "${plan.label}".`
+          : `Doorbell screen on "${this.displayName}" cleared.`,
       );
     }).catch((err: unknown) => {
       this.platform.log.error(
-        `Could not change the doorbell screen on "${this.opts.name}": ${(err as Error).message}`,
+        `Could not change the doorbell screen on "${this.displayName}": ${(err as Error).message}`,
       );
       throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     });
   }
 
   setName(name: string): void {
+    this.displayName = name;
     this.motion.setName(name);
     this.trigger?.updateCharacteristic(this.platform.Characteristic.Name, `${name} Doorbell Trigger`);
+    // Consolidated sensor labels are derived from the camera's, so they follow a rename too.
+    for (const [type, sensor] of this.objectSensors) {
+      sensor.setName(objectSensorName(name, type));
+    }
   }
 
   /**
@@ -434,12 +585,20 @@ export class CameraAccessory {
 
   /** Push the combined reachability verdict to HomeKit. */
   private applyReachability(): void {
-    this.motion.setActive(this.deviceOnline && this.snapshotOk);
+    const usable = this.deviceOnline && this.snapshotOk;
+    this.motion.setActive(usable);
+    // The consolidated sensors are fed by the same event stream, so they are exactly as stale.
+    for (const sensor of this.objectSensors.values()) {
+      sensor.setActive(usable);
+    }
   }
 
   /** Stop any live streams for this camera (called on Homebridge shutdown). */
   shutdown(): void {
     this.motion.dispose();
+    for (const sensor of this.objectSensors.values()) {
+      sensor.dispose();
+    }
     this.streaming?.shutdown();
   }
 
@@ -457,6 +616,59 @@ export class CameraAccessory {
       this.ring();
     }
   }
+
+  /**
+   * Reconcile this camera's smart-detect contact sensors to `types`.
+   *
+   * Runs on every discovery pass rather than only at construction, so the handler stays consistent
+   * with the console without a restart — a camera whose supported detection types change (a firmware
+   * update adding one, say) is picked up by the next pass.
+   *
+   * Note the asymmetry with `buildStatusLedSwitch` / `buildMessageSwitches`, which run once: those
+   * are driven purely by plugin config, and a config change restarts Homebridge anyway, so a
+   * per-pass rebuild would buy nothing. This one also tracks a console-side capability.
+   */
+  setObjectTypes(types: string[]): void {
+    const { Service, Characteristic } = this.platform;
+    const wanted = new Set(types);
+    for (const svc of this.accessory.services.filter((s) => s.subtype?.startsWith(`${SMART_DETECT_SUBTYPE}.`))) {
+      // The filter guarantees a subtype, so no assertion is needed to narrow it.
+      const type = svc.subtype?.slice(SMART_DETECT_SUBTYPE.length + 1) ?? '';
+      if (!wanted.has(type)) {
+        this.objectSensors.get(type)?.dispose(); // cancel any pending safety-clear before dropping it
+        this.objectSensors.delete(type);
+        this.accessory.removeService(svc);
+      }
+    }
+    for (const type of wanted) {
+      if (this.objectSensors.has(type)) {
+        continue; // already built; its label follows the camera name via setName
+      }
+      const subtype = `${SMART_DETECT_SUBTYPE}.${type}`;
+      const label = objectSensorName(this.displayName, type);
+      const svc = this.accessory.getServiceById(Service.ContactSensor, subtype)
+        ?? this.accessory.addService(Service.ContactSensor, label, subtype);
+      setServiceName(this.platform, svc, label);
+      svc.updateCharacteristic(Characteristic.StatusActive, true);
+      const sensor = new ContactController(this.platform, svc, this.timers);
+      // Seed the cleared state explicitly. A restored accessory carries its last cached value, so a
+      // detection that was live when Homebridge stopped would come back tripped with no 'end' event
+      // ever coming to clear it — a sensor stuck open, firing automations. Seeded THROUGH the
+      // controller so only one place knows which value means "clear".
+      sensor.seedClear();
+      this.objectSensors.set(type, sensor);
+    }
+  }
+
+  /** True when this camera carries a consolidated sensor for `type`, so routing can prefer it. */
+  hasObjectSensor(type: string): boolean {
+    return this.objectSensors.has(type);
+  }
+
+  /** Apply a smart detection to this camera's consolidated contact sensor for that type. */
+  applyObjectDetection(type: string, active: boolean): void {
+    this.objectSensors.get(type)?.set(active);
+  }
 }
 
 /**
@@ -472,49 +684,43 @@ export class CameraAccessory {
  */
 export class AlarmSensorAccessory {
   private readonly service: Service;
-  private readonly characteristic: WithUUID<new () => Characteristic>;
-  private readonly detectedValue: number;
-  private readonly clearValue: number;
-  private handle?: ReturnType<typeof setTimeout>;
+  private readonly latch: LatchingCharacteristic;
   private online = true;
 
   constructor(
     private readonly platform: UnifiProtectPlatform,
     accessory: PlatformAccessory,
     opts: { name: string; serial: string; kind: SensorKind },
-    private readonly timers: Timers = REAL_TIMERS,
+    timers: Timers = REAL_TIMERS,
   ) {
     const { Service, Characteristic } = platform;
     platform.applyInfo(accessory, opts.serial, 'UniFi Protect Camera');
+    let characteristic: WithUUID<new () => Characteristic>;
+    let detectedValue: number;
+    let clearValue: number;
     if (opts.kind === 'carbonMonoxide') {
       this.service =
         accessory.getService(Service.CarbonMonoxideSensor) ?? accessory.addService(Service.CarbonMonoxideSensor);
-      this.characteristic = Characteristic.CarbonMonoxideDetected;
-      this.detectedValue = Characteristic.CarbonMonoxideDetected.CO_LEVELS_ABNORMAL;
-      this.clearValue = Characteristic.CarbonMonoxideDetected.CO_LEVELS_NORMAL;
+      characteristic = Characteristic.CarbonMonoxideDetected;
+      detectedValue = Characteristic.CarbonMonoxideDetected.CO_LEVELS_ABNORMAL;
+      clearValue = Characteristic.CarbonMonoxideDetected.CO_LEVELS_NORMAL;
     } else {
       this.service = accessory.getService(Service.SmokeSensor) ?? accessory.addService(Service.SmokeSensor);
-      this.characteristic = Characteristic.SmokeDetected;
-      this.detectedValue = Characteristic.SmokeDetected.SMOKE_DETECTED;
-      this.clearValue = Characteristic.SmokeDetected.SMOKE_NOT_DETECTED;
+      characteristic = Characteristic.SmokeDetected;
+      detectedValue = Characteristic.SmokeDetected.SMOKE_DETECTED;
+      clearValue = Characteristic.SmokeDetected.SMOKE_NOT_DETECTED;
     }
+    this.latch = new LatchingCharacteristic(this.service, characteristic, detectedValue, clearValue, timers);
     this.service.updateCharacteristic(Characteristic.Name, opts.name);
     this.service.updateCharacteristic(Characteristic.StatusActive, true);
-    this.service.updateCharacteristic(this.characteristic, this.clearValue);
+    // Seeded, not left to the restored cache: a detection still live when Homebridge stopped comes
+    // back latched with no 'end' event left to clear it. Worst here of all three sensor kinds — a
+    // smoke sensor stuck in alarm is a HomeKit critical alert that nothing will retract.
+    this.latch.seedClear();
   }
 
   applyDetection(active: boolean): void {
-    if (this.handle) {
-      this.timers.clear(this.handle);
-      this.handle = undefined;
-    }
-    this.service.updateCharacteristic(this.characteristic, active ? this.detectedValue : this.clearValue);
-    if (active) {
-      this.handle = this.timers.set(() => {
-        this.handle = undefined;
-        this.service.updateCharacteristic(this.characteristic, this.clearValue);
-      }, MOTION_SAFETY_CLEAR_MS);
-    }
+    this.latch.set(active);
   }
 
   /** Mirror the parent camera's reachability — an offline camera hears nothing. */
@@ -534,51 +740,6 @@ export class AlarmSensorAccessory {
   }
 
   shutdown(): void {
-    if (this.handle) {
-      this.timers.clear(this.handle);
-      this.handle = undefined;
-    }
-  }
-}
-
-/** A standalone motion sensor for one smart-detect object type (person/vehicle/animal/package). */
-export class ObjectSensorAccessory {
-  private readonly motion: MotionController;
-  private online = true;
-
-  constructor(
-    platform: UnifiProtectPlatform,
-    accessory: PlatformAccessory,
-    opts: { name: string; serial: string },
-    timers: Timers = REAL_TIMERS,
-  ) {
-    const { Service, Characteristic } = platform;
-    platform.applyInfo(accessory, opts.serial, 'UniFi Protect Camera');
-    const svc = accessory.getService(Service.MotionSensor) ?? accessory.addService(Service.MotionSensor);
-    svc.updateCharacteristic(Characteristic.Name, opts.name);
-    svc.updateCharacteristic(Characteristic.StatusActive, true);
-    this.motion = new MotionController(platform, svc, timers);
-  }
-
-  applyDetection(active: boolean): void {
-    this.motion.set(active);
-  }
-
-  /** Mirror the parent camera's reachability — an offline camera detects nothing. */
-  setOnline(online: boolean): void {
-    if (this.online === online) {
-      return; // discovery runs every few minutes; don't rewrite an unchanged characteristic
-    }
-    this.online = online;
-    this.motion.setActive(online);
-  }
-
-  /** Follow a rename of the parent camera (the sensor's label is derived from it). */
-  setName(name: string): void {
-    this.motion.setName(name);
-  }
-
-  shutdown(): void {
-    this.motion.dispose();
+    this.latch.cancel();
   }
 }

@@ -2,7 +2,7 @@
   "pluginAlias": "UnifiProtectIntegration",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "**Quick setup**\n1. In UniFi OS \u2192 **Settings \u2192 Control Plane \u2192 Integrations**, create an **API Key** and paste it below.\n2. Enter your console's address (the same one you use for the UniFi web app).\n3. *(Optional, for arm/disarm)* In **Protect \u2192 Alarm Manager**, create webhook-triggered alarms with an **Arm** or **Disarm** action, and paste each **Trigger ID** below.\n4. Save & restart. Your zones, hub and outputs are discovered automatically.",
+  "headerDisplay": "**Quick setup**\n1. In UniFi OS → **Integrations** (a top-level area, not under Settings), create an **API Key** and paste it below.\n2. Enter your console's address (the same one you use for the UniFi web app).\n3. *(Optional, for arm/disarm)* In **Protect → Alarm Manager**, create webhook-triggered alarms with an **Arm** or **Disarm** action, and paste each **Trigger ID** below.\n4. Save & restart. Your zones, hub and outputs are discovered automatically.",
   "footerDisplay": "Outputs and the emergency input are read-only (UniFi does not yet allow controlling them via the API). See the [README](https://github.com/actravis/homebridge-unifi-protect-alarm-hub) for details.",
   "schema": {
     "type": "object",
@@ -22,13 +22,13 @@
         "type": "string",
         "placeholder": "192.168.1.1",
         "format": "hostname",
-        "description": "IP or hostname of your UDM / Cloud Key / NVR \u2014 the same address you use for the UniFi web app."
+        "description": "IP or hostname of your UDM / Cloud Key / NVR — the same address you use for the UniFi web app."
       },
       "apiKey": {
         "title": "API Key",
         "type": "string",
         "format": "password",
-        "description": "Create it in UniFi OS \u2192 Settings \u2192 Control Plane \u2192 Integrations, then paste it here. This key grants console-wide access \u2014 treat it like a password."
+        "description": "Create it in UniFi OS → Integrations (a top-level area, not under Settings), then paste it here. This key grants console-wide access — treat it like a password."
       },
       "securityName": {
         "title": "Alarm tile name",
@@ -37,19 +37,19 @@
         "description": "Name for the alarm accessory in HomeKit (e.g. \"Security System\" or \"Security\")."
       },
       "armAwayTriggerId": {
-        "title": "\"Away\" arm \u2014 webhook Trigger ID",
+        "title": "\"Away\" arm — webhook Trigger ID",
         "type": "string",
-        "description": "In Alarm Manager create an alarm: Trigger = Webhook, Action = Arm \u2192 Away. Paste its Trigger ID here. Leave blank if you don't use Away.",
+        "description": "In Alarm Manager create an alarm: Trigger = Webhook, Action = Arm → Away. Paste its Trigger ID here. Leave blank if you don't use Away.",
         "pattern": "^$|^[0-9a-fA-F-]{8,}$"
       },
       "armNightTriggerId": {
-        "title": "\"Night\" arm \u2014 webhook Trigger ID",
+        "title": "\"Night\" arm — webhook Trigger ID",
         "type": "string",
-        "description": "Same, but Action = Arm \u2192 Night. Leave blank if you don't use Night.",
+        "description": "Same, but Action = Arm → Night. Leave blank if you don't use Night.",
         "pattern": "^$|^[0-9a-fA-F-]{8,}$"
       },
       "disarmTriggerId": {
-        "title": "Disarm \u2014 webhook Trigger ID",
+        "title": "Disarm — webhook Trigger ID",
         "type": "string",
         "description": "Same, but Action = Disarm. Leave all three blank and the alarm tile shows status but can't be changed from HomeKit.",
         "pattern": "^$|^[0-9a-fA-F-]{8,}$"
@@ -112,7 +112,7 @@
           "title": "Camera name or device ID",
           "type": "string"
         },
-        "description": "Optional. Leave empty for all cameras. If you list any, only those are exposed. HomeKit allows 149 accessories per bridge and this plugin can create up to 6 per camera, so a large site can split its cameras across two platform instances, each in its own child bridge."
+        "description": "Optional. Leave empty for all cameras. If you list any, only those are exposed. HomeKit allows 149 accessories per bridge; a camera counts as one, so this is mainly for very large sites — it lets you split the cameras across two platform instances, each in its own child bridge, with its own budget. It also works as a privacy control: a camera left out is never exposed."
       },
       "excludeCameras": {
         "title": "Never expose these cameras",
@@ -127,19 +127,19 @@
         "title": "Expose smart-detection sensors",
         "type": "boolean",
         "default": true,
-        "description": "Add a separate motion sensor per smart-detect type each camera supports (person, vehicle, animal, package) for use in automations."
+        "description": "Expose each smart-detect type the camera supports (person, vehicle, animal, package) as its own contact sensor on the camera, for use in automations. These are services on the camera accessory, so they cost no extra HomeKit accessories. Turn this off to reduce a camera to overall motion only."
       },
       "exposeAudioSensors": {
         "title": "Expose smoke / CO alarm sensors (experimental)",
         "type": "boolean",
         "default": false,
-        "description": "Adds a native HomeKit smoke and/or carbon-monoxide sensor per camera, driven by Protect\u2019s audio detection \u2014 it reports that the camera HEARD an alarm, and is not a detector itself. Useful because a sounding alarm then becomes a HomeKit trigger (lights on, notifications). Only detections you have enabled in Protect are exposed. Experimental: the event shape has not yet been confirmed on real hardware, so if your alarm sounds and the sensor stays clear, please report it with debug logging on."
+        "description": "Adds a native HomeKit smoke and/or carbon-monoxide sensor per camera, driven by Protect’s audio detection — it reports that the camera HEARD an alarm, and is not a detector itself. Useful because a sounding alarm then becomes a HomeKit trigger (lights on, notifications). Only detections you have enabled in Protect are exposed. Experimental: the event shape has not yet been confirmed on real hardware, so if your alarm sounds and the sensor stays clear, please report it with debug logging on."
       },
       "exposeDoorbellTriggers": {
         "title": "Add doorbell-trigger switches",
         "type": "boolean",
         "default": false,
-        "description": "Add a \"Doorbell Trigger\" switch to every camera. Flip it from an automation to ring the doorbell \u2014 e.g. when your driveway camera detects a vehicle. Any camera becomes ringable (gains a doorbell notification)."
+        "description": "Add a \"Doorbell Trigger\" switch to every camera. Flip it from an automation to ring the doorbell — e.g. when your driveway camera detects a vehicle. Any camera becomes ringable (gains a doorbell notification)."
       },
       "exposeDoorbellMessages": {
         "title": "Doorbell Screen Message Switches",
@@ -160,7 +160,7 @@
         "title": "Status Light Switch",
         "type": "boolean",
         "default": false,
-        "description": "Add a switch to turn a camera's status light on or off. Only cameras that report a controllable LED get one \u2014 on many models the light cannot be changed, so no switch is created for them."
+        "description": "Add a switch to turn a camera's status light on or off. Only cameras that report a controllable LED get one — on many models the light cannot be changed, so no switch is created for them."
       },
       "doorbellDeviceIds": {
         "title": "Force these cameras to be doorbells",
@@ -175,12 +175,12 @@
         "title": "Expose doorbell chimes",
         "type": "boolean",
         "default": true,
-        "description": "Adds a switch per Protect chime that mutes and unmutes it \u2014 on means audible. Useful for automations like silencing the doorbell overnight. HomeKit has no native chime-volume control, so a switch is used rather than a fake light; unmuting restores the volume the chime had before it was muted, remembered across restarts."
+        "description": "Adds a switch per Protect chime that mutes and unmutes it — on means audible. Useful for automations like silencing the doorbell overnight. HomeKit has no native chime-volume control, so a switch is used rather than a fake light; unmuting restores the volume the chime had before it was muted, remembered across restarts."
       },
       "chimeTriggerId": {
         "title": "Chime Ring Trigger ID",
         "type": "string",
-        "description": "Alarm Manager Trigger ID for an alarm that rings your chime. In UniFi Protect go to Alarm Manager, create an alarm with a Webhook trigger and a chime/sound action, then paste its Trigger ID here. Required \u2014 the official API has no ring endpoint, so without this no chime button appears."
+        "description": "Alarm Manager Trigger ID for an alarm that rings your chime. In UniFi Protect go to Alarm Manager, create an alarm with a Webhook trigger and a chime/sound action, then paste its Trigger ID here. Required — the official API has no ring endpoint, so without this no chime button appears."
       },
       "exposeChimeMute": {
         "title": "Chime Mute Switch",
@@ -198,7 +198,7 @@
         "title": "Stream camera audio (experimental)",
         "type": "boolean",
         "default": false,
-        "description": "Include the camera microphone in the live stream. Needs an ffmpeg that can encode a codec HomeKit accepts \u2014 AAC-ELD (libfdk_aac) or Opus (libopus); the bundled ffmpeg provides Opus. The plugin tests this at startup and logs which codec it chose, or falls back to video-only if neither works. Experimental: audio changes how iOS negotiates the stream, so if live view stops working, turn this off first."
+        "description": "Include the camera microphone in the live stream. Needs an ffmpeg that can encode a codec HomeKit accepts — AAC-ELD (libfdk_aac) or Opus (libopus); the bundled ffmpeg provides Opus. The plugin tests this at startup and logs which codec it chose, or falls back to video-only if neither works. Experimental: audio changes how iOS negotiates the stream, so if live view stops working, turn this off first."
       },
       "exposeTalkback": {
         "title": "Two-way audio (talkback, experimental)",
@@ -217,7 +217,7 @@
         "title": "Use realtime updates",
         "type": "boolean",
         "default": true,
-        "description": "Recommended. Uses the console's push feed for ~1\u20132s updates, falling back to the interval above."
+        "description": "Recommended. Uses the console's push feed for ~1–2s updates, falling back to the interval above."
       },
       "realtimeIdleTimeout": {
         "title": "Realtime idle timeout (seconds, 0 = off)",
@@ -370,7 +370,7 @@
           }
         }
       ],
-      "description": "Doorbell chimes. Ringing needs an Alarm Manager Trigger ID \u2014 see the README."
+      "description": "Doorbell chimes. Ringing needs an Alarm Manager Trigger ID — see the README."
     },
     {
       "type": "fieldset",

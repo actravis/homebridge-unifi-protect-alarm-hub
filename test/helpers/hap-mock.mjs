@@ -9,6 +9,7 @@ function char(name, values = {}) {
 
 export const Characteristic = {
   Name: char('Name'),
+  ConfiguredName: char('ConfiguredName'),
   Manufacturer: char('Manufacturer'),
   Model: char('Model'),
   SerialNumber: char('SerialNumber'),
@@ -85,6 +86,7 @@ class FakeService {
   constructor(token) {
     this.token = token;
     this.characteristics = new Map();
+    this.optionalCharacteristics = new Set();
   }
   getCharacteristic(token) {
     if (!this.characteristics.has(token)) {
@@ -98,6 +100,23 @@ class FakeService {
   }
   setCharacteristic(token, value) {
     this.getCharacteristic(token).value = value;
+    return this;
+  }
+  /**
+   * HAP's presence check.
+   *
+   * Modelled on the real thing, which is subtler than it looks: hap-nodejs 0.14.3 returns FALSE
+   * after `addOptionalCharacteristic` — that call only declares a characteristic as permitted, it
+   * does not add it — while `updateCharacteristic` then works and the value serializes. Verified
+   * against real HAP. An earlier version of this mock returned true, which would have hidden a
+   * production guard that depends on the real behaviour.
+   */
+  testCharacteristic(token) {
+    return this.characteristics.has(token);
+  }
+  /** Declares a characteristic as permitted. Deliberately does NOT make it present — see above. */
+  addOptionalCharacteristic(token) {
+    this.optionalCharacteristics.add(token);
     return this;
   }
   /** Test helper: the last value written to a characteristic. */

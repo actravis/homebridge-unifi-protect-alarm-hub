@@ -52,8 +52,9 @@ plugin. The two coexist fine.
     (typically ~2s to first frame). No account password, no cloud. Camera audio is available
     behind `exposeCameraAudio`, and two-way talkback behind `exposeTalkback`.
   - **Snapshots** — including the thumbnail on motion and doorbell notifications.
-  - **Motion + smart detection** — a motion sensor per camera plus optional per-type sensors
-    (person / vehicle / animal / package), driven by the realtime events feed.
+  - **Motion + smart detection** — a motion sensor per camera, plus a contact sensor per
+    smart-detect type it supports (person / vehicle / animal / package), driven by the realtime
+    events feed. All of it is one HomeKit accessory per camera — see [Scale](#scale).
   - **Doorbell** — ring events for doorbell cameras, and an optional per-camera trigger
     switch so any camera can ring the doorbell from an automation.
   - **Status light** — an optional switch (`exposeStatusLed`) to turn a camera's status LED off.
@@ -88,15 +89,16 @@ plugin. The two coexist fine.
 - Homebridge v1.8+ (or v2 beta), Node 18.17+.
 - A UniFi console (UDM / Cloud Key / NVR) running UniFi Protect.
 - For the Alarm Hub features: a Protect **Alarm Hub**.
-- An **API key**: UniFi OS → Settings → Control Plane → Integrations.
+- An **API key**: UniFi OS → **Integrations**.
 - For live video: **ffmpeg**. The `ffmpeg-for-homebridge` optional dependency normally
   supplies it automatically; otherwise the plugin falls back to `ffmpeg` on `PATH`. Only
   needed if you leave camera streaming enabled.
 
 ## Setup
 
-1. **API key** — create one under Settings → Control Plane → Integrations and paste it into
-   the plugin config, along with your console's address.
+1. **API key** — create one under **Integrations**, a top-level area in UniFi OS (older guides
+   put it under Settings → Control Plane), and paste it into the plugin config along with your
+   console's address.
 2. **Arm/disarm (optional)** — the Integration API can't set the arm profile directly while
    the Global Alarm Manager is enabled, so arming is done through Alarm Manager webhooks:
    - In **Protect → Alarm Manager**, create an alarm with **Trigger = Webhook** and
@@ -128,11 +130,16 @@ settings endpoint.
 
 ## Scale
 
-This plugin creates up to **6 HomeKit accessories per camera** when object and audio sensors are
-enabled — the camera itself, plus one per detection type — and one per alarm zone. HomeKit's limit is
-**149 accessories per one bridge**, so roughly 20 cameras alongside a full alarm hub reaches it. Past
-the limit HomeKit silently stops accepting accessories, which looks like devices going missing with
-nothing in any log to explain it — so the plugin warns once as it approaches, at 130.
+**A camera is one HomeKit accessory.** Its smart detections (person, vehicle, animal, package) are
+contact sensors *on* that accessory rather than accessories of their own, so adding detection types
+costs nothing against HomeKit's limit of **149 accessories per one bridge**.
+
+That limit is therefore out of reach for most homes. It is still reachable on a large site, because
+two things do add accessories: `exposeAudioSensors` adds up to 2 per camera (the smoke and CO sensors
+stay separate — HomeKit treats a native `SmokeSensor` as a critical alert, which is the entire reason
+to expose one), and the alarm hub contributes one per zone. Past the limit HomeKit silently stops
+accepting accessories, which looks like devices going missing with nothing in any log to explain it —
+so the plugin warns once as it approaches, at 130.
 
 The limit is **per bridge**, and the plugin does **not** split itself automatically. If you approach
 it, the fix that keeps every accessory is to run two platform instances in separate Homebridge
@@ -172,8 +179,8 @@ instance that shouldn't have it.
 
 ### Split two: divide the cameras themselves
 
-Only needed when the cameras alone overflow one bridge — around 24 cameras with all sensors enabled,
-or 149 with them all off. Add `includeCameras` to each camera instance:
+Only needed when the cameras alone overflow one bridge — around 49 cameras with the smoke/CO sensors
+on, or 149 without them. Add `includeCameras` to each camera instance:
 
 ```json
 {
@@ -198,8 +205,24 @@ Points that matter for either split:
 - **The alarm hub cannot be split.** There is no per-zone filter, so all of its accessories live on
   whichever bridge exposes it. In practice a hub's zone count is bounded well under the limit.
 
-If you would rather trade features for headroom than add a bridge, turning off `exposeObjectSensors`
-and/or `exposeAudioSensors` drops each camera from up to 6 accessories to 1.
+### Why the sensors are on the camera
+
+The smart-detection sensors are **contact** sensors on the camera accessory, not motion sensors on
+accessories of their own. Two reasons, and both are deliberate:
+
+- **Accessory budget.** One accessory per camera instead of up to five is what puts the 149 limit out
+  of reach for a normal home.
+- **HomeKit's motion signal is singular.** A camera accessory's motion sensor *is* "this camera
+  detected motion" — it drives the camera's notifications and its recording. Adding a motion service
+  per detection type would make five services all claim to be that camera's motion, so one person
+  walking past reports several times.
+
+They remain individually visible and usable in automations; they appear grouped under the camera
+rather than as separate tiles. The one thing to know when building automations: the trigger reads
+**Opens**, not *Detects Motion*.
+
+Set `exposeObjectSensors: false` to drop them entirely and leave a camera reporting overall motion
+only. That reduces clutter, not accessory count — they were never separate accessories.
 
 `excludeCameras` also works on its own as a privacy control: a camera listed there is never exposed
 to HomeKit.

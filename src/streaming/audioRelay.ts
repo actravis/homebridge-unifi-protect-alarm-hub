@@ -20,7 +20,10 @@ import { stripV4Mapped } from '../util';
 export interface AudioRelayOptions {
   /** The socket bound to the port advertised to iOS. Owned by the caller; not closed here. */
   advertised: Socket;
-  /** Socket receiving the outbound stream's audio from ffmpeg on localhost. */
+  /**
+   * Socket receiving the outbound stream's audio from ffmpeg on localhost. Expected to be
+   * loopback-bound — packets from anywhere else are dropped, since only a local ffmpeg feeds it.
+   */
   local: Socket;
   /** Where to send audio: the phone. */
   target: { address: string; port: number };
@@ -46,9 +49,18 @@ export interface AudioRelayOptions {
 }
 
 export interface AudioRelay {
-  /** Counters for diagnostics and tests: packets moved each way, and inbound dropped by the filter. */
+  /** Counters for diagnostics and tests: packets moved each way, and packets dropped by a filter. */
   readonly stats: { outbound: number; inbound: number; dropped: number };
   stop(): void;
+}
+
+/**
+ * True for an address on this host. IPv4-mapped IPv6 is normalised first, so a dual-stack socket
+ * reporting `::ffff:127.0.0.1` is recognised — the same normalisation the inbound filter needs.
+ */
+function isLoopback(address: string): boolean {
+  const addr = stripV4Mapped(address);
+  return addr === '127.0.0.1' || addr === '::1' || addr.startsWith('127.');
 }
 
 /**
@@ -94,7 +106,14 @@ export function startAudioRelay(opts: AudioRelayOptions): AudioRelay {
     }
   };
 
-  const onLocal = (packet: Buffer): void => {
+  const onLocal = (packet: Buffer, rinfo: RemoteInfo): void => {
+    // Only the local ffmpeg feeds this leg. The socket is loopback-bound, so nothing else can reach
+    // it in the first place; this makes that a property of the relay rather than of one caller's
+    // bind, and keeps both legs symmetrical — the inbound filter existed and this one did not.
+    if (!isLoopback(rinfo.address)) {
+      stats.dropped += 1;
+      return;
+    }
     // Re-emit from the advertised socket, so iOS sees the source port it was told about.
     forward(opts.advertised, packet, opts.target.port, opts.target.address, 'outbound');
   };

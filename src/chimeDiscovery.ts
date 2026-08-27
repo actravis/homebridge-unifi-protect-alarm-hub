@@ -14,6 +14,19 @@
 
 import type { Chime, ChimeRingSetting } from './types';
 
+/**
+ * `ringSettings` as something safe to iterate.
+ *
+ * Typed `ChimeRingSetting[] | undefined`, but the console supplies it: a non-array value has no
+ * `.every`/`.map` and threw out of planning. That no longer crashes the process — the discovery pass
+ * catches it — but it surfaced as an internal-defect log rather than ordinary degradation. Treating a
+ * malformed value like an ABSENT one is right: both mean "no usable pairing info", which already has
+ * defined behaviour (an unpaired chime reports not-muted and offers no volume to change).
+ */
+function ringSettings(settings: ChimeRingSetting[] | undefined): ChimeRingSetting[] {
+  return Array.isArray(settings) ? settings.filter((s) => typeof s === 'object' && s !== null) : [];
+}
+
 /** Volume restored when unmuting a chime whose previous level we never observed. */
 export const DEFAULT_CHIME_VOLUME = 100;
 
@@ -47,7 +60,7 @@ export interface ChimePlan {
  * showing the switch as off would imply the user had muted something.
  */
 export function isChimeMuted(settings: ChimeRingSetting[] | undefined): boolean {
-  const entries = settings ?? [];
+  const entries = ringSettings(settings);
   return entries.length > 0 && entries.every((s) => (s.volume ?? 0) === 0);
 }
 
@@ -60,7 +73,7 @@ export function isChimeMuted(settings: ChimeRingSetting[] | undefined): boolean 
  * before the plugin ever saw it still produces sound.
  */
 export function loudestVolume(settings: ChimeRingSetting[] | undefined): number {
-  const volumes = (settings ?? []).map((s) => s.volume ?? 0).filter((v) => v > 0);
+  const volumes = ringSettings(settings).map((s) => s.volume ?? 0).filter((v) => v > 0);
   return volumes.length ? Math.max(...volumes) : DEFAULT_CHIME_VOLUME;
 }
 
@@ -76,7 +89,7 @@ export function settingsAtVolume(
   volume: number,
 ): ChimeRingSetting[] {
   const clamped = Math.max(0, Math.min(100, Math.round(volume)));
-  return (settings ?? []).map((s) => ({ ...s, volume: clamped }));
+  return ringSettings(settings).map((s) => ({ ...s, volume: clamped }));
 }
 
 /**
@@ -120,7 +133,7 @@ export function planChimeAccessories(chimes: Chime[], config: ChimePlanConfig = 
     mutable,
     muted: isChimeMuted(chime.ringSettings),
     volume: loudestVolume(chime.ringSettings),
-    pairedCameras: chime.ringSettings?.length ?? 0,
-    ringSettings: chime.ringSettings ?? [],
+    pairedCameras: ringSettings(chime.ringSettings).length,
+    ringSettings: ringSettings(chime.ringSettings),
   }));
 }

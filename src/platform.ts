@@ -9,10 +9,10 @@ import type {
 
 import { PLATFORM_NAME, PLUGIN_NAME, type ProtectConfig } from './settings';
 import { ProtectApiError, ProtectClient, type ProtectClientOptions } from './client/protectClient';
-import type { AccessoryHandler, AlarmHub, ProtectEvent } from './types';
+import type { AccessoryHandler, AlarmHub, Camera, ProtectEvent } from './types';
 import { SecuritySystemAccessory } from './accessories/securitySystem';
 import { HubAccessory, ReadonlyContactAccessory, ZoneAccessory } from './accessories/sensors';
-import { AlarmSensorAccessory, CameraAccessory, ObjectSensorAccessory } from './accessories/camera';
+import { AlarmSensorAccessory, CameraAccessory } from './accessories/camera';
 import { ChimeAccessory } from './accessories/chime';
 import { chimeKey, planChimeAccessories } from './chimeDiscovery';
 import { planDoorbellMessages } from './doorbellMessages';
@@ -21,14 +21,13 @@ import { basePollSeconds, effectivePollSeconds } from './pollPolicy';
 import {
   audioSensorKey,
   cameraKey,
-  objectSensorKey,
-  objectSensorName,
   planCameraAccessories,
   selectCameras,
+  type CameraPlan,
 } from './cameraDiscovery';
 import { decodeCameraEvent } from './cameraEvents';
 import { alarmKindLabel, isAudioDetection, sensorKindsFor } from './detectionKinds';
-import { redactPayload } from './util';
+import { isDeviceList, redactPayload } from './util';
 import { probeAudioCodec, type AudioCodecChoice } from './streaming/audioCodec';
 import { resolveFfmpegPath } from './streaming/ffmpegPath';
 
@@ -95,11 +94,12 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   private readonly accessories = new Map<string, PlatformAccessory>();
   private readonly handlers = new Map<string, AccessoryHandler>();
   private readonly cameraHandlers = new Map<string, CameraAccessory>();
-  private readonly objectHandlers = new Map<string, ObjectSensorAccessory>();
   /** Native smoke / CO sensors driven by the cameras' audio detection, keyed by accessory UUID. */
   private readonly alarmHandlers = new Map<string, AlarmSensorAccessory>();
   private readonly chimeHandlers = new Map<string, ChimeAccessory>();
-  private chimeDiscoveryOk = true;
+
+  /** So an unexpected discovery throw is reported once rather than every interval. */
+  private deviceSyncErrorLogged = false;
   /** The accessory-budget warning is reported once, not on every discovery pass. */
   private warnedAccessoryBudget = false;
   /** Talkback-without-audio is warned about once, not on every discovery pass. */
@@ -107,7 +107,11 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   private disposeEvents?: () => void;
   private syncingCameras = false;
   private resyncCameras = false;
-  private cameraDiscoveryOk = true;
+  /**
+   * Per-device-class discovery health, so each reports its FIRST failure and its recovery once.
+   * Keyed by the label {@link readDeviceList} is called with.
+   */
+  private readonly discoveryOk = new Map<string, boolean>();
   private readonly warnedTypes = new Set<string>();
   private readonly warnedRingDevices = new Set<string>();
   private readonly warnedDisabledDetections = new Set<string>();
@@ -185,6 +189,27 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
 
     this.api.on('didFinishLaunching', () => this.start());
     this.api.on('shutdown', () => this.stop());
+  }
+
+  /**
+   * Fire-and-forget a device discovery pass without leaking unhandled rejections.
+   *
+   * This is the net `tick()` and the snapshot path always had and this path did not: `syncDevices`
+   * was called as a bare `void`, so ANY throw inside it became an unhandled rejection, which Node
+   * treats as fatal — one malformed `/chimes` body took the whole bridge down and logged nothing
+   * about chimes. The specific failures are reported by the passes themselves; reaching here means
+   * a defect, so it is loud once and quiet after, rather than repeating every discovery interval.
+   */
+  private discoverDevices(): void {
+    void this.syncDevices().catch((err) => {
+      const message = `Device discovery failed unexpectedly: ${(err as Error).message}`;
+      if (this.deviceSyncErrorLogged) {
+        this.log.debug(message);
+        return;
+      }
+      this.deviceSyncErrorLogged = true;
+      this.log.error(`${message} — please report this with debug logging on.`);
+    });
   }
 
   /** Fire-and-forget a refresh cycle without leaking unhandled rejections. */
@@ -266,10 +291,10 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
         this.log.info('Realtime is off: cameras are exposed but motion/doorbell events will not fire.');
       }
       if (this.config.exposeCameras !== false || this.config.exposeChimes !== false) {
-        void this.syncDevices();
+        this.discoverDevices();
         // Detections arrive over the events socket, but a device being added, renamed, or going
         // offline does not — that only shows up in a discovery pass.
-        this.cameraTimer = this.deps.setInterval(() => void this.syncDevices(), DEVICE_DISCOVERY_SECONDS * 1000);
+        this.cameraTimer = this.deps.setInterval(() => this.discoverDevices(), DEVICE_DISCOVERY_SECONDS * 1000);
       }
       if (alarmEnabled && this.sirenChannels.size) {
         const shown = [...this.sirenChannels].map((c) => Number(c) + 1).join(', ');
@@ -334,12 +359,16 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     // Each shutdown is isolated, or one throwing handler would skip the rest AND the client
     // close below — turning a cosmetic failure into leaked processes and sockets.
     for (const uuid of [
-      ...this.cameraHandlers.keys(), ...this.objectHandlers.keys(),
+      ...this.cameraHandlers.keys(),
       ...this.alarmHandlers.keys(), ...this.chimeHandlers.keys(),
     ]) {
-      this.shutdownCameraHandler(uuid);
+      this.shutdownHandler(uuid);
     }
-    void this.client?.close();
+    // undici's Agent.close() REJECTS (ClientDestroyedError) if the agent is already closed, and a
+    // bare `void` would turn that into an unhandled rejection during shutdown.
+    void this.client?.close().catch((err: unknown) => {
+      this.log.debug(`Closing the console connection failed: ${(err as Error).message}`);
+    });
   }
 
   /** Serialise refreshes so overlapping triggers can't double-register accessories. */
@@ -557,14 +586,15 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
   /**
    * Warn as the bridge approaches HomeKit's per-bridge accessory limit.
    *
-   * HAP allows 149 accessories on one bridge. This plugin creates up to 6 per camera with object and
-   * audio sensors enabled (the camera, one sensor per detection type), plus one per alarm zone — so a
-   * 20-camera site with a full alarm hub lands around 146. Past the limit HomeKit simply stops
+   * HAP allows 149 accessories on one bridge. A camera is ONE accessory — its smart detections are
+   * services on it — so this is normally only reachable with `exposeAudioSensors` on (which adds up
+   * to 2 per camera, since HomeKit treats smoke/CO as critical alerts and they have to stay separate)
+   * or with a large alarm hub, which contributes one per zone. Past the limit HomeKit simply stops
    * accepting accessories, which reads as "some cameras are missing" with nothing to explain it.
    *
-   * The limit is per BRIDGE, so the first remedy offered is splitting across child bridges — that
-   * keeps every accessory. Switching sensors off is named second because it costs the user
-   * functionality; leading with it steers people into losing features they could have kept.
+   * The limit is per BRIDGE, so the remedy offered is splitting across child bridges — that keeps
+   * every accessory. Switching sensors off is named second because it costs the user functionality;
+   * leading with it steers people into losing features they could have kept.
    */
   private checkAccessoryBudget(): void {
     const count = this.accessories.size;
@@ -578,8 +608,8 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
         'keeps everything is to split this platform into two instances in separate Homebridge ' +
         'child bridges — one for the alarm (exposeCameras: false) and one for the cameras ' +
         '(exposeAlarm: false), or split the cameras themselves with includeCameras. See the ' +
-        'Scale section of the plugin README. Failing that, turning off exposeObjectSensors ' +
-        'and/or exposeAudioSensors reduces the count, at the cost of those sensors.',
+        'Scale section of the plugin README. Failing that, turning off exposeAudioSensors ' +
+        'reduces the count, at the cost of the smoke/CO sensors.',
     );
   }
 
@@ -605,22 +635,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       );
       return;
     }
-    let chimes;
-    try {
-      chimes = await client.getChimes();
-    } catch (err) {
-      if (this.chimeDiscoveryOk) {
-        this.chimeDiscoveryOk = false;
-        this.log.warn(`Chime discovery failed: ${(err as Error).message}. Will keep retrying.`);
-      }
-      return;
-    }
-    if (this.stopped) {
-      return;
-    }
-    if (!this.chimeDiscoveryOk) {
-      this.chimeDiscoveryOk = true;
-      this.log.info('Chime discovery recovered.');
+    const chimes = await this.readDeviceList('Chime', '/chimes', () => client.getChimes());
+    if (!chimes || this.stopped) {
+      return; // failed read, or shut down while we were awaiting the console
     }
 
     const { Categories, uuid } = this.api.hap;
@@ -631,6 +648,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       let handler = this.chimeHandlers.get(id);
       if (!handler) {
         const accessory = this.acquireAccessory(id, plan.name, Categories.SWITCH, 'chime');
+        if (!accessory) {
+          continue; // registration failed; it stays in `desired` so nothing prunes it meanwhile
+        }
         handler = new ChimeAccessory(this, accessory, {
           name: plan.name,
           serial: plan.deviceId,
@@ -643,17 +663,10 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       handler.update(plan);
     }
 
-    for (const [id, accessory] of this.accessories) {
-      if (accessory.context.domain === 'chime' && !desired.has(id)) {
-        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-        this.accessories.delete(id);
-        this.chimeHandlers.delete(id);
-        this.log.info(`Removed chime accessory "${accessory.displayName}".`);
-      }
-    }
+    this.pruneDomain('chime', 'no longer on the console', desired);
   }
 
-  /** Discover cameras and create/prune their accessories (overall motion, doorbell, object sensors). */
+  /** Discover cameras and create/prune their accessories, serialising overlapping requests. */
   private async syncCameras(): Promise<void> {
     if (!this.client || this.stopped) {
       return;
@@ -674,7 +687,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       do {
         this.resyncCameras = false;
         await this.syncCamerasOnce();
-      } while (this.resyncCameras);
+        // Re-checked per iteration: a resync queued just before shutdown would otherwise issue one
+        // more round of console requests after Homebridge asked us to stop.
+      } while (this.resyncCameras && !this.stopped);
     } catch (err) {
       // Fire-and-forget callers (start/reconnect) can't catch — swallow so it can't crash.
       this.log.debug(`Camera sync error: ${(err as Error).message}`);
@@ -683,40 +698,121 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     }
   }
 
+  /**
+   * One reconcile pass over the camera domain: read, filter, plan, apply, prune.
+   *
+   * Deliberately kept to that narrative — each step below is a named method, because this used to be
+   * one 200-line function mixing console I/O, payload validation, filter diagnostics, HomeKit
+   * accessory construction and pruning, and the shape of the pass was invisible inside it.
+   */
   private async syncCamerasOnce(): Promise<void> {
     const client = this.client;
     if (!client) {
       return;
     }
-    let cameras;
-    try {
-      cameras = await client.getCameras();
-    } catch (err) {
-      // Surface the first failure: a user whose cameras never appear should not have to switch
-      // on debug logging to find out why. Subsequent failures stay quiet until it recovers.
-      if (this.cameraDiscoveryOk) {
-        this.cameraDiscoveryOk = false;
-        this.log.warn(`Camera discovery failed: ${(err as Error).message}. Will keep retrying.`);
-      } else {
-        this.log.debug(`Camera discovery failed: ${(err as Error).message}`);
-      }
-      return;
-    }
-    if (this.stopped) {
-      return; // shut down while we were awaiting the console
-    }
-    if (!this.cameraDiscoveryOk) {
-      this.cameraDiscoveryOk = true;
-      this.log.info('Camera discovery recovered.');
+    const cameras = await this.readDeviceList('Camera', '/cameras', () => client.getCameras());
+    if (!cameras || this.stopped) {
+      return; // failed read, or shut down while we were awaiting the console
     }
 
-    const { Categories, uuid } = this.api.hap;
     const streaming = this.config.exposeCameraStreams !== false;
     if (streaming && this.config.exposeCameraAudio === true) {
       await this.ensureAudioCodec();
     }
-    // Talkback needs an audio session to ride on. Warn once rather than silently omitting the
-    // microphone button and leaving the user to guess why.
+    this.warnIfTalkbackUnavailable();
+
+    // Filter BEFORE planning, so an excluded camera produces no accessories of any kind — and so
+    // its cached ones fall out of the prune loop below like any other camera that went away.
+    const { selected, unmatched } = selectCameras(cameras, this.config);
+    this.reportUnmatchedFilters(unmatched);
+
+    const desired = new Set<string>();
+    for (const plan of planCameraAccessories(selected, this.config)) {
+      const camId = this.api.hap.uuid.generate(cameraKey(plan.deviceId));
+      desired.add(camId);
+      this.reportCameraReachability(plan.deviceId, plan.name, plan.online);
+      this.reportDisabledDetections(plan);
+
+      if (!this.cameraHandlers.has(camId)) {
+        if (!this.createCameraHandler(plan, camId, streaming, client)) {
+          continue; // HomeKit refused it; it stays in `desired` so nothing prunes it meanwhile
+        }
+      } else if (this.renameAccessory(camId, plan.name)) {
+        // Renamed in Protect. The service label has to follow the accessory name, or HomeKit
+        // keeps showing the old one — the alarm-side handlers do this on every refresh.
+        this.cameraHandlers.get(camId)?.setName(plan.name);
+      }
+      this.applyCameraState(plan, camId);
+      this.syncAudioSensors(plan, desired);
+    }
+
+    this.pruneDomain('camera', 'no longer on the console', desired);
+    this.forgetVanishedCameras(selected);
+  }
+
+  /**
+   * Read one device class's list, or undefined when this pass must change nothing.
+   *
+   * Undefined covers BOTH a failed request and a successful one carrying an unusable body, because
+   * they mean the same thing to the caller: we do not know what exists, so touch nothing.
+   *
+   * Shared by the camera and chime reconcilers deliberately. The policy is small but subtle — an
+   * unreadable payload must never be read as "no devices", because each reconciler prunes against
+   * what it just read, so an empty list would unregister the user's accessories and take their rooms
+   * and automations with them. Two copies of that rule DID drift: the chime copy never checked the
+   * payload shape at all, which crashed the whole bridge, and its error path forgot the debug
+   * fallback so repeat failures logged nothing. One implementation cannot diverge from itself.
+   */
+  private async readDeviceList<T extends { id: string }>(
+    label: 'Camera' | 'Chime',
+    path: string,
+    fetch: () => Promise<T[]>,
+  ): Promise<T[] | undefined> {
+    const healthy = this.discoveryOk.get(label) !== false;
+    let devices: unknown;
+    try {
+      devices = await fetch();
+    } catch (err) {
+      // Surface the FIRST failure: a user whose devices never appear should not have to switch on
+      // debug logging to find out why. Repeats stay quiet until it recovers.
+      const message = `${label} discovery failed: ${(err as Error).message}`;
+      if (healthy) {
+        this.discoveryOk.set(label, false);
+        this.log.warn(`${message}. Will keep retrying.`);
+      } else {
+        this.log.debug(message);
+      }
+      return undefined;
+    }
+    if (this.stopped) {
+      return undefined; // shut down while we were awaiting the console
+    }
+    if (!isDeviceList(devices)) {
+      if (healthy) {
+        this.discoveryOk.set(label, false);
+        this.log.warn(
+          `${label} discovery returned data this plugin could not read, so this pass was skipped and ` +
+            `your ${label.toLowerCase()}s were left as they are. Will keep retrying. Turn on debug ` +
+            'logging to see the payload.',
+        );
+      }
+      this.log.debug(`Unusable ${path} payload: ${redactPayload(devices)}`);
+      return undefined;
+    }
+    if (!healthy) {
+      this.discoveryOk.set(label, true);
+      this.log.info(`${label} discovery recovered.`);
+    }
+    // Justified by the guard above: it proves every entry is an object with a string id, which is
+    // all this function promises. Field-level shape is each planner's business.
+    return devices as T[];
+  }
+
+  /**
+   * Talkback needs an audio session to ride on. Warned once rather than silently omitting the
+   * microphone button and leaving the user to guess why.
+   */
+  private warnIfTalkbackUnavailable(): void {
     if (this.config.exposeTalkback === true && !this.audioCodec && !this.warnedTalkback) {
       this.warnedTalkback = true;
       this.log.warn(
@@ -724,11 +820,15 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
           'Enable exposeCameraAudio (and check the startup log for the audio codec probe result).',
       );
     }
-    const desired = new Set<string>();
+  }
 
-    // Filter BEFORE planning, so an excluded camera produces no accessories of any kind — and so
-    // its cached ones fall out of the prune loop below like any other camera that went away.
-    const { selected, unmatched } = selectCameras(cameras, this.config);
+  /**
+   * Report include/exclude entries that matched nothing, once each.
+   *
+   * A typo silently exposes no cameras (include) or exposes one meant to stay private (exclude),
+   * and both read as a plugin fault with nothing in the log to explain them.
+   */
+  private reportUnmatchedFilters(unmatched: string[]): void {
     for (const entry of unmatched) {
       if (this.warnedUnmatchedCameras.has(entry)) {
         continue;
@@ -739,115 +839,134 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
           'Use the camera\'s name or device ID exactly as Protect reports it.',
       );
     }
+  }
 
-    for (const plan of planCameraAccessories(selected, this.config)) {
-      const camId = uuid.generate(cameraKey(plan.deviceId));
-      desired.add(camId);
-      this.reportCameraReachability(plan.deviceId, plan.name, plan.online);
-      // A supported-but-switched-off detection type can never fire; say so once, or the user is
-      // left staring at a sensor that looks broken when it is actually just disabled in Protect.
-      if (plan.disabledObjectTypes.length && !this.warnedDisabledDetections.has(plan.deviceId)) {
-        this.warnedDisabledDetections.add(plan.deviceId);
-        this.log.info(
-          `"${plan.name}": ${plan.disabledObjectTypes.join(', ')} detection is turned off in Protect, ` +
-            'so those sensors will never trigger. Enable it in Protect > camera > Smart Detections.',
+  /**
+   * A supported-but-switched-off detection type can never fire; say so once, or the user is left
+   * staring at a sensor that looks broken when it is actually just disabled in Protect.
+   */
+  private reportDisabledDetections(plan: CameraPlan): void {
+    if (plan.disabledObjectTypes.length && !this.warnedDisabledDetections.has(plan.deviceId)) {
+      this.warnedDisabledDetections.add(plan.deviceId);
+      this.log.info(
+        `"${plan.name}": ${plan.disabledObjectTypes.join(', ')} detection is turned off in Protect, ` +
+          'so those sensors will never trigger. Enable it in Protect > camera > Smart Detections.',
+      );
+    }
+  }
+
+  /** Create the accessory and handler for a camera. False when HomeKit refused to register it. */
+  private createCameraHandler(
+    plan: CameraPlan,
+    camId: string,
+    streaming: boolean,
+    client: ProtectClient,
+  ): boolean {
+    const { Categories } = this.api.hap;
+    const opts = {
+      name: plan.name,
+      serial: plan.deviceId,
+      isDoorbell: plan.isDoorbell,
+      doorbellTrigger: this.config.exposeDoorbellTriggers === true,
+      streaming,
+      source: client,
+      audioCodec: this.audioCodec,
+      // Talkback rides on the audio path: without a codec there is no audio session for
+      // HomeKit to send a microphone over, so requesting it alone cannot work.
+      //
+      // Also gated on the camera actually HAVING a speaker, decided from data discovery already
+      // fetched. Asking a speakerless camera answers 503, which the retry policy treated as
+      // transient — measured ~7s of backoff, all of it blocking video from starting. On observed
+      // hardware only the doorbell has a speaker.
+      talkback: this.config.exposeTalkback === true && !!this.audioCodec && plan.hasSpeaker,
+      // Screen messages only make sense on a device with a screen. planDoorbellMessages
+      // returns nothing unless the feature is switched on, so a non-doorbell costs nothing.
+      messages: plan.isDoorbell ? planDoorbellMessages(this.config) : [],
+      messageSink: client,
+      // Only cameras that report a controllable LED; the rest silently ignore the write.
+      statusLed: this.config.exposeStatusLed === true && plan.hasStatusLed,
+      // The smart-detect sensors are contact services on THIS accessory, so a camera is one
+      // HomeKit accessory however many detection types it supports. See CameraAccessory.
+      objectTypes: plan.objectTypes,
+    };
+    // Cameras are bridged like everything else: they appear automatically with the bridge,
+    // are cached/restored across restarts, and prune normally. (Publishing them as external
+    // accessories — which costs the user a manual add each — was tried and is NOT required;
+    // HomeKit streams a bridged camera fine. Verified end to end on real hardware.)
+    const category = streaming
+      ? opts.isDoorbell
+        ? Categories.VIDEO_DOORBELL
+        : Categories.CAMERA
+      : Categories.SENSOR;
+    const accessory = this.acquireAccessory(camId, plan.name, category);
+    if (!accessory) {
+      return false;
+    }
+    this.cameraHandlers.set(camId, new CameraAccessory(this, accessory, opts));
+    return true;
+  }
+
+  /** Push the console's current state for one camera onto its handler. */
+  private applyCameraState(plan: CameraPlan, camId: string): void {
+    const handler = this.cameraHandlers.get(camId);
+    if (!handler) {
+      return;
+    }
+    // Reconcile every pass, not just at construction: a detection type switched off in Protect,
+    // or one a firmware update adds, is picked up without a Homebridge restart.
+    //
+    // Deliberately unconditional, which makes it redundant on the pass that just built the
+    // handler (the constructor already applied `opts.objectTypes`). Mutation-testing confirms
+    // that: emptying the constructor's copy fails nothing, because this line puts them back. The
+    // redundancy is the point — one line guarantees the invariant on every branch, where calling
+    // it only in the `else` would mean two places had to agree forever. Keep both: the
+    // constructor's copy is what makes a CameraAccessory correct standalone, which is how the
+    // unit tests build one.
+    handler.setObjectTypes(plan.objectTypes);
+    handler.setOnline(plan.online);
+    // The console is the source of truth for the screen: a message set in the Protect app should
+    // show up on the matching HomeKit switch.
+    handler.updateMessages(plan.lcdMessage);
+    handler.updateStatusLed(plan.statusLedOn);
+  }
+
+  /**
+   * Reconcile the native smoke / CO sensors a camera's audio detection warrants.
+   *
+   * These stay SEPARATE accessories rather than services on the camera, unlike the smart-detect
+   * sensors: HomeKit treats a native SmokeSensor as a critical alert, which is the only reason to
+   * expose one at all, and it only gets that treatment as an accessory in its own right.
+   */
+  private syncAudioSensors(plan: CameraPlan, desired: Set<string>): void {
+    const { Categories, uuid } = this.api.hap;
+    for (const kind of plan.alarmKinds) {
+      const alarmId = uuid.generate(audioSensorKey(plan.deviceId, kind));
+      desired.add(alarmId);
+      const name = `${plan.name} ${alarmKindLabel(kind)}`;
+      if (!this.alarmHandlers.has(alarmId)) {
+        const accessory = this.acquireAccessory(alarmId, name, Categories.SENSOR);
+        if (!accessory) {
+          continue; // registration failed; it stays in `desired` so nothing prunes it meanwhile
+        }
+        this.alarmHandlers.set(
+          alarmId,
+          new AlarmSensorAccessory(this, accessory, { name, serial: `${plan.deviceId}:${kind}`, kind }),
         );
+      } else if (this.renameAccessory(alarmId, name)) {
+        this.alarmHandlers.get(alarmId)?.setName(name);
       }
-      if (!this.cameraHandlers.has(camId)) {
-        const opts = {
-          name: plan.name,
-          serial: plan.deviceId,
-          isDoorbell: plan.isDoorbell,
-          doorbellTrigger: this.config.exposeDoorbellTriggers === true,
-          streaming,
-          source: client,
-          audioCodec: this.audioCodec,
-          // Talkback rides on the audio path: without a codec there is no audio session for
-          // HomeKit to send a microphone over, so requesting it alone cannot work.
-          //
-          // Also gated on the camera actually HAVING a speaker, decided from data discovery already
-          // fetched. Asking a speakerless camera answers 503, which the retry policy treated as
-          // transient — measured ~7s of backoff, all of it blocking video from starting. On observed
-          // hardware only the doorbell has a speaker.
-          talkback: this.config.exposeTalkback === true && !!this.audioCodec && plan.hasSpeaker,
-          // Screen messages only make sense on a device with a screen. planDoorbellMessages
-          // returns nothing unless the feature is switched on, so a non-doorbell costs nothing.
-          messages: plan.isDoorbell ? planDoorbellMessages(this.config) : [],
-          messageSink: client,
-          // Only cameras that report a controllable LED; the rest silently ignore the write.
-          statusLed: this.config.exposeStatusLed === true && plan.hasStatusLed,
-
-        };
-        // Cameras are bridged like everything else: they appear automatically with the bridge,
-        // are cached/restored across restarts, and prune normally. (Publishing them as external
-        // accessories — which costs the user a manual add each — was tried and is NOT required;
-        // HomeKit streams a bridged camera fine. Verified end to end on real hardware.)
-        const category = streaming
-          ? opts.isDoorbell
-            ? Categories.VIDEO_DOORBELL
-            : Categories.CAMERA
-          : Categories.SENSOR;
-        const accessory = this.acquireAccessory(camId, plan.name, category);
-        this.cameraHandlers.set(camId, new CameraAccessory(this, accessory, opts));
-      } else if (this.renameAccessory(camId, plan.name)) {
-        // Renamed in Protect. The service label has to follow the accessory name, or HomeKit
-        // keeps showing the old one — the alarm-side handlers do this on every refresh.
-        this.cameraHandlers.get(camId)?.setName(plan.name);
-      }
-      this.cameraHandlers.get(camId)?.setOnline(plan.online);
-      // The console is the source of truth for the screen: a message set in the Protect app should
-      // show up on the matching HomeKit switch.
-      this.cameraHandlers.get(camId)?.updateMessages(plan.lcdMessage);
-      this.cameraHandlers.get(camId)?.updateStatusLed(plan.statusLedOn);
-      for (const type of plan.objectTypes) {
-        const objId = uuid.generate(objectSensorKey(plan.deviceId, type));
-        desired.add(objId);
-        const name = objectSensorName(plan.name, type);
-        if (!this.objectHandlers.has(objId)) {
-          const accessory = this.acquireAccessory(objId, name, Categories.SENSOR);
-          this.objectHandlers.set(objId, new ObjectSensorAccessory(this, accessory, { name, serial: `${plan.deviceId}:${type}` }));
-        } else if (this.renameAccessory(objId, name)) {
-          // These names are derived from the camera's, so a camera rename renames them all.
-          this.objectHandlers.get(objId)?.setName(name);
-        }
-        this.objectHandlers.get(objId)?.setOnline(plan.online);
-      }
-      for (const kind of plan.alarmKinds) {
-        const alarmId = uuid.generate(audioSensorKey(plan.deviceId, kind));
-        desired.add(alarmId);
-        const name = `${plan.name} ${alarmKindLabel(kind)}`;
-        if (!this.alarmHandlers.has(alarmId)) {
-          const accessory = this.acquireAccessory(alarmId, name, Categories.SENSOR);
-          this.alarmHandlers.set(
-            alarmId,
-            new AlarmSensorAccessory(this, accessory, { name, serial: `${plan.deviceId}:${kind}`, kind }),
-          );
-        } else if (this.renameAccessory(alarmId, name)) {
-          this.alarmHandlers.get(alarmId)?.setName(name);
-        }
-        this.alarmHandlers.get(alarmId)?.setOnline(plan.online);
-      }
+      this.alarmHandlers.get(alarmId)?.setOnline(plan.online);
     }
+  }
 
-    // Prune camera-domain accessories that are no longer present.
-    for (const [id, accessory] of this.accessories) {
-      if (accessory.context.domain === 'camera' && !desired.has(id)) {
-        // Shut the handler down BEFORE dropping it: a pruned camera can have a live ffmpeg
-        // transcode and a pending motion safety-clear, and once the map entry is gone nothing
-        // can ever reach them again — the process would survive until Homebridge restarts.
-        this.shutdownCameraHandler(id);
-        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-        this.accessories.delete(id);
-        this.cameraHandlers.delete(id);
-        this.objectHandlers.delete(id);
-        this.alarmHandlers.delete(id);
-        this.log.info(`Removed camera accessory "${accessory.displayName}".`);
-      }
-    }
-    // Forget per-device warning/reachability state for cameras that no longer exist, so these
-    // sets track the live camera list rather than everything ever seen.
-    // Keyed off the SELECTED list, not every camera on the console: a filtered-out camera is never
-    // reported on again, so holding its warning state would keep it alive for the process lifetime.
+  /**
+   * Forget per-device warning and reachability state for cameras that no longer exist, so these
+   * sets track the live camera list rather than everything ever seen.
+   *
+   * Keyed off the SELECTED list, not every camera on the console: a filtered-out camera is never
+   * reported on again, so holding its warning state would keep it alive for the process lifetime.
+   */
+  private forgetVanishedCameras(selected: Camera[]): void {
     const liveDevices = new Set(selected.map((c) => c.id));
     for (const set of [this.offlineCameras, this.warnedDisabledDetections, this.warnedRingDevices]) {
       for (const deviceId of set) {
@@ -884,7 +1003,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     }
   }
 
-  /** Stop a camera or object-sensor handler's background work, whichever kind it is. */
+  /** Stop whatever background work the handler at `uuid` holds, whichever domain it belongs to. */
   /**
    * Unregister every accessory in a domain.
    *
@@ -894,30 +1013,31 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
    * looks functional but cannot work" failure. Reconciling to an empty set is the only safe way to
    * skip a domain.
    */
-  private pruneDomain(domain: 'camera' | 'chime', reason: string): void {
+  private pruneDomain(domain: 'camera' | 'chime', reason: string, keep?: Set<string>): void {
     // Snapshot: unregistering mutates the map we are iterating.
     for (const [id, accessory] of [...this.accessories]) {
-      if (accessory.context.domain !== domain) {
+      if (accessory.context.domain !== domain || keep?.has(id)) {
         continue;
       }
-      this.shutdownCameraHandler(id);
+      this.shutdownHandler(id);
       this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       this.accessories.delete(id);
+      // EVERY handler map, not just the domain's obvious one: an entry left behind is a handler
+      // realtime routing can still find, writing to an accessory HomeKit no longer has.
       this.cameraHandlers.delete(id);
+      this.alarmHandlers.delete(id);
       this.chimeHandlers.delete(id);
-      this.objectHandlers.delete(id);
       this.log.info(`Removed ${domain} accessory "${accessory.displayName}" (${reason}).`);
     }
   }
 
-  private shutdownCameraHandler(uuid: string): void {
+  private shutdownHandler(uuid: string): void {
     try {
       this.cameraHandlers.get(uuid)?.shutdown();
-      this.objectHandlers.get(uuid)?.shutdown();
       this.alarmHandlers.get(uuid)?.shutdown();
       this.chimeHandlers.get(uuid)?.shutdown();
     } catch (err) {
-      this.log.debug(`Camera shutdown failed: ${(err as Error).message}`);
+      this.log.debug(`Handler shutdown failed: ${(err as Error).message}`);
     }
   }
 
@@ -958,18 +1078,38 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
    * accessories it owns. Chimes get their own domain rather than borrowing the cameras' — sharing it
    * would mean the camera prune had to special-case every non-camera accessory it encountered.
    */
+  /**
+   * The accessory for `uuid`, creating and registering it if HomeKit does not have it yet.
+   *
+   * Returns undefined when it could not be registered, and the caller skips that device for this
+   * pass. Registration comes BEFORE the bookkeeping, and that order is load-bearing: caching first
+   * meant a failed registration left the plugin believing the accessory existed while HomeKit had
+   * never received it — and because the cache hit short-circuits, it was never retried. One
+   * transient failure hid a camera permanently, with nothing in the log. Not caching a failure lets
+   * the next discovery pass simply try again.
+   */
   private acquireAccessory(
     uuid: string,
     name: string,
     category: number,
     domain: 'camera' | 'chime' = 'camera',
-  ): PlatformAccessory {
+  ): PlatformAccessory | undefined {
     let accessory = this.accessories.get(uuid);
     if (!accessory) {
       accessory = new this.api.platformAccessory(name, uuid, category);
       accessory.context.domain = domain;
+      try {
+        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      } catch (err) {
+        // Reported per device rather than once globally: which accessory failed is the whole of
+        // the diagnostic, and the next pass retries so this is not a permanent state.
+        this.log.warn(
+          `HomeKit refused the accessory "${name}": ${(err as Error).message}. Will retry on the ` +
+            'next discovery pass.',
+        );
+        return undefined;
+      }
       this.accessories.set(uuid, accessory);
-      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       this.log.info(`Added accessory "${name}".`);
     } else {
       accessory.context.domain = domain; // ensure a restored cached accessory is tagged
@@ -1027,16 +1167,18 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
           );
         }
       } else {
-        const objectHandler = this.objectHandlers.get(this.api.hap.uuid.generate(objectSensorKey(d.deviceId, d.kind)));
-        if (!objectHandler) {
-          this.noteUnroutedDetection(
-            `${d.deviceId}:${d.kind}`,
-            `"${d.kind}" detection from ${d.deviceId} has no sensor — the camera does not advertise that ` +
-              'detection type. Restart Homebridge if you just enabled it in Protect.',
-          );
+        // A smart detection is a contact service on the camera's own accessory, so one lookup
+        // reaches it. This is the plugin's only hot path.
+        const camera = this.cameraHandlers.get(this.api.hap.uuid.generate(cameraKey(d.deviceId)));
+        if (camera?.hasObjectSensor(d.kind)) {
+          camera.applyObjectDetection(d.kind, d.active);
           continue;
         }
-        objectHandler.applyDetection(d.active);
+        this.noteUnroutedDetection(
+          `${d.deviceId}:${d.kind}`,
+          `"${d.kind}" detection from ${d.deviceId} has no sensor — the camera does not advertise that ` +
+            'detection type. Restart Homebridge if you just enabled it in Protect.',
+        );
       }
     }
   }

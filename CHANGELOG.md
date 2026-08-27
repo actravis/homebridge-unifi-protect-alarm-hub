@@ -111,6 +111,19 @@ side gained a substantial round of reliability and security work.
   button that cannot ring would fail silently inside an automation. Muting sets the ring volume to
   0 for every paired camera and restores the previous level on unmute, preserving each camera's
   chosen ringtone and repeat count.
+- **A camera is one HomeKit accessory.** Its smart-detection sensors (person / vehicle / animal /
+  package) are contact sensors *on* that accessory rather than accessories of their own, so enabling
+  detection types costs nothing against HomeKit's 149-per-bridge limit — which puts that limit out of
+  reach for a normal home. The sensors stay individually usable in automations; the trigger reads
+  **Opens** rather than *Detects Motion*.
+
+  Contact rather than motion is deliberate: a camera accessory's motion sensor is HomeKit's single
+  "this camera detected motion" signal, driving its notifications and recording, so extra motion
+  services would make one physical event report several times.
+
+  The smoke/CO sensors (`exposeAudioSensors`) are the exception and stay separate accessories,
+  because HomeKit treats a native smoke sensor as a critical alert — which is the only reason to
+  expose one. With those on, a camera is 1 accessory plus up to 2.
 - **Camera include/exclude filter.** `includeCameras` exposes only the cameras you list;
   `excludeCameras` keeps cameras out entirely. Both match a camera's **name or device ID**,
   case-insensitively, and an entry matching nothing is reported in the log — a typo in an include
@@ -128,6 +141,24 @@ side gained a substantial round of reliability and security work.
 
 ### Fixed
 
+- **An unreadable response from the console can no longer take Homebridge down, or delete your
+  accessories.** A request that succeeded but carried an unusable body — an empty `200`, or a JSON
+  object where a list was expected — reached an unhandled rejection, which Node treats as fatal: the
+  bridge exited with a bare `TypeError` and nothing in the log naming the cause. Such a response is
+  now treated as a *failed read*: the pass is skipped, your cameras and chimes are left exactly as
+  they are, and it is reported once with recovery announced when it clears. Deliberately not read as
+  "no devices" — that would reconcile to an empty set and unregister every accessory, losing room
+  assignments and any automation referencing them, which would be worse than the crash. A single
+  camera with an odd field no longer costs you the others either.
+- **Live video failed on hosts with two network interfaces.** The plugin told HomeKit to expect its
+  video from the address of the HAP *control* connection, which on a multi-homed host (Wi-Fi plus
+  Ethernet, common on a NAS or Mac mini) is not the address the video actually leaves from. HomeKit
+  discards a stream arriving from an unexpected address, so the camera showed a spinner and timed
+  out while ffmpeg streamed perfectly — with nothing wrong in any log. The media address is now
+  derived from the route to the device being streamed to.
+- **A motion sensor could come back stuck "on" after a restart.** Homebridge restores an accessory's
+  last characteristic values, so a detection that was still active when it stopped was restored as
+  active, with no matching end event left to clear it. Motion and contact sensors now start clear.
 - **The security tile no longer reports an illegal state.** With only an arm trigger configured
   and no disarm trigger, every refresh while disarmed wrote a target value outside the tile's
   allowed set, producing a repeated HomeKit warning.

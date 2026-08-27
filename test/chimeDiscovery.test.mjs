@@ -138,3 +138,27 @@ test('volumes are clamped to 0-100 and rounded', () => {
 test('setting a volume on an empty list is a no-op, not a crash', () => {
   assert.deepEqual(settingsAtVolume(undefined, 50), []);
 });
+
+// --- Malformed ringSettings --------------------------------------------------
+// The console supplies this, and it is typed `ChimeRingSetting[] | undefined`. A non-array has no
+// `.every`/`.map`, which threw out of planning — once fatally, later as an internal-defect log. A
+// malformed value is treated exactly like an ABSENT one, because both mean "no usable pairing info"
+// and that already has defined behaviour: not muted, nothing to change.
+for (const [label, bad] of [
+  ['a string', 'x'],
+  ['a number', 7],
+  ['an object', { volume: 0 }],
+  ['null', null],
+  ['a list with a junk entry', [null, 'nope']],
+]) {
+  test(`ringSettings of ${label} degrades instead of throwing`, () => {
+    assert.equal(isChimeMuted(bad), false, 'nothing known to be silenced');
+    assert.equal(loudestVolume(bad), DEFAULT_CHIME_VOLUME, 'unmute still produces sound');
+    assert.deepEqual(settingsAtVolume(bad, 50), []);
+
+    const plan = planChimeAccessories([{ id: 'ch1', name: 'Chime', ringSettings: bad }], { chimeTriggerId: 't' })[0];
+    assert.equal(plan.pairedCameras, 0, 'a bogus value must not claim paired cameras');
+    assert.deepEqual(plan.ringSettings, []);
+    assert.equal(plan.muted, false);
+  });
+}

@@ -33,7 +33,13 @@ export interface ProtectConfig extends PlatformConfig {
   includeCameras?: string[];
   /** Never expose these cameras (device ID or name, case-insensitive). Applied after the include list. */
   excludeCameras?: string[];
-  /** Expose per-type smart-detect sensors (person/vehicle/animal/package) — default on. */
+  /**
+   * Expose per-type smart-detect sensors (person/vehicle/animal/package) — default on.
+   *
+   * They are ContactSensor services on the camera's own accessory, not accessories of their own, so
+   * enabling them costs no extra HomeKit accessories. Switch it off to reduce a camera to overall
+   * motion only.
+   */
   exposeObjectSensors?: boolean;
   /** Expose smoke/CO sensors driven by the cameras' audio detection — default off (experimental). */
   exposeAudioSensors?: boolean;

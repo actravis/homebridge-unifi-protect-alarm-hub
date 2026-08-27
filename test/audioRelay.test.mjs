@@ -245,3 +245,45 @@ test('a send failure is caught and reported once per direction, not per packet',
   assert.ok(errors.length <= 1, `expected at most one report, got ${errors.length}`);
   assert.equal(relay.stats.outbound, 0);
 });
+
+// --- Both legs are filtered, not just the inbound one -------------------------
+// The relay's private socket is loopback-bound by the delegate, so in production nothing off-host
+// can reach the outbound leg. The check below makes that a property of the RELAY rather than of one
+// caller's bind: the inbound leg had a source filter and the outbound leg had none, so a change to
+// how that socket is bound would have silently reopened the forwarding path. A non-loopback rinfo
+// cannot be produced against a loopback-bound socket, so the datagram is injected by emitting the
+// event the socket itself would emit — the relay's filter is the unit under test, not the kernel's.
+
+test('the outbound leg drops a packet that did not come from this host', async (t) => {
+  const [local, advertised, phone] = await sockets(t, 3);
+  const relay = relayFor(t, {
+    advertised,
+    local,
+    target: { address: '127.0.0.1', port: phone.address().port },
+  });
+
+  local.emit('message', Buffer.from('forged'), { address: '192.168.1.50', port: 40000, family: 'IPv4' });
+
+  assert.equal(await nextMessage(phone, 200), null, 'an off-host packet must not reach the phone');
+  assert.equal(relay.stats.outbound, 0);
+  assert.equal(relay.stats.dropped, 1);
+});
+
+test('the outbound leg still forwards a genuine loopback packet, including IPv4-mapped', async (t) => {
+  const [local, advertised, phone] = await sockets(t, 3);
+  const relay = relayFor(t, {
+    advertised,
+    local,
+    target: { address: '127.0.0.1', port: phone.address().port },
+  });
+
+  // `::ffff:127.0.0.1` is what a dual-stack socket reports; the filter must normalise it, or
+  // enabling IPv6 would silently kill outbound audio while video kept working.
+  for (const address of ['127.0.0.1', '::ffff:127.0.0.1', '127.0.0.2']) {
+    local.emit('message', Buffer.from(address), { address, port: 40000, family: 'IPv4' });
+    const got = await nextMessage(phone);
+    assert.equal(got?.msg.toString(), address, `a packet from ${address} must be forwarded`);
+  }
+  assert.equal(relay.stats.dropped, 0);
+  assert.equal(relay.stats.outbound, 3);
+});

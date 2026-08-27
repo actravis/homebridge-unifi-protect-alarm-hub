@@ -4,6 +4,7 @@ import { test } from 'node:test';
 
 import {
   isExpectedFfmpegNoise,
+  localAddressFor,
   pickAddressOverride,
   ProtectStreamingDelegate,
   randomSsrc,
@@ -51,6 +52,8 @@ const prepareRequest = (sessionID = 's1') => ({
 test('prepareStream advertises the source address and a video-only response', async () => {
   const d = new ProtectStreamingDelegate({
     deviceId: 'cam1', source: {}, log: makeLog(), ffmpegPath: 'ffmpeg', prepareTimeoutMs: 20,
+    // No route discoverable → fall back to the address hap reported.
+    resolveLocalAddress: async () => undefined,
   });
   const res = await new Promise((resolve, reject) =>
     d.prepareStream(prepareRequest(), (err, r) => (err ? reject(err) : resolve(r))),
@@ -832,4 +835,129 @@ test('a failed talkback spawn still relays outbound audio', async (t) => {
   assert.ifError(err, 'video must survive a failed talkback spawn');
   // The outbound stream is still pointed at the relay, so the relay has to be forwarding.
   assert.match(spawnedLocal[0].args.at(-1), /^srtp:\/\/127\.0\.0\.1:\d+\?/);
+});
+
+// --- Media source address on a multi-homed host ------------------------------
+// HomeKit drops a stream whose packets arrive from an address other than the one it was told to
+// expect. hap offers `request.sourceAddress`, but that is the HAP *control* connection's local
+// address — on a host with two LAN interfaces the media can route out of the other one, and the
+// result is a spinner with ffmpeg streaming perfectly the whole time.
+
+test('localAddressFor returns the address that routes to the target', async () => {
+  // Loopback is the one route every host is guaranteed to have.
+  assert.equal(await localAddressFor('127.0.0.1', 'udp4'), '127.0.0.1');
+});
+
+test('localAddressFor never reports the wildcard address', async () => {
+  // An unresolvable target leaves the socket unbound; advertising 0.0.0.0 to HomeKit as the media
+  // source is worse than falling back to hap's value, so it must report "unknown" instead.
+  assert.equal(await localAddressFor('not a host', 'udp4'), undefined);
+});
+
+test('localAddressFor resolves rather than rejecting on a bad family', async () => {
+  // It sits on the stream-start path: a throw here would take down video for a routing hint.
+  assert.equal(await localAddressFor('127.0.0.1', 'udp6'), undefined);
+});
+
+// REGRESSION: the media source was taken from `request.sourceAddress`, which hap sets to the HAP
+// control connection's local address. On a dual-homed host the phone's control connection landed on
+// Wi-Fi while its media routed out of Ethernet, so HomeKit waited for packets from an address
+// nothing sent from — a permanent spinner while ffmpeg streamed happily. Found on real hardware:
+// the advertised .148 against a measured route of .12.
+test('prepareStream advertises the ROUTED address, not the control connection\'s', async () => {
+  // Documentation addresses (RFC 5737): what matters is that the routed address DIFFERS from the
+  // one hap reports, not the specific values. On the host where this was found, the control
+  // connection was on Wi-Fi and the media route on Ethernet.
+  const ROUTED = '192.0.2.12';
+  const d = new ProtectStreamingDelegate({
+    deviceId: 'cam1', source: {}, log: makeLog(), ffmpegPath: 'ffmpeg', prepareTimeoutMs: 20,
+    resolveLocalAddress: async () => ROUTED,
+  });
+  const res = await new Promise((resolve, reject) =>
+    d.prepareStream(prepareRequest(), (err, r) => (err ? reject(err) : resolve(r))),
+  );
+  assert.equal(res.addressOverride, ROUTED);
+  assert.notEqual(res.addressOverride, prepareRequest().sourceAddress, 'must not echo hap\'s address');
+});
+
+test('a routed address of the wrong family is not advertised', async () => {
+  // pickAddressOverride still guards the family: an IPv6 answer for an IPv4 session is unusable.
+  const d = new ProtectStreamingDelegate({
+    deviceId: 'cam1', source: {}, log: makeLog(), ffmpegPath: 'ffmpeg', prepareTimeoutMs: 20,
+    resolveLocalAddress: async () => 'fe80::1',
+  });
+  const res = await new Promise((resolve, reject) =>
+    d.prepareStream(prepareRequest(), (err, r) => (err ? reject(err) : resolve(r))),
+  );
+  assert.equal(res.addressOverride, undefined);
+});
+
+// Without this, "the stream took forever" can only ever be reported as a feeling — every other
+// log line marks a request or a spawn, not the moment a picture exists.
+test('the time to the first frame is logged, once', async () => {
+  const log = makeLog();
+  const { delegate, spawned } = makeStreamDelegate({ log });
+  await startStream(delegate);
+
+  const proc = spawned[0].proc;
+  proc.stderr.emit('data', Buffer.from('frame=    1 fps=0.0 q=28.0 size=1kB\n'));
+  proc.stderr.emit('data', Buffer.from('frame=   48 fps= 24 q=28.0 size=99kB\n'));
+
+  const firstFrame = log.entries.filter((e) => /first frame in \d+ms/.test(e.msg));
+  assert.equal(firstFrame.length, 1, 'reported for the first frame only, not every progress line');
+  assert.match(firstFrame[0].msg, /cam1/);
+});
+
+// The probe runs BEFORE the prepare-timeout reaper is armed, so an unbounded await here would hang
+// stream setup with nothing left to rescue it. It must always settle.
+test('localAddressFor gives up rather than hanging on an unreachable target', async () => {
+  // A TEST-NET-1 address (RFC 5737) that nothing routes to.
+  const started = Date.now();
+  const result = await localAddressFor('192.0.2.1', 'udp4');
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 2000, `settled in ${elapsed}ms — must not hang the stream-start path`);
+  // Either it resolves a route or it reports "unknown"; it must never report the wildcard.
+  assert.notEqual(result, '0.0.0.0');
+});
+
+// --- Which interfaces each socket listens on ---------------------------------
+// Two opposite requirements that a single shared `bindUdp` has to satisfy, so they are pinned
+// together. The advertised video/audio sockets MUST stay wildcard-bound or the phone cannot reach
+// them and every stream breaks. The relay's private socket must NOT be, because only a local ffmpeg
+// feeds it and its packets are re-emitted from the advertised port towards the phone.
+
+test('the sockets advertised to HomeKit stay reachable on every interface', async (t) => {
+  const { delegate } = makeStreamDelegate({ audioCodec: OPUS, t });
+  await new Promise((resolve, reject) =>
+    delegate.prepareStream(prepareRequest('s1'), (err) => (err ? reject(err) : resolve())),
+  );
+  const session = delegate.sessions.get('s1');
+
+  // A loopback bind here would be invisible to every other test — the args and ports would all
+  // still look right — and would stop the phone reaching us at all.
+  assert.equal(session.videoSocket.address().address, '0.0.0.0', 'video return socket must be wildcard');
+  assert.equal(session.audioSocket.address().address, '0.0.0.0', 'audio return socket must be wildcard');
+});
+
+test('the audio relay socket listens on loopback only, not the LAN', async (t) => {
+  const { delegate } = makeStreamDelegate({ t, ...talkbackDeps() });
+  const err = await runWithAudio(delegate);
+  assert.ifError(err);
+  const session = delegate.sessions.get('s1');
+
+  assert.ok(session.relaySocket, 'talkback holds a relay socket for the session');
+  assert.equal(
+    session.relaySocket.address().address, '127.0.0.1',
+    'the relay forwards to the phone, so it must not accept packets off the LAN',
+  );
+});
+
+// An empty target routes to LOOPBACK, and 127.0.0.1 advertised to HomeKit as the media source is
+// exactly the silent stall this whole function exists to prevent — worse than deferring to hap's
+// own value. hap should always supply the controller's address; this is the boundary check for when
+// it does not.
+test('localAddressFor refuses an empty target rather than reporting loopback', async () => {
+  assert.equal(await localAddressFor('', 'udp4'), undefined);
+  assert.equal(await localAddressFor('', 'udp6'), undefined);
 });

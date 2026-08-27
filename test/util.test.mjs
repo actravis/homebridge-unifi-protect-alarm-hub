@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { redactPayload, redactStreamUrl } from '../dist/util.js';
+import { isDeviceList, redactPayload, redactStreamUrl } from '../dist/util.js';
 
 test('redactStreamUrl reports missing URLs plainly', () => {
   assert.equal(redactStreamUrl(undefined), '<none>');
@@ -68,4 +68,33 @@ test('redactPayload caps the length so one huge object cannot flood the log', ()
   const out = redactPayload({ blob: 'x'.repeat(5000) }, 100);
   assert.ok(out.length <= 101, `expected a truncated string, got ${out.length} chars`);
   assert.ok(out.endsWith('…'));
+});
+
+// --- isDeviceList ------------------------------------------------------------
+// The guard that stands between a malformed console response and either a crashed Homebridge or —
+// worse — a reconciler that reads "no devices" and unregisters everything the user had.
+
+test('isDeviceList accepts a real device list, including an empty one', () => {
+  assert.equal(isDeviceList([]), true, 'genuinely zero devices is a valid answer');
+  assert.equal(isDeviceList([{ id: 'a' }, { id: 'b', name: 'B' }]), true);
+});
+
+test('isDeviceList rejects the shapes that crashed the plugin', () => {
+  // `request()` returns undefined for an empty 200 body — the most reachable of these, and the one
+  // that turned `chimes.map(...)` into a fatal unhandled rejection.
+  assert.equal(isDeviceList(undefined), false);
+  assert.equal(isDeviceList(null), false);
+  assert.equal(isDeviceList({}), false, 'a JSON object is not a list');
+  assert.equal(isDeviceList('oops'), false, 'a string would iterate per character');
+  assert.equal(isDeviceList(42), false);
+  assert.equal(isDeviceList([null]), false, 'one junk entry makes the whole payload untrustworthy');
+  assert.equal(isDeviceList([42]), false);
+});
+
+test('isDeviceList requires a usable id, because that IS the accessory identity', () => {
+  // Every accessory UUID is derived from the id; an entry without one cannot be reconciled at all.
+  assert.equal(isDeviceList([{ name: 'no id' }]), false);
+  assert.equal(isDeviceList([{ id: '' }]), false, 'empty is not an identity');
+  assert.equal(isDeviceList([{ id: 7 }]), false, 'a numeric id has no .toLowerCase()');
+  assert.equal(isDeviceList([{ id: 'a' }, { id: undefined }]), false, 'one bad id spoils the list');
 });

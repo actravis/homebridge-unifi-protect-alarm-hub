@@ -77,3 +77,27 @@ export function redactPayload(value: unknown, maxChars = MAX_PAYLOAD_CHARS): str
 export function stripV4Mapped(addr: string): string {
   return /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(addr)?.[1] ?? addr;
 }
+
+/**
+ * True when an API response really is a list of devices we can reconcile against.
+ *
+ * Every device list is typed `Device[]`, but that is a promise about the API, not a fact about the
+ * payload. `request()` deliberately returns `undefined` for an empty 200 body, and a firmware change
+ * or an intercepting proxy can answer with a JSON object instead of an array — measured: five such
+ * shapes each turned `chimes.map(...)` into a TypeError that reached an unhandled rejection and took
+ * the whole Homebridge process down, with nothing about chimes in the log.
+ *
+ * A device needs a string `id` because that IS its identity: every accessory UUID is derived from it,
+ * so an entry without one cannot be reconciled, only guessed at.
+ *
+ * CRITICAL — callers must treat `false` as a FAILED READ, not as "no devices". Coercing a malformed
+ * payload to `[]` would be worse than the crash it prevents: every reconciler prunes against the list
+ * it just read, so an empty list means "every device was removed" and would unregister the user's
+ * accessories, destroying their room assignments and any automation referencing them. A transient bad
+ * response must never be able to do that. Skip the pass, keep what exists, and report it.
+ */
+export function isDeviceList(value: unknown): value is { id: string }[] {
+  return Array.isArray(value)
+    && value.every((d) => typeof d === 'object' && d !== null
+      && typeof (d as { id?: unknown }).id === 'string' && (d as { id: string }).id !== '');
+}

@@ -56,6 +56,13 @@ export interface StreamingDelegateOptions {
    */
   spawn?: typeof spawn;
   /**
+   * Resolves the local address that routes to a controller, injectable for the same reason as
+   * `spawn`: the real one consults the host's routing table, so a test asserting the advertised
+   * address would otherwise depend on the machine's network interfaces. Defaults to
+   * {@link localAddressFor}.
+   */
+  resolveLocalAddress?: (target: string, family: 'udp4' | 'udp6') => Promise<string | undefined>;
+  /**
    * The probed audio encoder, or undefined for video-only. MUST match what the CameraController
    * advertised: if the controller declares a codec and this is absent, iOS waits for audio that
    * never arrives and refuses to render the video either.
@@ -190,8 +197,95 @@ function closeSocket(socket?: Socket): void {
   }
 }
 
-/** Bind a UDP socket to an ephemeral port, resolving once bound. */
-function bindUdp(family: 'udp4' | 'udp6'): Promise<Socket> {
+/**
+ * The only address the audio relay's private socket needs to be reachable on: the outbound ffmpeg
+ * runs on this host and is pointed at `srtp://127.0.0.1:<relayPort>`. Binding it here rather than on
+ * every interface keeps the relay's forwarding path off the LAN entirely.
+ */
+const LOOPBACK = '127.0.0.1';
+
+/**
+ * Port used only to ask the OS a routing question — a connected UDP socket sends nothing, so the
+ * value never reaches the network. Any port gives the same answer.
+ */
+const RTP_PROBE_PORT = 9;
+
+/**
+ * Ceiling on the routing probe. Connecting a UDP socket to a literal IP is a local, synchronous-ish
+ * routing lookup, so this should never fire — but the probe runs BEFORE the prepare-timeout reaper
+ * is armed, so an unbounded await here would hang stream setup with nothing left to rescue it. The
+ * fallback (hap's own address) is correct on any single-homed host, which makes giving up cheap.
+ */
+const ROUTE_PROBE_TIMEOUT_MS = 500;
+
+/**
+ * The local address that actually routes to `target`, or undefined if it cannot be determined.
+ *
+ * Why this exists: HomeKit is told, via `addressOverride`, which address its media will come from,
+ * and it drops a stream whose packets arrive from anywhere else. hap-nodejs offers
+ * `request.sourceAddress`, but that is `connection.localAddress` — the address of the HAP *control*
+ * connection. On a multi-homed host those can differ: a phone's control connection can land on the
+ * Wi-Fi interface while UDP media to that same phone routes out of Ethernet. HomeKit then waits for
+ * media on an address nothing ever sends from, shows a spinner, and times out — with ffmpeg happily
+ * streaming the whole time, which is what makes it so hard to read from the logs.
+ *
+ * Connecting a UDP socket sends no packets; it only asks the OS to apply its routing table and bind
+ * a local address, which is exactly the question being asked.
+ */
+export function localAddressFor(target: string, family: 'udp4' | 'udp6'): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    // An empty target routes to LOOPBACK, and advertising 127.0.0.1 as the media source guarantees
+    // the exact silent failure this function exists to prevent — worse than hap's own guess. hap
+    // should always supply the controller's address; this is the boundary check for when it doesn't.
+    if (!target) {
+      resolve(undefined);
+      return;
+    }
+    let socket: Socket;
+    try {
+      socket = createSocket(family);
+    } catch {
+      resolve(undefined);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (value?: string): void => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      closeSocket(socket);
+      resolve(value);
+    };
+    timer = setTimeout(() => done(undefined), ROUTE_PROBE_TIMEOUT_MS);
+    timer.unref?.(); // never hold the process open for a routing hint
+    socket.on('error', () => done(undefined));
+    try {
+      // Port is irrelevant — nothing is sent. Any port yields the same routing decision.
+      socket.connect(RTP_PROBE_PORT, target, () => {
+        try {
+          const addr = socket.address().address;
+          // An unroutable or unresolvable target leaves the socket on the wildcard address.
+          // Advertising 0.0.0.0 as the media source is worse than deferring to hap's value.
+          done(addr === '0.0.0.0' || addr === '::' ? undefined : addr);
+        } catch {
+          done(undefined);
+        }
+      });
+    } catch {
+      done(undefined);
+    }
+  });
+}
+
+/**
+ * Bind a UDP socket to an ephemeral port, resolving once bound.
+ *
+ * `address` restricts which interfaces can reach it; omitted means every interface, which is
+ * REQUIRED for the sockets whose ports are advertised to HomeKit — the phone has to reach those.
+ * Pass `LOOPBACK` for a socket only a local ffmpeg talks to.
+ */
+function bindUdp(family: 'udp4' | 'udp6', address?: string): Promise<Socket> {
   return new Promise((resolve, reject) => {
     const socket = createSocket(family);
     const onError = (err: Error): void => {
@@ -199,7 +293,7 @@ function bindUdp(family: 'udp4' | 'udp6'): Promise<Socket> {
       reject(err);
     };
     socket.once('error', onError);
-    socket.bind(() => {
+    socket.bind(0, address, () => {
       socket.removeListener('error', onError);
       resolve(socket);
     });
@@ -360,7 +454,17 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     try {
       const family = request.addressVersion === 'ipv6' ? 'udp6' : 'udp4';
       const videoSSRC = randomSsrc();
-      const addressOverride = pickAddressOverride(request.sourceAddress, request.addressVersion);
+      // Prefer the address that actually routes to this controller over the one the HAP control
+      // connection happens to use; they differ on a multi-homed host. Falls back to hap's value.
+      const resolveAddress = this.opts.resolveLocalAddress ?? localAddressFor;
+      const routed = await resolveAddress(request.targetAddress, family);
+      if (routed && routed !== stripV4Mapped(request.sourceAddress)) {
+        this.opts.log.debug(
+          `[stream] media source ${routed} differs from the HAP connection's ${request.sourceAddress}; ` +
+            'advertising the routed address (multi-homed host).',
+        );
+      }
+      const addressOverride = pickAddressOverride(routed ?? request.sourceAddress, request.addressVersion);
       const videoSocket = await bindUdp(family);
       videoSocket.on('error', (err) => this.opts.log.debug(`Video return socket error: ${err.message}`));
       const videoReturnPort = videoSocket.address().port;
@@ -568,8 +672,19 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
       try {
         // Always IPv4: both relay hops are localhost (ffmpeg -> us, us -> talkback ffmpeg). Only
         // the advertised socket talks to the phone, and it keeps whatever family prepareStream chose.
-        const relaySocket = await bindUdp('udp4');
+        //
+        // Loopback-bound, not wildcard: nothing off this host has any business reaching the relay,
+        // and its inbound packets are re-emitted from the advertised port towards the phone. SRTP
+        // authentication is what stops forged audio being rendered, but there is no reason to leave
+        // the forwarding path itself open to the LAN.
+        const relaySocket = await bindUdp('udp4', LOOPBACK);
         relaySocket.on('error', (err) => this.opts.log.debug(`Audio relay socket error: ${err.message}`));
+        // Wildcard on purpose, unlike the relay socket: this one only RESERVES a free port, which is
+        // then closed and handed to the talkback ffmpeg to bind itself. Reserving it on loopback
+        // alone could pick a port already taken on another interface, and ffmpeg's own bind — which
+        // is wildcard, measured — would then fail. Restricting ffmpeg's listener needs `-localaddr`,
+        // and an unknown option is a HARD error on the ffmpeg 4.x that Debian 11 still ships, so it
+        // would need a functional capability probe like `supportsFpsMax` to be safe.
         const talkbackIn = await bindUdp('udp4');
         session.talkbackInPort = talkbackIn.address().port;
         // Hand the port straight to the talkback ffmpeg: it must bind it to read the SDP stream.
@@ -629,14 +744,25 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     });
     session.ffmpeg = proc;
 
-    if (talkbackTarget && session.audioKey && session.audioSalt && request.audio) {
-      this.startTalkback(session, request, talkbackTarget);
+    // Every field the talkback path dereferences is checked HERE, so nothing downstream needs a
+    // non-null assertion. They were previously guaranteed only by distance from where they are set —
+    // the same shape as the bug that once built an SDP with `port: 0` and spawned an ffmpeg that
+    // could never receive anything.
+    if (
+      talkbackTarget && session.audioKey && session.audioSalt && request.audio
+      && session.talkbackInPort !== undefined && session.audioPort !== undefined
+    ) {
+      this.startTalkback(session, request, talkbackTarget, {
+        inPort: session.talkbackInPort,
+        key: session.audioKey,
+        salt: session.audioSalt,
+      });
       if (session.audioSocket && session.relaySocket) {
         session.relay = startAudioRelay({
           advertised: session.audioSocket,
           local: session.relaySocket,
           // The phone's audio port comes from prepareStream, not the start request.
-          target: { address: session.targetAddress, port: session.audioPort as number },
+          target: { address: session.targetAddress, port: session.audioPort },
           // Inbound only if talkback's process is actually there to receive it. The relay still runs
           // either way: the outbound args already point at the relay socket, so skipping it would
           // leave the phone with no audio and stall iOS on the codec we advertised.
@@ -656,11 +782,28 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     // Split per line rather than logging each chunk whole: ffmpeg writes in bursts that do not
     // align with line boundaries, so chunk-logging interleaved unrelated lines into each other.
     let suppressed = 0;
+    // Time to the first encoded frame — the number that actually describes "how long until I see
+    // something". Everything else the plugin logs is a request or a spawn, so a slow open could
+    // only ever be reported as a feeling.
+    //
+    // This exists because it settled a real question: a bench harness said keeping a camera's
+    // RTSPS session warm removed an occasional multi-second stall, but measured HERE, warm and
+    // cold openings of the same camera were indistinguishable (medians 1853ms vs 1851ms over 13
+    // opens) and no stall appeared at all. The floor is handshake and transcode startup, not the
+    // keyframe wait. Judge any future latency work on this number, in this path.
+    const spawnedAt = this.nowMs();
+    let firstFrameLogged = false;
     proc.stderr?.on('data', (d: Buffer) => {
       for (const raw of d.toString().split('\n')) {
         const line = raw.trim();
         if (!line) {
           continue;
+        }
+        if (!firstFrameLogged && /^frame=\s*\d/.test(line)) {
+          firstFrameLogged = true;
+          this.opts.log.debug(
+            `[stream] first frame in ${this.nowMs() - spawnedAt}ms (${this.opts.deviceId})`,
+          );
         }
         if (isExpectedFfmpegNoise(line)) {
           suppressed += 1;
@@ -716,16 +859,25 @@ export class ProtectStreamingDelegate implements CameraStreamingDelegate {
     session: Session,
     request: Extract<StreamingRequest, { type: 'start' }>,
     target: NonNullable<ReturnType<typeof parseTalkbackTarget>>,
+    /**
+     * The values this needs from the session, passed explicitly rather than re-read from it.
+     *
+     * They are all optional on `Session` and were previously recovered with `as` assertions, so the
+     * invariant "the caller checked these" lived only in a comment. Taking them as required
+     * parameters makes it impossible to reach this function without them — the compiler enforces
+     * what a convention used to.
+     */
+    audio: { inPort: number; key: Buffer; salt: Buffer },
   ): void {
     const a = request.audio;
     const sdp = buildTalkbackSdp({
       // The relay's private port, NOT the advertised one — the plugin keeps that and forwards to
       // here, so the outbound stream can still send from it.
-      port: session.talkbackInPort as number,
+      port: audio.inPort,
       payloadType: a.pt,
       sampleRate: a.sample_rate * 1000,
       opus: this.opts.audioCodec?.encoder === 'libopus',
-      srtp: encodeSrtpParams(session.audioKey as Buffer, session.audioSalt as Buffer),
+      srtp: encodeSrtpParams(audio.key, audio.salt),
     });
     const args = buildTalkbackArgs({
       target,

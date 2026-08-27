@@ -5,7 +5,6 @@ import {
   audioSensorKey,
   cameraKey,
   isDoorbell,
-  objectSensorKey,
   planCameraAccessories,
   selectCameras,
 } from '../dist/cameraDiscovery.js';
@@ -77,25 +76,16 @@ test('an unnamed camera falls back to "Camera"', () => {
 // They were inline template strings in both; a typo in either silently sent every detection
 // to a handler that didn't exist, with no error anywhere.
 
-test('cameraKey/objectSensorKey are stable and distinct', () => {
+test('cameraKey is stable and distinct per camera', () => {
   assert.equal(cameraKey('abc123'), 'abc123:camera');
-  assert.equal(objectSensorKey('abc123', 'person'), 'abc123:object:person');
-
-  // A camera key can never collide with one of its own object-sensor keys...
-  assert.notEqual(cameraKey('abc123'), objectSensorKey('abc123', 'camera'));
-  // ...nor can two different cameras or two different detection types collide.
   assert.notEqual(cameraKey('abc123'), cameraKey('abc124'));
-  assert.notEqual(objectSensorKey('abc123', 'person'), objectSensorKey('abc123', 'vehicle'));
-  assert.notEqual(objectSensorKey('abc123', 'person'), objectSensorKey('abc124', 'person'));
 });
 
-test('every planned object type produces a routable key', () => {
+test('every supported detection type survives planning in order', () => {
   const types = ['person', 'vehicle', 'animal', 'package'];
   const plan = planCameraAccessories([cam({ featureFlags: { smartDetectTypes: types } })], {})[0];
-  // What discovery creates must equal what event routing looks up, for every type.
-  for (const type of plan.objectTypes) {
-    assert.equal(objectSensorKey(plan.deviceId, type), `${plan.deviceId}:object:${type}`);
-  }
+  // These become the camera accessory's contact-sensor subtypes, and event routing looks them up
+  // by type string — so what planning reports and what the accessory builds must not drift.
   assert.deepEqual(plan.objectTypes, types);
 });
 
@@ -167,7 +157,6 @@ test('audio types with no native service produce no alarm sensor', () => {
 test('audioSensorKey is keyed by service and cannot collide with other sensors', () => {
   assert.equal(audioSensorKey('c1', 'smoke'), 'c1:audio:smoke');
   assert.notEqual(audioSensorKey('c1', 'smoke'), audioSensorKey('c1', 'carbonMonoxide'));
-  assert.notEqual(audioSensorKey('c1', 'smoke'), objectSensorKey('c1', 'smoke'));
   assert.notEqual(audioSensorKey('c1', 'smoke'), cameraKey('c1'));
 });
 
@@ -301,4 +290,64 @@ test('the filter never mutates or reorders the camera list it was given', () => 
   assert.deepEqual(input, three);
   assert.notEqual(selected, input);
   assert.deepEqual(selected.map((c) => c.id), ['aaa', 'ccc']);
+});
+
+// --- Malformed console payloads ----------------------------------------------
+// `smartDetectTypes` is typed `string[]`, but that is a promise about the API, not a fact about the
+// payload — and every entry becomes a HomeKit service or accessory named after it. The consolidated
+// layout puts them all on ONE accessory, which makes a bad shape here more expensive than it was.
+
+test('a bare string of detection types is rejected, not iterated per character', () => {
+  // The shape that made this worth guarding: `for..of` / `new Set` over "person" yields 'p','e','r'…
+  // which would have built sensors called "Front Door P", "Front Door E", "Front Door R".
+  const plan = planCameraAccessories([cam({ featureFlags: { smartDetectTypes: 'person' } })], {})[0];
+  assert.deepEqual(plan.objectTypes, []);
+});
+
+test('planning survives detection types of a wholly wrong type', () => {
+  // Previously these threw out of planning, losing EVERY camera over one odd field on one of them.
+  for (const types of [42, null, {}, true, { 0: 'person', length: 1 }]) {
+    const plan = planCameraAccessories([cam({ featureFlags: { smartDetectTypes: types } })], {})[0];
+    assert.deepEqual(plan.objectTypes, [], `types=${JSON.stringify(types)}`);
+  }
+});
+
+test('non-string and empty entries are dropped, and duplicates collapse', () => {
+  const plan = planCameraAccessories(
+    [cam({ featureFlags: { smartDetectTypes: ['person', 'person', '', null, 7, 'vehicle'] } })], {},
+  )[0];
+  // A duplicate would have two sensors fighting over one HAP subtype; '' would name a sensor
+  // "Front Door " and a non-string has no `charAt` for the label to call.
+  assert.deepEqual(plan.objectTypes, ['person', 'vehicle']);
+});
+
+test('the doorbell heuristic survives a malformed detection-type list', () => {
+  assert.equal(isDoorbell(cam({ lcdMessage: {}, featureFlags: { hasSpeaker: true, smartDetectTypes: 42 } })), false);
+  assert.equal(
+    isDoorbell(cam({ lcdMessage: {}, featureFlags: { hasSpeaker: true, smartDetectTypes: 'package' } })), false,
+    'a bare string must not satisfy the package check by substring',
+  );
+});
+
+test('a malformed enabled-types list is treated as unknown, not as "all disabled"', () => {
+  // Two failure modes, and the assertion has to discriminate both. A bare string satisfies
+  // `.includes` by SUBSTRING, so "person" would report vehicle as switched off in Protect and warn
+  // the user to enable a detection that is already on. A number has no `.includes` at all and threw
+  // out of planning, losing every camera. Note a one-type camera cannot tell these apart — it comes
+  // out `[]` either way — which is why this uses two.
+  const plan = (objectTypes) => planCameraAccessories(
+    [cam({ featureFlags: { smartDetectTypes: ['person', 'vehicle'] }, smartDetectSettings: { objectTypes } })], {},
+  )[0];
+  assert.deepEqual(plan('person').disabledObjectTypes, [], 'a bare string must not imply vehicle is off');
+  assert.deepEqual(plan(42).disabledObjectTypes, []);
+  assert.deepEqual(plan('person').objectTypes, ['person', 'vehicle'], 'the supported list is unaffected');
+  // A well-formed list still reports genuinely-disabled types — the guard must not blanket-clear it.
+  assert.deepEqual(plan(['person']).disabledObjectTypes, ['vehicle']);
+});
+
+test('a malformed audio-types list yields no alarm sensors rather than throwing', () => {
+  const plan = planCameraAccessories(
+    [cam({ smartDetectSettings: { audioTypes: 99 } })], { exposeAudioSensors: true },
+  )[0];
+  assert.deepEqual(plan.alarmKinds, []);
 });

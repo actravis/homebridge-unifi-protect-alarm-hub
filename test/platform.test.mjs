@@ -47,6 +47,14 @@ async function startPlatform(config = {}, clientState = {}, audioCodec = { encod
 }
 
 const names = (accessories) => accessories.map((a) => a.displayName).sort();
+/**
+ * The CAMERA-domain accessory with this name.
+ *
+ * Not `registered.find(byName)`: an alarm zone and a camera can legitimately share a name, so that
+ * resolves to whichever of two independent async flows happened to register first.
+ */
+const cameraNamed = (api, name) =>
+  api.registered.find((a) => a.context?.domain === 'camera' && a.displayName === name);
 const logged = (log, level) => log.entries.filter((e) => e.level === level).map((e) => e.msg);
 
 // --- Alarm reconcile ---------------------------------------------------------
@@ -187,15 +195,18 @@ test('a configured interval slower than the backstop is left alone', async () =>
 
 // --- Cameras -----------------------------------------------------------------
 
-test('cameras and their smart-detect sensors are registered', async () => {
+test('a camera is ONE accessory carrying a contact sensor per detection type', async () => {
   const { api } = await startPlatform(
     { exposeCameraStreams: false },
     { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person', 'package'] } })] },
   );
-  const registered = names(api.registered);
-  assert.ok(registered.includes('Front Yard'));
-  assert.ok(registered.includes('Front Yard Person'));
-  assert.ok(registered.includes('Front Yard Package'));
+  // The accessory count is the point: one per camera however many detections it supports, which is
+  // what keeps a large site under HomeKit's 149-per-bridge ceiling.
+  assert.deepEqual(names(api.registered).filter((n) => n.startsWith('Front Yard')), ['Front Yard']);
+
+  const cam = api.registered.find((a) => a.displayName === 'Front Yard');
+  assert.ok(cam.getServiceById(Service.ContactSensor, 'smartDetect.person'), 'person sensor');
+  assert.ok(cam.getServiceById(Service.ContactSensor, 'smartDetect.package'), 'package sensor');
 });
 
 test('a camera removed from Protect is pruned, and the alarm side is untouched', async () => {
@@ -222,22 +233,21 @@ test('pruning a camera shuts its handler down before dropping it', async () => {
     { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
   );
   const camUuid = api.registered.find((a) => a.displayName === 'Front Yard').UUID;
-  const objUuid = api.registered.find((a) => a.displayName === 'Front Yard Person').UUID;
   const stopped = [];
-  for (const [uuid, map] of [[camUuid, platform.cameraHandlers], [objUuid, platform.objectHandlers]]) {
-    const handler = map.get(uuid);
-    const real = handler.shutdown.bind(handler);
-    handler.shutdown = () => {
-      stopped.push(uuid);
-      real();
-    };
-  }
+  const handler = platform.cameraHandlers.get(camUuid);
+  const real = handler.shutdown.bind(handler);
+  // A pruned camera can hold a live ffmpeg transcode and pending safety-clear timers; once the map
+  // entry is gone nothing can reach them, so shutdown MUST happen before the drop.
+  handler.shutdown = () => {
+    stopped.push(camUuid);
+    real();
+  };
 
   state.cameras = [];
   clock.cameraInterval().fn();
   await flush();
 
-  assert.deepEqual(stopped.sort(), [camUuid, objUuid].sort());
+  assert.deepEqual(stopped, [camUuid]);
 });
 
 // --- Camera include/exclude filter -------------------------------------------
@@ -257,8 +267,7 @@ test('only the included cameras get accessories', async () => {
   );
   const registered = names(api.registered);
   assert.ok(registered.includes('Front Yard'));
-  assert.ok(registered.includes('Front Yard Person'));
-  // Not just the camera: an excluded camera must produce none of its derived sensors either.
+  // An excluded camera must produce no accessory at all.
   assert.ok(!registered.some((n) => n.startsWith('Back Yard')), `unexpected: ${registered.join(', ')}`);
 });
 
@@ -282,7 +291,7 @@ test('a camera added to the exclude list is pruned on the next discovery pass', 
   clock.cameraInterval().fn();
   await flush();
 
-  assert.deepEqual(names(api.unregistered), ['Front Yard', 'Front Yard Person']);
+  assert.deepEqual(names(api.unregistered), ['Front Yard']);
   assert.equal(state.cameras.length, 1, 'the camera is still on the console, only filtered out');
 });
 
@@ -303,13 +312,12 @@ test('a filter entry matching no camera warns once, not once per discovery pass'
   assert.ok(!warnings.some((m) => m.includes('front yard')), 'a matching entry must not warn');
 });
 
-test('a camera renamed in Protect renames its services and its object sensors', async () => {
+test('a camera renamed in Protect renames its services and its detection sensors', async () => {
   const { api, state, clock } = await startPlatform(
     { exposeCameraStreams: false },
     { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
   );
   const cam = api.registered.find((a) => a.displayName === 'Front Yard');
-  const person = api.registered.find((a) => a.displayName === 'Front Yard Person');
 
   state.cameras = [camera({ name: 'Driveway', featureFlags: { smartDetectTypes: ['person'] } })];
   clock.cameraInterval().fn();
@@ -319,8 +327,10 @@ test('a camera renamed in Protect renames its services and its object sensors', 
   // The service label matters as much as the accessory name: HomeKit reads both, and leaving
   // the old one there is how a renamed camera keeps showing its old name in the Home app.
   assert.equal(cam.getService(Service.MotionSensor).value(C.Name), 'Driveway');
-  assert.equal(person.displayName, 'Driveway Person');
-  assert.equal(person.getService(Service.MotionSensor).value(C.Name), 'Driveway Person');
+  // The detection sensors are labelled FROM the camera's name, so they have to follow it.
+  const person = cam.getServiceById(Service.ContactSensor, 'smartDetect.person');
+  assert.equal(person.value(C.Name), 'Driveway Person');
+  assert.equal(person.value(C.ConfiguredName), 'Driveway Person');
   assert.equal(api.unregistered.length, 0, 'a rename must not re-create the accessories');
 });
 
@@ -373,7 +383,6 @@ test('a disconnected camera keeps its accessory but is marked unavailable', asyn
     { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
   );
   const cam = api.registered.find((a) => a.displayName === 'Front Yard');
-  const person = api.registered.find((a) => a.displayName === 'Front Yard Person');
 
   state.cameras = [camera({ state: 'DISCONNECTED', featureFlags: { smartDetectTypes: ['person'] } })];
   clock.cameraInterval().fn();
@@ -381,7 +390,10 @@ test('a disconnected camera keeps its accessory but is marked unavailable', asyn
 
   assert.equal(api.unregistered.length, 0, 'an offline camera must not be pruned');
   assert.equal(cam.getService(Service.MotionSensor).value(C.StatusActive), false);
-  assert.equal(person.getService(Service.MotionSensor).value(C.StatusActive), false);
+  // The detection sensors are fed by the same event stream, so they are exactly as stale.
+  assert.equal(
+    cam.getServiceById(Service.ContactSensor, 'smartDetect.person').value(C.StatusActive), false,
+  );
   assert.ok(logged(log, 'warn').some((m) => /Front Yard.*disconnected/.test(m)));
 });
 
@@ -422,18 +434,20 @@ test('a motion event reaches the camera it belongs to', async () => {
   assert.equal(cam.getService(Service.MotionSensor).value(C.MotionDetected), false);
 });
 
-test('a smart detection reaches its own object sensor, not the camera', async () => {
+test('a smart detection trips its own contact sensor, not the camera motion sensor', async () => {
   const { api, state } = await startPlatform(
     { exposeCameraStreams: false },
     { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
   );
   const cam = api.registered.find((a) => a.displayName === 'Front Yard');
-  const person = api.registered.find((a) => a.displayName === 'Front Yard Person');
+  const person = cam.getServiceById(Service.ContactSensor, 'smartDetect.person');
 
   state.events.onEvent({ item: { type: 'smartDetectZone', device: 'cam-1', smartDetectTypes: ['person'] } });
 
-  assert.equal(person.getService(Service.MotionSensor).value(C.MotionDetected), true);
-  assert.notEqual(cam.getService(Service.MotionSensor).value(C.MotionDetected), true);
+  assert.equal(person.value(C.ContactSensorState), C.ContactSensorState.CONTACT_NOT_DETECTED);
+  // The camera's MotionSensor is HomeKit's singular "this camera detected motion" signal and drives
+  // its notifications; an object detection must not also claim it, or one event reports twice.
+  assert.equal(cam.getService(Service.MotionSensor).value(C.MotionDetected), false);
 });
 
 test('a ring from a camera we did not flag as a doorbell warns once with the fix', async () => {
@@ -494,9 +508,10 @@ test('discovery and event routing agree on the accessory id', async () => {
     { hubs: [hub()], cameras: [camera({ featureFlags: { smartDetectTypes: ['person'] } })] },
   );
   const cam = api.registered.find((a) => a.displayName === 'Front Yard');
-  const person = api.registered.find((a) => a.displayName === 'Front Yard Person');
   assert.equal(cam.UUID, generateUuid('cam-1:camera'));
-  assert.equal(person.UUID, generateUuid('cam-1:object:person'));
+  // Detections resolve to the SAME accessory and then to a subtyped service on it, so the routing
+  // key is the camera's — a detection landing anywhere else is the failure this guards.
+  assert.ok(cam.getServiceById(Service.ContactSensor, 'smartDetect.person'));
 });
 
 // --- Config gates + lifecycle ------------------------------------------------
@@ -856,8 +871,12 @@ test('twoWayAudio is declared only for cameras with a speaker', async () => {
       ],
     },
   );
+  // Scoped to the CAMERA domain deliberately: an alarm zone and a camera can share a name (the
+  // real console has both a "Front Door" zone and a "Front Door" doorbell), so a bare find-by-name
+  // resolves to whichever registered first — an ordering these two independent async flows do not
+  // and should not guarantee.
   const twoWay = (name) =>
-    api.registered.find((a) => a.displayName === name)?.controller?.config?.streamingOptions?.audio?.twoWayAudio;
+    cameraNamed(api, name)?.controller?.config?.streamingOptions?.audio?.twoWayAudio;
 
   assert.equal(twoWay('Front Door'), true, 'the doorbell has a speaker');
   assert.equal(twoWay('Gatehouse'), false, 'a speakerless camera must not offer a microphone');
@@ -871,7 +890,8 @@ test('exposeTalkback:false declares twoWayAudio nowhere, speaker or not', async 
       cameras: [{ id: 'bell', modelKey: 'camera', name: 'Front Door', featureFlags: { hasSpeaker: true } }],
     },
   );
-  const ctl = api.registered.find((a) => a.displayName === 'Front Door')?.controller;
+  // Camera-scoped: the hub fixture also has a zone called "Front Door".
+  const ctl = cameraNamed(api, 'Front Door')?.controller;
   assert.equal(ctl?.config?.streamingOptions?.audio?.twoWayAudio, false);
 });
 
@@ -900,21 +920,26 @@ test('exposeStatusLed:false creates no switch even on a capable camera', async (
     { exposeCameraStreams: false },
     { hubs: [hub()], cameras: [{ id: 'bell', modelKey: 'camera', name: 'Front Door', featureFlags: { hasLedStatus: true } }] },
   );
-  const acc = api.registered.find((a) => a.displayName === 'Front Door');
+  // Camera-scoped: the hub fixture also has a "Front Door" ZONE, which never has a switch — so a
+  // bare find-by-name would satisfy this assertion without ever looking at the camera.
+  const acc = cameraNamed(api, 'Front Door');
   assert.equal(acc?.getServiceById(Service.Switch, 'led'), undefined);
 });
 
 // Past HAP's 149-per-bridge limit HomeKit silently stops accepting accessories, which reads as
-// "some cameras are missing" with nothing to explain it. 6 accessories per camera with object and
-// audio sensors on means a 20-camera site plus a full alarm hub lands right at the edge.
+// "some cameras are missing" with nothing to explain it. A camera is ONE accessory, so reaching the
+// ceiling now takes a large site with the smoke/CO sensors on, or a hub contributing one per zone.
 test('the bridge warns once as it approaches the HomeKit accessory limit', async () => {
-  const many = Array.from({ length: 40 }, (_, i) => ({
+  // A camera is one accessory now, so reaching 130 takes a real site: 45 cameras with the smoke/CO
+  // sensors on is 45 x 3 = 135. That those two stay separate accessories is exactly why the ceiling
+  // is still reachable at all.
+  const many = Array.from({ length: 45 }, (_, i) => ({
     id: `cam${i}`, modelKey: 'camera', name: `Camera ${i}`,
     featureFlags: { smartDetectTypes: ['person', 'vehicle', 'animal'] },
-    smartDetectSettings: { objectTypes: ['person', 'vehicle', 'animal'] },
+    smartDetectSettings: { objectTypes: ['person', 'vehicle', 'animal'], audioTypes: ['alrmSmoke', 'alrmCmonx'] },
   }));
   const { log, clock } = await startPlatform(
-    { exposeCameraStreams: false, exposeObjectSensors: true },
+    { exposeCameraStreams: false, exposeObjectSensors: true, exposeAudioSensors: true },
     { hubs: [hub()], cameras: many },
   );
   const budget = () => logged(log, 'warn').filter((m) => /HomeKit's limit is 149/.test(m));
@@ -922,9 +947,9 @@ test('the bridge warns once as it approaches the HomeKit accessory limit', async
   // The remedy that keeps every accessory must be named FIRST; losing sensors is the fallback.
   assert.match(budget()[0], /child bridge/i, 'offers the split that keeps everything');
   assert.match(budget()[0], /exposeCameras|exposeAlarm|includeCameras/, 'says how to split');
-  assert.match(budget()[0], /exposeObjectSensors/, 'still says which setting reduces the count');
+  assert.match(budget()[0], /exposeAudioSensors/, 'still says which setting reduces the count');
   assert.ok(
-    budget()[0].indexOf('child bridge') < budget()[0].indexOf('exposeObjectSensors'),
+    budget()[0].indexOf('child bridge') < budget()[0].indexOf('exposeAudioSensors'),
     'the lossless fix must come before the lossy one',
   );
 
@@ -940,4 +965,409 @@ test('a small bridge gets no budget warning', async () => {
     { hubs: [hub()], cameras: [camera()] },
   );
   assert.equal(logged(log, 'warn').filter((m) => /accessor/i.test(m)).length, 0);
+});
+
+// --- One accessory per camera ------------------------------------------------
+// The layout the plugin commits to: a camera is a single HomeKit accessory whose smart detections
+// are ContactSensor services on it. There is no per-type-accessory alternative, so these pin the
+// properties that made it the right choice.
+
+const camWithTypes = (over = {}) => camera({
+  featureFlags: { smartDetectTypes: ['person', 'vehicle'] },
+  smartDetectSettings: { objectTypes: ['person', 'vehicle'] },
+  ...over,
+});
+
+test('a camera is ONE accessory however many detection types it supports', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camWithTypes()] },
+  );
+  const cameraSide = names(api.registered).filter((n) => n.startsWith('Front Yard'));
+  assert.deepEqual(cameraSide, ['Front Yard'], `expected only the camera, got: ${cameraSide.join(', ')}`);
+});
+
+test('a detection trips its contact sensor and clears on the end event', async () => {
+  const { api, state } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camWithTypes()] },
+  );
+  const cam = api.registered.find((a) => a.displayName === 'Front Yard');
+  const person = cam.getServiceById(Service.ContactSensor, 'smartDetect.person');
+  assert.ok(person, 'the camera carries a person contact sensor');
+
+  state.events.onEvent({ item: { type: 'smartDetectZone', device: 'cam-1', smartDetectTypes: ['person'] } });
+  assert.equal(person.value(C.ContactSensorState), C.ContactSensorState.CONTACT_NOT_DETECTED);
+  // The camera's own motion signal stays untouched — that is the point of using contact sensors.
+  // Asserted as exactly false, not merely "not true": construction seeds it false, so `notEqual`
+  // would also pass on an unwritten characteristic and prove nothing about the routing.
+  assert.equal(cam.getService(Service.MotionSensor).value(C.MotionDetected), false);
+
+  state.events.onEvent({ item: { type: 'smartDetectZone', device: 'cam-1', smartDetectTypes: ['person'], end: 9 } });
+  assert.equal(person.value(C.ContactSensorState), C.ContactSensorState.CONTACT_DETECTED);
+});
+
+// Turning the feature off must not leave a control HomeKit still shows and nothing can drive.
+test('exposeObjectSensors:false removes the detection sensors, keeping the camera', async () => {
+  const { api, platform, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camWithTypes()] },
+  );
+  const cam = api.registered.find((a) => a.displayName === 'Front Yard');
+  assert.ok(cam.getServiceById(Service.ContactSensor, 'smartDetect.person'));
+
+  platform.config.exposeObjectSensors = false;
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.equal(
+    cam.getServiceById(Service.ContactSensor, 'smartDetect.person'), undefined,
+    'a dead contact sensor would still appear in the Home app with nothing driving it',
+  );
+  assert.equal(api.unregistered.length, 0, 'the camera accessory itself stays');
+  assert.ok(cam.getService(Service.MotionSensor), 'overall motion survives');
+});
+
+// Documented behaviour worth pinning: the OBJECT sensors live on the camera, but the smoke/CO
+// sensors deliberately stay their own accessories, because HomeKit treats a native SmokeSensor as a
+// critical alert — which is the only reason to expose them. The README and CHANGELOG both state the
+// resulting count, so a silent change here would make the docs wrong.
+test('smoke/CO stay separate accessories while object sensors do not', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false, exposeAudioSensors: true },
+    {
+      hubs: [hub()],
+      cameras: [camera({
+        featureFlags: { smartDetectTypes: ['person', 'vehicle'] },
+        smartDetectSettings: { objectTypes: ['person', 'vehicle'], audioTypes: ['alrmSmoke'] },
+      })],
+    },
+  );
+  const mine = names(api.registered).filter((n) => n.startsWith('Front Yard'));
+  assert.deepEqual(mine, ['Front Yard', 'Front Yard Smoke Alarm']);
+
+  const cam = api.registered.find((a) => a.displayName === 'Front Yard');
+  assert.ok(cam.getServiceById(Service.ContactSensor, 'smartDetect.person'), 'objects live on the camera');
+});
+
+// --- Malformed console payloads ----------------------------------------------
+// A successful request can still carry an unusable body: `request()` returns undefined for an empty
+// 200, and a proxy or firmware change can answer with a JSON object. Measured before the fix: five
+// such shapes each reached an unhandled rejection through `void this.syncDevices()`, which Node
+// treats as fatal — the whole bridge died with a bare TypeError and nothing about chimes in the log.
+//
+// The property that matters most is NOT "does not crash". It is "does not prune". Every reconciler
+// reconciles against the payload it just read, so coercing a bad one to [] would read as "every
+// device was removed" and unregister the user's accessories, losing their rooms and automations.
+// That would be worse than the crash. These pin the failed-read behaviour instead.
+
+const badPayloads = [
+  ['an empty 200 body', undefined],
+  ['a JSON object', {}],
+  ['a bare string', 'oops'],
+  ['a list with a junk entry', [null]],
+  ['a list entry with no id', [{ name: 'nameless' }]],
+];
+
+for (const [label, payload] of badPayloads) {
+  test(`a /cameras response of ${label} leaves existing cameras registered`, async () => {
+    const { api, platform, clock, client } = await startPlatform(
+      { exposeCameraStreams: false },
+      { hubs: [hub()], cameras: [camera()] },
+    );
+    assert.ok(names(api.registered).includes('Front Yard'), 'registered on the good pass');
+
+    client.getCameras = async () => payload;
+    clock.cameraInterval().fn();
+    await flush();
+
+    assert.deepEqual(api.unregistered, [], 'a bad payload must never prune a camera');
+    assert.ok(platform.cameraHandlers.size > 0, 'the handler must survive to keep driving the tile');
+  });
+
+  test(`a /chimes response of ${label} leaves existing chimes registered`, async () => {
+    const cfg = { exposeCameras: false, exposeChimes: true, chimeTriggerId: 'trig-1', exposeCameraStreams: false };
+    const { api, clock, client } = await startPlatform(cfg, { hubs: [hub()], chimes: [{ id: 'ch-1', name: 'Hallway Chime' }] });
+    assert.ok(names(api.registered).includes('Hallway Chime'), 'registered on the good pass');
+
+    client.getChimes = async () => payload;
+    clock.cameraInterval().fn();
+    await flush();
+
+    assert.deepEqual(api.unregistered, [], 'a bad payload must never prune a chime');
+  });
+}
+
+test('an unreadable payload is reported once, and recovery is announced', async () => {
+  const { log, clock, client } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  const unreadable = () => logged(log, 'warn').filter((m) => /could not read/.test(m));
+
+  client.getCameras = async () => ({});
+  clock.cameraInterval().fn();
+  await flush();
+  assert.equal(unreadable().length, 1, 'the user must be told, not just the debug log');
+
+  // Every 5 minutes forever would be log spam, so it reports the transition only.
+  clock.cameraInterval().fn();
+  await flush();
+  assert.equal(unreadable().length, 1, 'reported once while it persists');
+
+  client.getCameras = async () => [camera()];
+  clock.cameraInterval().fn();
+  await flush();
+  assert.ok(logged(log, 'info').some((m) => /Camera discovery recovered/.test(m)), 'recovery is loud too');
+});
+
+// One odd camera used to abort the whole pass, so EVERY camera vanished from HomeKit — and the only
+// trace was a debug line. A cosmetic field must not cost the user their other cameras.
+test('a camera with a non-string name does not cost the other cameras', async () => {
+  const { api } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera(), camera({ id: 'cam-2', name: 42 })] },
+  );
+  assert.ok(names(api.registered).includes('Front Yard'), 'the healthy camera still appears');
+  assert.equal(api.registered.filter((a) => a.context?.domain === 'camera').length, 2);
+});
+
+// The outer safety net. `syncDevices` was called as a bare `void`, so anything throwing inside it
+// became an unhandled rejection — fatal in Node. The chime reconcile is the half with no try/catch
+// of its own, so a throw there is what actually reaches this net. If it were missing, node:test
+// would report an unhandled rejection rather than these assertions failing.
+test('an unexpected throw in a discovery pass is reported, not fatal', async () => {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  const client = fakeClient({ hubs: [hub()], chimes: [{ id: 'ch-1', name: 'Hallway Chime' }] });
+  const boom = new Error('HAP said no');
+  // From the accessory constructor, not from registration: a registration failure is now handled
+  // inside acquireAccessory (logged, retried next pass) and deliberately does NOT reach this net.
+  api.platformAccessory = function failing() {
+    throw boom;
+  };
+  new UnifiProtectPlatform(
+    log,
+    {
+      platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key',
+      exposeCameras: false, exposeChimes: true, chimeTriggerId: 'trig-1',
+    },
+    api,
+    { createClient: () => client, probeAudioCodec: async () => undefined, ...clock.deps },
+  );
+  api.emit('didFinishLaunching');
+  await flush(8);
+
+  const reported = logged(log, 'error').filter((m) => /Device discovery failed unexpectedly/.test(m));
+  assert.equal(reported.length, 1, 'a defect here must be reportable, not silent');
+  assert.match(reported[0], /HAP said no/, 'the cause is preserved, not flattened');
+});
+
+// undici's Agent.close() rejects (ClientDestroyedError) when the agent is already closed. A bare
+// `void` on it made that an unhandled rejection during shutdown; node:test would surface one here.
+test('a failure closing the console connection does not escape shutdown', async () => {
+  const { platform, client, log } = await startPlatform({ exposeCameras: false }, { hubs: [hub()] });
+  client.close = async () => {
+    throw new Error('The client is destroyed');
+  };
+
+  platform.api.emit('shutdown');
+  await flush();
+
+  assert.ok(
+    logged(log, 'debug').some((m) => /Closing the console connection failed/.test(m)),
+    'the failure is recorded rather than thrown into the void',
+  );
+});
+
+// A resync queued mid-pass is normally right: an events-socket reconnect during a slow discovery
+// must still be honoured. But once Homebridge has asked us to stop, honouring it means a fresh round
+// of console requests against a tearing-down bridge.
+test('a resync queued as Homebridge shuts down is abandoned', async () => {
+  const { platform, api, client, clock } = await startPlatform(
+    { exposeCameraStreams: false, exposeChimes: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+  // Gate the next fetch so the pass is still in flight while we queue a resync and shut down.
+  let release = () => {};
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  client.getCameras = async () => {
+    client.state.calls.getCameras += 1;
+    await gate;
+    return [camera()];
+  };
+  const before = client.state.calls.getCameras;
+
+  clock.cameraInterval().fn(); // pass 1 — now parked on the gate
+  await flush();
+  clock.cameraInterval().fn(); // pass 2 — sees one in flight, so queues a resync
+  await flush();
+  api.emit('shutdown');
+  release();
+  await flush(8);
+
+  assert.equal(
+    client.state.calls.getCameras - before, 1,
+    'the queued resync must not fetch again after shutdown',
+  );
+  assert.equal(platform.stopped, true);
+});
+
+// Reaching the outer net means a defect, so it has to be reportable — but repeating every discovery
+// interval forever would bury the log it is meant to help someone read.
+test('an unexpected discovery failure is reported once, then only at debug', async () => {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  const client = fakeClient({ hubs: [hub()], chimes: [{ id: 'ch-1', name: 'Hallway Chime' }] });
+  // Thrown from the accessory CONSTRUCTOR, not from registration: `acquireAccessory` caches the
+  // accessory before registering it, so a registration failure does not recur on the next pass.
+  // This one does, which is what makes "once, then quietly" observable at all.
+  api.platformAccessory = function failing() {
+    throw new Error('HAP said no');
+  };
+  new UnifiProtectPlatform(
+    log,
+    {
+      platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key',
+      exposeCameras: false, exposeChimes: true, chimeTriggerId: 'trig-1',
+    },
+    api,
+    { createClient: () => client, probeAudioCodec: async () => undefined, ...clock.deps },
+  );
+  api.emit('didFinishLaunching');
+  await flush(8);
+
+  clock.cameraInterval().fn(); // it fails the same way every pass
+  await flush(8);
+
+  const errors = logged(log, 'error').filter((m) => /Device discovery failed unexpectedly/.test(m));
+  const debugs = logged(log, 'debug').filter((m) => /Device discovery failed unexpectedly/.test(m));
+  assert.equal(errors.length, 1, 'loud exactly once');
+  assert.ok(debugs.length >= 1, 'still recorded on later passes, just quietly');
+});
+
+
+// A transient registration failure used to hide the accessory FOREVER: the plugin cached it before
+// registering, so it believed the accessory existed while HomeKit had never received it, and the
+// cache hit meant no pass ever tried again. Nothing was logged either.
+test('an accessory HomeKit refuses is retried on the next pass, not lost', async () => {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  const client = fakeClient({ hubs: [], cameras: [camera()] });
+  const realRegister = api.registerPlatformAccessories.bind(api);
+  let failNext = true;
+  api.registerPlatformAccessories = (...args) => {
+    if (failNext) {
+      failNext = false;
+      throw new Error('HAP registration failed');
+    }
+    return realRegister(...args);
+  };
+  new UnifiProtectPlatform(
+    log,
+    { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key', exposeCameraStreams: false, exposeChimes: false },
+    api,
+    { createClient: () => client, probeAudioCodec: async () => undefined, ...clock.deps },
+  );
+  api.emit('didFinishLaunching');
+  await flush(8);
+
+  assert.equal(api.registered.length, 0, 'the failure really did stop it reaching HomeKit');
+  assert.ok(
+    logged(log, 'warn').some((m) => /HomeKit refused the accessory "Front Yard"/.test(m)),
+    'and the user is told which accessory, rather than it vanishing silently',
+  );
+
+  clock.cameraInterval().fn();
+  await flush(8);
+
+  assert.deepEqual(names(api.registered), ['Front Yard'], 'the next pass registers it for real');
+});
+
+// One device HomeKit will not accept must not cost the others their pass.
+test('a refused accessory does not stop the rest of the cameras registering', async () => {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  const client = fakeClient({
+    hubs: [],
+    cameras: [camera(), camera({ id: 'cam-2', name: 'Back Yard' })],
+  });
+  const realRegister = api.registerPlatformAccessories.bind(api);
+  api.registerPlatformAccessories = (plugin, platformName, accessories) => {
+    if (accessories.some((a) => a.displayName === 'Front Yard')) {
+      throw new Error('HAP registration failed');
+    }
+    return realRegister(plugin, platformName, accessories);
+  };
+  new UnifiProtectPlatform(
+    log,
+    { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key', exposeCameraStreams: false, exposeChimes: false },
+    api,
+    { createClient: () => client, probeAudioCodec: async () => undefined, ...clock.deps },
+  );
+  api.emit('didFinishLaunching');
+  await flush(8);
+
+  assert.deepEqual(names(api.registered), ['Back Yard'], 'the healthy camera is unaffected');
+  assert.deepEqual(api.unregistered, [], 'and the refused one is not pruned either');
+});
+
+// --- Pruning is one implementation for every caller --------------------------
+// Three near-identical prune loops had drifted: the chime reconcile's copy skipped the handler
+// shutdown, and the feature-off copy never cleared the audio-sensor handlers. Both are the kind of
+// gap that is invisible until the handler grows background work or a stale entry gets routed to.
+
+test('a pruned chime has its handler shut down before it is dropped', async () => {
+  const cfg = { exposeCameras: false, exposeChimes: true, chimeTriggerId: 'trig-1', exposeCameraStreams: false };
+  const { platform, api, client, clock } = await startPlatform(cfg, {
+    hubs: [hub()],
+    chimes: [{ id: 'ch-1', name: 'Hallway Chime' }],
+  });
+  const id = api.registered.find((a) => a.displayName === 'Hallway Chime').UUID;
+  let shutdownCalled = false;
+  const handler = platform.chimeHandlers.get(id);
+  const real = handler.shutdown.bind(handler);
+  handler.shutdown = () => {
+    shutdownCalled = true;
+    real();
+  };
+
+  client.state.chimes = [];
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.deepEqual(names(api.unregistered), ['Hallway Chime']);
+  assert.equal(shutdownCalled, true, 'once the map entry is gone nothing can reach the handler');
+  assert.equal(platform.chimeHandlers.size, 0);
+});
+
+test('switching a domain off clears every handler map, not just the obvious one', async () => {
+  const { platform, api, clock } = await startPlatform(
+    { exposeCameraStreams: false, exposeAudioSensors: true },
+    {
+      hubs: [hub()],
+      cameras: [camera({ smartDetectSettings: { audioTypes: ['alrmSmoke'] } })],
+    },
+  );
+  assert.ok(names(api.registered).includes('Front Yard Smoke Alarm'), 'the audio sensor exists first');
+  assert.equal(platform.alarmHandlers.size, 1);
+
+  // Driven through the real discovery interval, not by poking a private method: an optional call
+  // like `platform.syncCameras?.()` silently becomes a no-op if the method is ever renamed, and the
+  // test would keep passing while testing nothing.
+  platform.config.exposeCameras = false;
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.ok(names(api.unregistered).includes('Front Yard Smoke Alarm'));
+  assert.equal(
+    platform.alarmHandlers.size, 0,
+    'a leftover handler is one realtime routing can still find, writing to a removed accessory',
+  );
 });

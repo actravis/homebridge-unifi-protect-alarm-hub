@@ -48,19 +48,15 @@ export interface CameraPlan {
 }
 
 /**
- * Accessory-key seeds for a camera and its per-type smart-detect sensors.
+ * Accessory-key seed for a camera.
  *
- * These are hashed into HomeKit UUIDs in two independent places — where accessories are created
- * and where realtime detections are routed to them. Building the strings inline in both spots
- * meant a typo in either would silently route every detection to nothing, with no error. Keep
- * them here so the two sides cannot drift.
+ * Hashed into a HomeKit UUID in two independent places — where the accessory is created and where
+ * realtime detections are routed to it. Building the string inline in both spots meant a typo in
+ * either would silently route every detection to nothing, with no error. Keep it here so the two
+ * sides cannot drift.
  */
 export function cameraKey(deviceId: string): string {
   return `${deviceId}:camera`;
-}
-
-export function objectSensorKey(deviceId: string, objectType: string): string {
-  return `${deviceId}:object:${objectType}`;
 }
 
 /**
@@ -84,10 +80,12 @@ export function audioSensorKey(deviceId: string, kind: SensorKind): string {
 /**
  * Restrict which cameras this platform instance manages.
  *
- * The reason this exists is HomeKit's 149-accessory-per-bridge limit. With object and audio sensors
- * enabled this plugin creates up to 6 accessories per camera, so a large site hits the ceiling and
- * HomeKit silently stops accepting accessories. Splitting the cameras across two platform instances,
- * each in its own Homebridge child bridge, gives each its own budget — and that needs a filter.
+ * The reason this exists is HomeKit's 149-accessory-per-bridge limit, past which HomeKit silently
+ * stops accepting accessories. A camera is one accessory, so that ceiling is far away for most
+ * sites — but a big install, especially with `exposeAudioSensors` adding smoke/CO sensors or a large
+ * alarm hub contributing one per zone, can still reach it. Splitting the cameras across two platform
+ * instances, each in its own Homebridge child bridge, gives each its own budget — and that needs a
+ * filter.
  *
  * It doubles as a privacy control: a camera left out is not exposed to HomeKit at all.
  */
@@ -113,7 +111,7 @@ function entrySet(value: unknown): Set<string> {
 }
 
 const matches = (camera: Camera, set: Set<string>): boolean =>
-  set.has(camera.id.toLowerCase()) || (camera.name !== undefined && set.has(camera.name.trim().toLowerCase()));
+  set.has(camera.id.toLowerCase()) || (typeof camera.name === 'string' && set.has(camera.name.trim().toLowerCase()));
 
 /**
  * Apply the include/exclude filter.
@@ -134,7 +132,9 @@ export function selectCameras(
   const seen = new Set<string>();
   for (const c of cameras) {
     seen.add(c.id.toLowerCase());
-    if (c.name) {
+    // Typed `string | undefined`, but a non-string here has no `.trim()` and used to throw out of
+    // the whole discovery pass — so a single odd camera silently removed EVERY camera from HomeKit.
+    if (typeof c.name === 'string' && c.name) {
       seen.add(c.name.trim().toLowerCase());
     }
   }
@@ -177,7 +177,9 @@ export function isDoorbell(camera: Camera, config: CameraPlanConfig = {}): boole
     return true;
   }
   const flags = camera.featureFlags;
-  return flags?.hasSpeaker === true && flags.smartDetectTypes?.includes('package') === true;
+  // Via the shape check, not `smartDetectTypes?.includes(...)` directly: a non-array value there
+  // has no `includes` and would throw out of planning, losing every camera over one odd field.
+  return flags?.hasSpeaker === true && supportedObjectTypes(flags.smartDetectTypes).includes('package');
 }
 
 /**
@@ -189,21 +191,50 @@ export function isCameraOnline(camera: Camera): boolean {
   return camera.state !== 'DISCONNECTED';
 }
 
+/**
+ * The detection types this camera supports, as reported by the console — shape-checked.
+ *
+ * `smartDetectTypes` is declared `string[]`, but that is a promise about the API, not a fact about
+ * the payload, and every type here becomes a HomeKit service or accessory named after it. The two
+ * shapes that matter: a bare string (were Protect ever to send `"person"` instead of `["person"]`)
+ * iterates per CHARACTER, producing a sensor called "Front Door P", another called "Front Door E",
+ * and so on; a non-array non-string throws out of the caller and takes the whole camera sync with
+ * it. Duplicates are dropped for the same reason — two entries of one type would fight over a
+ * single HAP subtype.
+ *
+ * Deliberately a shape check and NOT an allow-list of known types: Protect keeps adding detections,
+ * and `decodeCameraEvent` matches the whole `smart*` family precisely so a new one arrives working.
+ * An allow-list here would undo that. The count needs no cap — it is bounded by Protect's detection
+ * catalogue (a handful), and a console inventing hundreds is a compromised console, which has more
+ * direct routes to misbehaviour than this one.
+ */
+function supportedObjectTypes(types: unknown): string[] {
+  if (!Array.isArray(types)) {
+    return [];
+  }
+  return [...new Set(types.filter((type): type is string => typeof type === 'string' && type.length > 0))];
+}
+
 export function planCameraAccessories(cameras: Camera[], config: CameraPlanConfig = {}): CameraPlan[] {
   if (config.exposeCameras === false) {
     return [];
   }
   return cameras.map((camera) => {
-    const supported = config.exposeObjectSensors === false ? [] : camera.featureFlags?.smartDetectTypes ?? [];
+    const supported = config.exposeObjectSensors === false
+      ? []
+      : supportedObjectTypes(camera.featureFlags?.smartDetectTypes);
     // `smartDetectSettings.objectTypes` is what's actually switched on; featureFlags is only what
-    // the hardware can do. An absent settings block means "unknown" — assume everything is on.
-    const enabled = camera.smartDetectSettings?.objectTypes;
+    // the hardware can do. An absent settings block means "unknown" — assume everything is on, and
+    // a malformed one is treated the same rather than reported as "every detection is disabled".
+    const settings = camera.smartDetectSettings;
+    const enabled = Array.isArray(settings?.objectTypes) ? supportedObjectTypes(settings.objectTypes) : undefined;
+    const audioTypes = Array.isArray(settings?.audioTypes) ? supportedObjectTypes(settings.audioTypes) : undefined;
     return {
       deviceId: camera.id,
-      name: camera.name ?? 'Camera',
+      name: typeof camera.name === 'string' && camera.name ? camera.name : 'Camera',
       isDoorbell: isDoorbell(camera, config),
       objectTypes: supported,
-      alarmKinds: config.exposeAudioSensors === true ? alarmSensorKinds(camera.smartDetectSettings?.audioTypes) : [],
+      alarmKinds: config.exposeAudioSensors === true ? alarmSensorKinds(audioTypes) : [],
       online: isCameraOnline(camera),
       hasSpeaker: camera.featureFlags?.hasSpeaker === true,
       lcdMessage: camera.lcdMessage,
