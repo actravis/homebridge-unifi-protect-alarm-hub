@@ -141,6 +141,18 @@ side gained a substantial round of reliability and security work.
 
 ### Fixed
 
+- **A console restart no longer costs you your accessories.** A device missing from a *successful*
+  discovery read was unregistered on the spot — and unregistering discards the accessory's room
+  assignment and every automation using it, which re-adding the device does not restore. But a
+  successful read is not proof a device is gone: a console mid-reboot or mid-adoption answers `200`
+  with a short list, or an empty one. A disappearance is now a claim that has to be confirmed by a
+  later pass, with the console steady in between, before anything irreversible happens. Two
+  independent conditions, because they fail apart: the delay answers "has it been gone long enough?",
+  the steadiness check answers "is the console trustworthy enough to be believed right now?" — and a
+  console that leaves and returns mid-delay satisfies the first while failing the second. New
+  `deviceRemovalDelay` (seconds, default 300; `0` restores the old behaviour). Removals you *asked*
+  for — switching a feature off, or excluding a camera the console still reports — are never delayed,
+  since leaving those in place would be an accessory the plugin no longer drives.
 - **An unreadable response from the console can no longer take Homebridge down, or delete your
   accessories.** A request that succeeded but carried an unusable body — an empty `200`, or a JSON
   object where a list was expected — reached an unhandled rejection, which Node treats as fatal: the

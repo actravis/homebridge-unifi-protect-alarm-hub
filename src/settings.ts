@@ -34,6 +34,16 @@ export interface ProtectConfig extends PlatformConfig {
   /** Never expose these cameras (device ID or name, case-insensitive). Applied after the include list. */
   excludeCameras?: string[];
   /**
+   * Seconds a device must stay missing from the console before its accessory is removed — default
+   * 300, `0` removes on sight.
+   *
+   * Removing an accessory discards its room assignment and any automation using it, and re-adding
+   * the device does not restore them. A console that is mid-restart can answer successfully with an
+   * incomplete list, so the default waits for a second pass to agree before doing anything
+   * irreversible. Does not delay removals you asked for by changing config.
+   */
+  deviceRemovalDelay?: number;
+  /**
    * Expose per-type smart-detect sensors (person/vehicle/animal/package) — default on.
    *
    * They are ContactSensor services on the camera's own accessory, not accessories of their own, so

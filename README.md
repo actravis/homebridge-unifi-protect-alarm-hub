@@ -78,6 +78,14 @@ plugin. The two coexist fine.
   without a restart; a camera Protect reports as disconnected is marked unavailable in HomeKit
   rather than left showing a stale picture.
 
+  A device that stops being reported is **not** removed straight away. Removing an accessory also
+  discards its room assignment and any automation using it, and re-adding the device does not bring
+  those back — so a device has to stay missing across a second discovery pass, with the console
+  steady in between, before anything irreversible happens. That means a console reboot no longer
+  costs you your setup. Tune it with `deviceRemovalDelay` (seconds, default 300; `0` removes on
+  sight). Removals you ask for by changing settings — switching a feature off, or adding a camera to
+  `excludeCameras` — are never delayed.
+
 ## Roadmap
 
 - **Devices & settings** — lights, sensors, liveviews, and camera setting switches.

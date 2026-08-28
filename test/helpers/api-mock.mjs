@@ -21,10 +21,18 @@ function generateUuid(seed) {
 export function fakeClock() {
   const intervals = [];
   const timeouts = [];
+  // Starts well above 0 so code that treats a zero timestamp as "unset" cannot pass by accident.
+  let nowMs = 1_700_000_000_000;
   return {
     intervals,
     timeouts,
+    /** Move the clock forward. Fires nothing on its own — run the intervals you want by hand. */
+    advance(ms) {
+      nowMs += ms;
+    },
+    now: () => nowMs,
     deps: {
+      now: () => nowMs,
       setInterval(fn, ms) {
         const handle = { fn, ms, cleared: false };
         intervals.push(handle);

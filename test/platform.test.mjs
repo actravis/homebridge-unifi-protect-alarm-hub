@@ -47,6 +47,19 @@ async function startPlatform(config = {}, clientState = {}, audioCodec = { encod
 }
 
 const names = (accessories) => accessories.map((a) => a.displayName).sort();
+
+/**
+ * Run the discovery pass that actually removes a device gone missing.
+ *
+ * A missing device is only marked on the pass that first notices it; removal needs a later pass,
+ * past both the removal grace and the discovery-stability window. Tests that care about the
+ * *reconciled* end state go through here, so the delay is stated once rather than in each of them.
+ */
+async function passAfterGrace(clock) {
+  clock.advance(301_000);
+  clock.cameraInterval().fn();
+  await flush();
+}
 /**
  * The CAMERA-domain accessory with this name.
  *
@@ -217,9 +230,11 @@ test('a camera removed from Protect is pruned, and the alarm side is untouched',
   assert.ok(names(api.registered).includes('Front Yard'));
 
   state.cameras = [];
-  clock.cameraInterval().fn(); // camera re-discovery
+  clock.cameraInterval().fn(); // camera re-discovery: notices it is gone, but does not act yet
   await flush();
+  assert.deepEqual(api.unregistered, [], 'one missing report is not proof the camera is gone');
 
+  await passAfterGrace(clock);
   assert.deepEqual(names(api.unregistered), ['Front Yard']);
 });
 
@@ -246,6 +261,7 @@ test('pruning a camera shuts its handler down before dropping it', async () => {
   state.cameras = [];
   clock.cameraInterval().fn();
   await flush();
+  await passAfterGrace(clock);
 
   assert.deepEqual(stopped, [camUuid]);
 });
@@ -269,6 +285,125 @@ test('only the included cameras get accessories', async () => {
   assert.ok(registered.includes('Front Yard'));
   // An excluded camera must produce no accessory at all.
   assert.ok(!registered.some((n) => n.startsWith('Back Yard')), `unexpected: ${registered.join(', ')}`);
+});
+
+// --- Removal grace -----------------------------------------------------------
+//
+// Unregistering is the one irreversible thing this plugin does: it takes the accessory's room
+// assignment and every automation using it, and re-adding the device does not bring them back. A
+// console that is mid-restart can answer 200 with a short or empty list, so a single successful
+// read claiming a device is gone must never be enough to act on.
+
+test('an empty camera list does not unregister anything on the pass that first sees it', async () => {
+  const { api, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera(), camera({ id: 'cam-2', name: 'Back Yard' })] },
+  );
+  assert.equal(api.registered.filter((a) => a.context?.domain === 'camera').length, 2);
+
+  // The shape a console mid-reboot produces: a successful request, an empty body.
+  state.cameras = [];
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.deepEqual(api.unregistered, [], 'an empty 200 must not be read as "every camera was removed"');
+});
+
+// Passes are not always a discovery interval apart — an events-socket reconnect resyncs cameras on
+// the spot — so "seen missing twice" must not be enough on its own. It is the deadline that decides.
+test('a camera missing on two passes inside the grace is still not removed', async () => {
+  const { api, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+
+  state.cameras = [];
+  clock.cameraInterval().fn();
+  await flush();
+
+  clock.advance(100_000); // still short of the 300s grace
+  clock.cameraInterval().fn();
+  await flush();
+  assert.deepEqual(api.unregistered, [], 'a second sighting inside the grace must not remove it');
+
+  clock.advance(250_000); // now past it
+  clock.cameraInterval().fn();
+  await flush();
+  assert.deepEqual(names(api.unregistered), ['Front Yard']);
+});
+
+test('a camera that comes back within the grace is not removed, and its clock is reset', async () => {
+  const { api, log, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+
+  state.cameras = [];
+  clock.cameraInterval().fn();
+  await flush();
+
+  // Back before the deadline — the console was only briefly unable to report it.
+  state.cameras = [camera()];
+  clock.advance(60_000);
+  clock.cameraInterval().fn();
+  await flush();
+  assert.deepEqual(api.unregistered, []);
+  assert.ok(logged(log, 'info').some((m) => /is back; it will not be removed/.test(m)));
+
+  // It goes missing again LATER than the original deadline. If the first mark had merely been left
+  // in place, this pass would remove it immediately; a cleared mark makes this a first sighting.
+  state.cameras = [];
+  clock.advance(301_000);
+  clock.cameraInterval().fn();
+  await flush();
+  assert.deepEqual(api.unregistered, [], 'the returning camera must have cleared its old deadline');
+});
+
+// The grace asks "has it been gone long enough?"; this asks "is the console steady enough to be
+// believed?". They come apart exactly here — and this is the case that matters, because a console
+// that just came back is the one most likely to answer with an incomplete list.
+test('a removal that is due still waits when discovery has just recovered', async () => {
+  const { api, state, clock } = await startPlatform(
+    { exposeCameraStreams: false },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+
+  state.cameras = [];
+  clock.cameraInterval().fn();
+  await flush();
+
+  // The console goes away for a while. The read fails, so this pass changes nothing either way.
+  clock.advance(301_000);
+  state.camerasError = new Error('timeout');
+  clock.cameraInterval().fn();
+  await flush();
+  assert.deepEqual(api.unregistered, []);
+
+  // It returns, still not reporting the camera. The grace has long since expired, but this is the
+  // first read after a disruption and must not be trusted to delete anything.
+  state.camerasError = undefined;
+  clock.cameraInterval().fn();
+  await flush();
+  assert.deepEqual(api.unregistered, [], 'the first read after a recovery must not remove anything');
+
+  // Once it has held steady past the stability window, the removal is finally allowed.
+  clock.advance(61_000);
+  clock.cameraInterval().fn();
+  await flush();
+  assert.deepEqual(names(api.unregistered), ['Front Yard']);
+});
+
+test('deviceRemovalDelay: 0 removes on sight', async () => {
+  const { api, state, clock } = await startPlatform(
+    { exposeCameraStreams: false, deviceRemovalDelay: 0 },
+    { hubs: [hub()], cameras: [camera()] },
+  );
+
+  state.cameras = [];
+  clock.cameraInterval().fn();
+  await flush();
+
+  assert.deepEqual(names(api.unregistered), ['Front Yard']);
 });
 
 test('excludeCameras drops a camera that would otherwise be exposed', async () => {
@@ -766,6 +901,9 @@ test('a chime removed from Protect is pruned', async () => {
   state.chimes = [];
   clock.cameraInterval().fn();
   await flush();
+  assert.deepEqual(api.unregistered, [], 'one missing report is not proof the chime is gone');
+
+  await passAfterGrace(clock);
   assert.deepEqual(names(api.unregistered), ['Doorbell Chime']);
 });
 
@@ -1341,6 +1479,7 @@ test('a pruned chime has its handler shut down before it is dropped', async () =
   client.state.chimes = [];
   clock.cameraInterval().fn();
   await flush();
+  await passAfterGrace(clock);
 
   assert.deepEqual(names(api.unregistered), ['Hallway Chime']);
   assert.equal(shutdownCalled, true, 'once the map entry is gone nothing can reach the handler');

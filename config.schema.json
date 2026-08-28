@@ -206,6 +206,14 @@
         "default": false,
         "description": "Talk from the Home app to a camera's speaker. Requires camera audio, a camera with a speaker, and a network route from Homebridge to the camera itself (the talkback target is the camera's own IP, not the console's)."
       },
+      "deviceRemovalDelay": {
+        "title": "Delay before removing a missing device (seconds)",
+        "type": "integer",
+        "default": 300,
+        "minimum": 0,
+        "description": "How long a camera or chime must stay missing from the console before its HomeKit accessory is removed. Removing an accessory also discards its room assignment and any automation using it, and re-adding the device does not bring those back — so the plugin waits for a second discovery pass to agree before doing anything irreversible, which keeps a console reboot from costing you your setup. Set to 0 to remove immediately. Removals you ask for by changing settings here are never delayed.",
+        "placeholder": "300"
+      },
       "refreshInterval": {
         "title": "Fallback refresh interval (seconds)",
         "type": "integer",
@@ -378,6 +386,7 @@
       "expandable": true,
       "expanded": false,
       "items": [
+        "deviceRemovalDelay",
         "refreshInterval",
         "useRealtime",
         {

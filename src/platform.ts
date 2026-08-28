@@ -59,6 +59,31 @@ const ACCESSORY_WARN_AT = 130;
 const DEVICE_DISCOVERY_SECONDS = 300;
 
 /**
+ * How long a device must stay missing from the console before its accessory is unregistered.
+ *
+ * Unregistering is the one genuinely destructive thing this plugin does: it takes the user's room
+ * assignment and every automation referencing the accessory with it, and re-adding the device does
+ * NOT bring those back. A successful read is not proof a device is gone — a console mid-reboot or
+ * mid-adoption can answer 200 with a short list, or an empty one — so a disappearance is treated as
+ * a claim to be confirmed by a later pass rather than acted on at once.
+ *
+ * The default spans two discovery passes, so a device has to be absent twice, minutes apart.
+ * Configurable via `deviceRemovalDelay`; 0 restores the old remove-on-sight behaviour.
+ */
+const DEVICE_REMOVAL_GRACE_SECONDS = 300;
+
+/**
+ * How long discovery must have been healthy before any graced removal is allowed to fire.
+ *
+ * Separate from the grace above and not redundant with it: the grace answers "has it been gone long
+ * enough?", this answers "is the console currently trustworthy enough to be believed about it?".
+ * They come apart exactly when it matters — a console that goes away and comes back mid-grace
+ * returns a list we should not act on destructively, however long the device has been missing.
+ * Also covers startup, where the very first read is the least trustworthy one we ever take.
+ */
+const REMOVAL_STABILITY_SECONDS = 60;
+
+/**
  * The I/O boundaries the platform owns, injectable so discovery, reconcile and the poll
  * cadence can be unit-tested without a console or real timers — the same pattern
  * {@link ProtectClient}'s `deps` uses. Homebridge never passes this; production gets
@@ -74,6 +99,12 @@ export interface PlatformDeps {
   setInterval: (fn: () => void, ms: number) => NodeJS.Timeout;
   clearInterval: (handle: NodeJS.Timeout) => void;
   setTimeout: (fn: () => void, ms: number) => NodeJS.Timeout;
+  /**
+   * Wall clock for the removal grace and stability window. Injected for the same reason
+   * {@link ProtectClient} injects one: a test asserting "not yet, then yes" must be able to move
+   * time without waiting minutes for it.
+   */
+  now: () => number;
 }
 
 const REAL_PLATFORM_DEPS: PlatformDeps = {
@@ -82,6 +113,7 @@ const REAL_PLATFORM_DEPS: PlatformDeps = {
   setInterval: (fn, ms) => setInterval(fn, ms),
   clearInterval: (handle) => clearInterval(handle),
   setTimeout: (fn, ms) => setTimeout(fn, ms),
+  now: () => Date.now(),
 };
 
 export class UnifiProtectPlatform implements DynamicPlatformPlugin {
@@ -112,6 +144,17 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
    * Keyed by the label {@link readDeviceList} is called with.
    */
   private readonly discoveryOk = new Map<string, boolean>();
+  /**
+   * When each device class's discovery last became healthy, keyed by the same label as
+   * {@link discoveryOk}. Reset on every failure, so the stability window restarts after any
+   * disruption rather than counting time across one.
+   */
+  private readonly discoveryHealthySince = new Map<string, number>();
+  /**
+   * Accessories seen missing from a successful read, and the time they may be unregistered.
+   * Keyed by accessory UUID. An entry disappears the moment its device comes back.
+   */
+  private readonly pendingRemovals = new Map<string, number>();
   private readonly warnedTypes = new Set<string>();
   private readonly warnedRingDevices = new Set<string>();
   private readonly warnedDisabledDetections = new Set<string>();
@@ -647,7 +690,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       desired.add(id);
       let handler = this.chimeHandlers.get(id);
       if (!handler) {
-        const accessory = this.acquireAccessory(id, plan.name, Categories.SWITCH, 'chime');
+        const accessory = this.acquireAccessory(id, plan.name, Categories.SWITCH, 'chime', plan.deviceId);
         if (!accessory) {
           continue; // registration failed; it stays in `desired` so nothing prunes it meanwhile
         }
@@ -663,7 +706,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       handler.update(plan);
     }
 
-    this.pruneDomain('chime', 'no longer on the console', desired);
+    this.pruneDomain('chime', 'no longer on the console', desired, new Set(chimes.map((c) => c.id)));
   }
 
   /** Discover cameras and create/prune their accessories, serialising overlapping requests. */
@@ -746,7 +789,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       this.syncAudioSensors(plan, desired);
     }
 
-    this.pruneDomain('camera', 'no longer on the console', desired);
+    // `cameras`, not `selected`: a camera the console still reports but the filter excludes is a
+    // config decision and goes at once, while a camera that truly vanished gets the grace period.
+    this.pruneDomain('camera', 'no longer on the console', desired, new Set(cameras.map((c) => c.id)));
     this.forgetVanishedCameras(selected);
   }
 
@@ -782,6 +827,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       } else {
         this.log.debug(message);
       }
+      // Any failure restarts the stability window: whatever the next successful read says, it is
+      // the first one after a disruption and must not be trusted to delete anything.
+      this.discoveryHealthySince.delete(label);
       return undefined;
     }
     if (this.stopped) {
@@ -797,11 +845,17 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
         );
       }
       this.log.debug(`Unusable ${path} payload: ${redactPayload(devices)}`);
+      this.discoveryHealthySince.delete(label);
       return undefined;
     }
     if (!healthy) {
       this.discoveryOk.set(label, true);
       this.log.info(`${label} discovery recovered.`);
+    }
+    // Stamped on the FIRST healthy read and left alone while it stays healthy, so this measures how
+    // long the class has been continuously good — not how long since the last pass.
+    if (!this.discoveryHealthySince.has(label)) {
+      this.discoveryHealthySince.set(label, this.deps.now());
     }
     // Justified by the guard above: it proves every entry is an object with a string id, which is
     // all this function promises. Field-level shape is each planner's business.
@@ -898,7 +952,7 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
         ? Categories.VIDEO_DOORBELL
         : Categories.CAMERA
       : Categories.SENSOR;
-    const accessory = this.acquireAccessory(camId, plan.name, category);
+    const accessory = this.acquireAccessory(camId, plan.name, category, 'camera', plan.deviceId);
     if (!accessory) {
       return false;
     }
@@ -944,7 +998,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       desired.add(alarmId);
       const name = `${plan.name} ${alarmKindLabel(kind)}`;
       if (!this.alarmHandlers.has(alarmId)) {
-        const accessory = this.acquireAccessory(alarmId, name, Categories.SENSOR);
+        // The camera's device ID, not a per-sensor one: these live and die with their camera, so
+        // the prune loop should judge them by whether that camera is still on the console.
+        const accessory = this.acquireAccessory(alarmId, name, Categories.SENSOR, 'camera', plan.deviceId);
         if (!accessory) {
           continue; // registration failed; it stays in `desired` so nothing prunes it meanwhile
         }
@@ -1013,22 +1069,109 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
    * looks functional but cannot work" failure. Reconciling to an empty set is the only safe way to
    * skip a domain.
    */
-  private pruneDomain(domain: 'camera' | 'chime', reason: string, keep?: Set<string>): void {
+  private pruneDomain(
+    domain: 'camera' | 'chime',
+    reason: string,
+    keep?: Set<string>,
+    onConsole?: Set<string>,
+  ): void {
+    // A device that came back cancels its pending removal. Done before the sweep so a device that
+    // reappeared in this very pass can never be removed by it.
+    for (const id of keep ?? []) {
+      if (this.pendingRemovals.delete(id)) {
+        this.log.info(`"${this.accessories.get(id)?.displayName ?? id}" is back; it will not be removed.`);
+      }
+    }
     // Snapshot: unregistering mutates the map we are iterating.
     for (const [id, accessory] of [...this.accessories]) {
       if (accessory.context.domain !== domain || keep?.has(id)) {
         continue;
       }
-      this.shutdownHandler(id);
-      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-      this.accessories.delete(id);
-      // EVERY handler map, not just the domain's obvious one: an entry left behind is a handler
-      // realtime routing can still find, writing to an accessory HomeKit no longer has.
-      this.cameraHandlers.delete(id);
-      this.alarmHandlers.delete(id);
-      this.chimeHandlers.delete(id);
-      this.log.info(`Removed ${domain} accessory "${accessory.displayName}" (${reason}).`);
+      const deviceId = (accessory.context as { deviceId?: unknown }).deviceId;
+      const stillOnConsole = typeof deviceId === 'string' && onConsole?.has(deviceId) === true;
+      if (keep && this.deferRemoval(domain, id, accessory.displayName, stillOnConsole)) {
+        continue;
+      }
+      this.removeAccessory(domain, id, accessory, reason);
     }
+  }
+
+  /**
+   * Whether this accessory's removal should wait, marking it on the first sighting.
+   *
+   * Only reconcile-driven removals are deferred. A prune with no `keep` set is the user switching a
+   * feature off, and a device the console still reports but config now excludes (`stillOnConsole`)
+   * is the user editing a filter — both are explicit intent with a deterministic answer, so they
+   * take effect at once. Leaving those lingering would be its own bug: an accessory the plugin no
+   * longer drives is a control that looks functional and cannot work.
+   *
+   * An accessory cached before this version carries no device ID, so `stillOnConsole` is false and
+   * it takes the graced path. That is the right way round to be wrong: the cost is a late removal,
+   * where the other way costs the user their automations.
+   */
+  private deferRemoval(
+    domain: 'camera' | 'chime',
+    uuid: string,
+    name: string,
+    stillOnConsole: boolean,
+  ): boolean {
+    const graceMs = this.removalGraceMs();
+    if (graceMs <= 0 || stillOnConsole) {
+      this.pendingRemovals.delete(uuid);
+      return false;
+    }
+    const now = this.deps.now();
+    const deadline = this.pendingRemovals.get(uuid);
+    if (deadline === undefined) {
+      this.pendingRemovals.set(uuid, now + graceMs);
+      this.log.info(
+        `"${name}" is no longer reported by the console. Waiting ${Math.round(graceMs / 1000)}s ` +
+          'before removing it, in case the console is only mid-restart.',
+      );
+      return true;
+    }
+    if (now < deadline) {
+      return true;
+    }
+    // Gone long enough — but only act on a console that has been steady since. A read taken just
+    // after a reconnect is exactly the one most likely to be short.
+    if (!this.discoveryStable(domain)) {
+      this.log.debug(`Removal of "${name}" is due, but ${domain} discovery has not been steady long enough.`);
+      return true;
+    }
+    return false;
+  }
+
+  /** The configured removal grace in ms. Non-numeric or negative config falls back to the default. */
+  private removalGraceMs(): number {
+    const configured = Number(this.config.deviceRemovalDelay);
+    const seconds = Number.isFinite(configured) && configured >= 0 ? configured : DEVICE_REMOVAL_GRACE_SECONDS;
+    return seconds * 1000;
+  }
+
+  /** True once this device class's discovery has been healthy for the full stability window. */
+  private discoveryStable(domain: 'camera' | 'chime'): boolean {
+    const since = this.discoveryHealthySince.get(domain === 'camera' ? 'Camera' : 'Chime');
+    return since !== undefined && this.deps.now() - since >= REMOVAL_STABILITY_SECONDS * 1000;
+  }
+
+  /** Shut the handler down, unregister the accessory, and forget every trace of it. */
+  private removeAccessory(
+    domain: 'camera' | 'chime',
+    uuid: string,
+    accessory: PlatformAccessory,
+    reason: string,
+  ): void {
+    this.shutdownHandler(uuid);
+    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    this.accessories.delete(uuid);
+    this.pendingRemovals.delete(uuid);
+    // EVERY handler map, not just the domain's obvious one: an entry left behind is a handler
+    // realtime routing can still find, writing to an accessory HomeKit no longer has.
+    this.cameraHandlers.delete(uuid);
+    this.alarmHandlers.delete(uuid);
+    this.chimeHandlers.delete(uuid);
+    this.log.info(`Removed ${domain} accessory "${accessory.displayName}" (${reason}).`);
   }
 
   private shutdownHandler(uuid: string): void {
@@ -1093,11 +1236,15 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
     name: string,
     category: number,
     domain: 'camera' | 'chime' = 'camera',
+    deviceId?: string,
   ): PlatformAccessory | undefined {
     let accessory = this.accessories.get(uuid);
     if (!accessory) {
       accessory = new this.api.platformAccessory(name, uuid, category);
       accessory.context.domain = domain;
+      // Recorded so the prune loop can tell "the console no longer reports this device" from "config
+      // now filters it out" — the first deserves a grace period, the second does not.
+      accessory.context.deviceId = deviceId;
       try {
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       } catch (err) {
@@ -1113,6 +1260,9 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
       this.log.info(`Added accessory "${name}".`);
     } else {
       accessory.context.domain = domain; // ensure a restored cached accessory is tagged
+      // Backfill for accessories cached before device IDs were recorded, so they stop taking the
+      // conservative unknown-device path on the very next pass.
+      accessory.context.deviceId = deviceId;
       // Category is baked into the cached accessory. Turning `exposeCameraStreams` on for a
       // camera that was first discovered as a plain sensor would otherwise leave it showing a
       // sensor tile forever, because reuse skipped the constructor that sets this.
