@@ -243,8 +243,14 @@
       "certificateSha256": {
         "title": "Pin certificate (SHA-256)",
         "type": "string",
-        "description": "Optional, most secure. Paste the console's certificate SHA-256 fingerprint (64 hex characters, colons optional) to pin it. When set, only that exact certificate is accepted and the setting above is ignored. A malformed value stops the plugin rather than silently falling back to no pinning.",
+        "description": "Optional. Paste the console's certificate SHA-256 fingerprint (64 hex characters, colons optional) to pin it. Only that exact certificate is accepted, and the setting above is ignored. Note this must be updated by hand whenever the console's certificate is reissued — if you have your own CA, the option below is stronger and needs no maintenance. A malformed value stops the plugin rather than silently falling back to no pinning.",
         "pattern": "^$|^([0-9a-fA-F]{2}:){31}[0-9a-fA-F]{2}$|^[0-9a-fA-F]{64}$"
+      },
+      "caCertificate": {
+        "title": "Verify against your own CA",
+        "type": "string",
+        "description": "Optional, and the strongest setting here if you run your own certificate authority. Give the path to your CA certificate on the Homebridge host (e.g. /Users/you/ca/homeCA.crt), or paste the PEM itself. The plugin then verifies the console's whole certificate chain instead of trusting it blindly, and — unlike a fingerprint pin — keeps working when the console's certificate is reissued, since your CA does not change. Hostname verification is on too, so the host you entered above must appear in the console certificate's subject-alternative names (a bare IP needs an IP SAN). Overrides 'Trust console certificate'; can be combined with a pin, in which case both must match. If the file cannot be read the plugin stops rather than quietly connecting unverified.",
+        "placeholder": "/path/to/ca.crt"
       }
     }
   },
@@ -397,6 +403,7 @@
         },
         "trustSelfSignedCert",
         "certificateSha256",
+        "caCertificate",
         "name"
       ]
     }

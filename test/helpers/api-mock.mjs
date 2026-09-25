@@ -101,6 +101,8 @@ export function fakeClient(overrides = {}) {
 
   const client = {
     state,
+    // The real client resolves this from the TLS policy; the platform logs it verbatim at startup.
+    tlsDescription: 'verifying the console certificate against the system trust store',
     async getVersion() {
       return state.version;
     },

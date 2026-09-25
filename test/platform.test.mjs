@@ -667,6 +667,72 @@ test('missing credentials leave the plugin idle instead of half-started', async 
   assert.equal(api.registered.length, 0);
 });
 
+// --- TLS wiring --------------------------------------------------------------
+
+test('a caCertificate path is read once and handed to the client', async () => {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  const client = fakeClient({ hubs: [] });
+  const reads = [];
+  let received;
+  new UnifiProtectPlatform(
+    log,
+    { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key', caCertificate: '/ca/homeCA.crt' },
+    api,
+    {
+      createClient: (opts) => {
+        received = opts;
+        return client;
+      },
+      probeAudioCodec: async () => undefined,
+      readTextFile: (path) => {
+        reads.push(path);
+        return '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----';
+      },
+      ...clock.deps,
+    },
+  );
+  assert.deepEqual(reads, ['/ca/homeCA.crt']);
+  assert.match(received.caCertificate, /BEGIN CERTIFICATE/, 'the PEM itself reaches the client, not the path');
+});
+
+// Falling back to an unverified connection here would leave the user believing a CA was in force.
+// Idle is the honest outcome: loud, and impossible to mistake for working.
+test('an unreadable caCertificate leaves the plugin idle rather than connecting unverified', async () => {
+  const log = makeLog();
+  const api = fakeApi();
+  const clock = fakeClock();
+  new UnifiProtectPlatform(
+    log,
+    { platform: 'UnifiProtectIntegration', host: '10.0.0.1', apiKey: 'key', caCertificate: '/nope/ca.crt' },
+    api,
+    {
+      createClient: () => assert.fail('must not build a client with a CA it could not read'),
+      probeAudioCodec: async () => undefined,
+      readTextFile: () => {
+        throw new Error('ENOENT: no such file or directory');
+      },
+      ...clock.deps,
+    },
+  );
+  api.emit('didFinishLaunching');
+  await flush();
+
+  const errors = logged(log, 'error');
+  assert.ok(errors.some((m) => /caCertificate could not be read/.test(m)), 'names the setting at fault');
+  assert.ok(errors.some((m) => /Plugin is idle/.test(m)));
+  assert.equal(api.registered.length, 0);
+});
+
+test('the TLS posture is reported at startup, whatever it is', async () => {
+  const { log } = await startPlatform({ exposeCameraStreams: false }, { hubs: [hub()], cameras: [] });
+  assert.ok(
+    logged(log, 'info').some((m) => /^TLS: verifying the console certificate/.test(m)),
+    'a user who believes they are verifying and is not has no other way to find out',
+  );
+});
+
 test('exposeAlarm:false exposes cameras only and never polls the hub', async () => {
   const { api, state, clock } = await startPlatform(
     { exposeAlarm: false, exposeCameraStreams: false },

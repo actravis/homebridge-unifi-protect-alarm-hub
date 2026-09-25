@@ -99,4 +99,12 @@ export interface ProtectConfig extends PlatformConfig {
   trustSelfSignedCert?: boolean;
   /** Optional SHA-256 cert fingerprint to pin (hex, colons optional). Overrides trustSelfSignedCert. */
   certificateSha256?: string;
+  /**
+   * Path to a CA certificate (PEM), or the PEM itself, to verify the console's certificate against.
+   *
+   * The strongest option, and the low-maintenance one: unlike a fingerprint pin it keeps working
+   * when the console's certificate is reissued, because the CA does not change. Turns on hostname
+   * verification too, so `host` must match a SAN on the console's certificate.
+   */
+  caCertificate?: string;
 }

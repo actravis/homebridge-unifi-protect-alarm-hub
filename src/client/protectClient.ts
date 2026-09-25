@@ -5,6 +5,11 @@ import type {
   TalkbackSession,
 } from '../types';
 import { computeRetryDelay, exponentialBackoff, jitter, reconnectDelay, reserveSlot } from './timing';
+import { resolveTlsPolicy, type TlsPolicy } from './tlsPolicy';
+
+// Re-exported because it is part of this client's public surface and was imported from here before
+// the TLS decision moved into its own module.
+export { loadCaCertificate, normalizeFingerprint, resolveTlsPolicy } from './tlsPolicy';
 
 /** Undici's Response type (avoids depending on the DOM lib for a global `Response`). */
 type FetchResponse = Awaited<ReturnType<typeof fetch>>;
@@ -54,6 +59,12 @@ export interface ClientDeps {
   /** Cancelable one-shot timer for the realtime liveness watchdog; returns a canceller. */
   setWatchdog: (fn: () => void, ms: number) => () => void;
   createWebSocket: (url: string, init: { headers: Record<string, string>; dispatcher: Agent }) => WebSocketLike;
+  /**
+   * Builds the TLS connector. Injected so a test can assert what the resolved TLS policy actually
+   * hands to undici — the step between "the policy says verify" and "the socket verifies", which is
+   * where a silent downgrade would live and which no test of the pure policy can reach.
+   */
+  buildConnector: typeof buildConnector;
 }
 
 const REAL_DEPS: ClientDeps = {
@@ -67,6 +78,7 @@ const REAL_DEPS: ClientDeps = {
     return () => clearTimeout(handle);
   },
   createWebSocket: (url, init) => new WebSocket(url, init) as unknown as WebSocketLike,
+  buildConnector,
 };
 
 export class ProtectApiError extends Error {
@@ -85,6 +97,12 @@ export interface ProtectClientOptions {
   /** Optional SHA-256 fingerprint to pin (hex, colons optional). Takes precedence over trustSelfSignedCert. */
   certificateSha256?: string;
   /**
+   * A CA certificate in PEM form to validate the console's certificate against. Turns on full chain
+   * AND hostname verification, so `host` must match a SAN on the console's certificate. Overrides
+   * `trustSelfSignedCert`; composes with `certificateSha256` (both are then enforced).
+   */
+  caCertificate?: string;
+  /**
    * Force a realtime reconnect if no frame arrives within this window (ms). Off by default
    * ({@link DEFAULT_WS_LIVENESS_MS}): this API sends no keepalives, so idle ≠ dead and TCP
    * keepalive already catches dead peers. Only set this if your deployment has reliably
@@ -95,28 +113,6 @@ export interface ProtectClientOptions {
 
 /** Give up after this many retries on 429 / 5xx / transport errors. */
 const MAX_RETRIES = 3;
-
-/**
- * Normalise a user-supplied SHA-256 certificate fingerprint to bare lowercase hex.
- *
- * Blank/absent means "not pinning" and returns undefined. Anything else MUST be a valid
- * fingerprint: a value that merely *looks* wrong (truncated paste, base64, a string of colons)
- * used to strip down to an empty string and silently fall through to the unpinned path — so the
- * user believed pinning was on while the client accepted any certificate. Fail closed instead.
- */
-export function normalizeFingerprint(value: string | undefined): string | undefined {
-  if (value === undefined || value.trim() === '') {
-    return undefined;
-  }
-  const hex = value.replace(/[\s:]/g, '').toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(hex)) {
-    throw new Error(
-      'certificateSha256 is not a valid SHA-256 fingerprint (expected 64 hex characters, ' +
-        'optionally colon-separated). Refusing to start rather than silently skip pinning.',
-    );
-  }
-  return hex;
-}
 
 /**
  * Default: app-level idle watchdog is OFF (0).
@@ -143,6 +139,12 @@ export class ProtectClient {
   private readonly wsBase: string;
   private readonly headers: Record<string, string>;
   private readonly dispatcher: Agent;
+  private readonly tlsPolicy: TlsPolicy;
+  /**
+   * Plain-language summary of how this client verifies the console, for the startup log. A TLS
+   * posture the user cannot see is one they cannot notice is wrong.
+   */
+  readonly tlsDescription: string;
   private readonly timeoutMs: number;
   /** Silence window before the liveness watchdog forces a realtime reconnect. */
   private readonly wsLivenessMs: number;
@@ -166,29 +168,37 @@ export class ProtectClient {
     this.headers = { 'X-API-KEY': opts.apiKey, Accept: 'application/json' };
     this.timeoutMs = opts.timeoutMs ?? 10_000;
     this.wsLivenessMs = opts.realtimeIdleTimeoutMs ?? DEFAULT_WS_LIVENESS_MS;
+    // Resolved before the connector is built, and it can throw (a malformed pin, an unreadable CA).
+    // Throwing from here is deliberate: the caller keeps the plugin idle rather than letting it run
+    // with weaker TLS than was asked for.
+    this.tlsPolicy = resolveTlsPolicy(opts);
+    this.tlsDescription = this.tlsPolicy.description;
     // Scoped to this client's connections only — NOT a global TLS override.
     this.dispatcher = new Agent({
-      connect: this.buildConnect(opts),
+      connect: this.buildConnect(),
       headersTimeout: this.timeoutMs,
       bodyTimeout: this.timeoutMs,
     });
   }
 
-  private buildConnect(opts: ProtectClientOptions) {
+  private buildConnect() {
     // TCP keepalive so the OS detects a silently-dead peer and closes the socket (→ reconnect).
     // The Integration API sends NO application-level keepalive frames (measured: zero over 60s
     // of active use), so this transport-level probe — not inbound data — is our liveness signal.
     const keepalive = { keepAlive: true, keepAliveInitialDelay: 60_000 };
-    const pinned = normalizeFingerprint(opts.certificateSha256);
+    const policy = this.tlsPolicy;
+    const base = this.deps.buildConnector({
+      ...keepalive,
+      rejectUnauthorized: policy.rejectUnauthorized,
+      ...(policy.ca ? { ca: policy.ca } : {}),
+      ...(policy.maxCachedSessions !== undefined ? { maxCachedSessions: policy.maxCachedSessions } : {}),
+    });
+    const pinned = policy.pinnedFingerprint;
     if (!pinned) {
-      // Fail closed when the caller didn't decide: only an explicit `true` disables validation.
-      return buildConnector({ ...keepalive, rejectUnauthorized: opts.trustSelfSignedCert !== true });
+      return base;
     }
-    // Pinning: skip CA validation and verify the fingerprint ourselves on every handshake.
-    // maxCachedSessions:0 disables TLS session resumption — on a resumed session
-    // getPeerCertificate() returns an empty object, which would fail the fingerprint check
-    // on every reused connection (only the first, full handshake would pass).
-    const base = buildConnector({ ...keepalive, rejectUnauthorized: false, maxCachedSessions: 0 });
+    // Pinning rides on top of whatever chain validation the policy chose: with a CA the connection
+    // must satisfy both, without one the fingerprint is the whole proof of identity.
     const connect: typeof base = (options, callback) =>
       base(options, (err, socket) => {
         if (err || !socket) {

@@ -26,6 +26,19 @@ side gained a substantial round of reliability and security work.
 
 ### Security
 
+- **Verify the console against your own CA — new `caCertificate`.** Point it at a CA certificate
+  (path or PEM) and the plugin validates the console's entire chain and its hostname, instead of
+  trusting a self-signed certificate blindly. It is both stronger and *less* work than the existing
+  fingerprint pin, which has to be re-pasted by hand every time the console's certificate is
+  reissued; a CA does not change when its leaf certificates are renewed. The two compose — set both
+  and the console must satisfy both. A CA also overrides "trust console certificate", because
+  supplying one is a request to be verified and honouring the weaker setting silently is the exact
+  failure this is here to prevent. Note that hostname verification comes with it, so the configured
+  host must appear in the certificate's subject-alternative names. An unreadable CA file stops the
+  plugin rather than letting it connect unverified.
+- **The TLS posture is now logged at startup, whichever one you are in.** Previously only the
+  unverified case said anything, so "verifying against my CA" and "silently ignored your setting"
+  looked identical from the outside.
 - **Updated `undici` to 6.28.0**, clearing three advisories against the plugin's only runtime
   dependency — most relevantly response desynchronisation via the retry interceptor, which this
   client uses. Also updated a dev-only transitive dependency (`brace-expansion`).

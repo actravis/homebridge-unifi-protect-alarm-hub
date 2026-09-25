@@ -8,7 +8,8 @@ import type {
 } from 'homebridge';
 
 import { PLATFORM_NAME, PLUGIN_NAME, type ProtectConfig } from './settings';
-import { ProtectApiError, ProtectClient, type ProtectClientOptions } from './client/protectClient';
+import { readFileSync } from 'node:fs';
+import { loadCaCertificate, ProtectApiError, ProtectClient, type ProtectClientOptions } from './client/protectClient';
 import type { AccessoryHandler, AlarmHub, Camera, ProtectEvent } from './types';
 import { SecuritySystemAccessory } from './accessories/securitySystem';
 import { HubAccessory, ReadonlyContactAccessory, ZoneAccessory } from './accessories/sensors';
@@ -105,6 +106,8 @@ export interface PlatformDeps {
    * time without waiting minutes for it.
    */
   now: () => number;
+  /** Reads the CA certificate file, injected so the loader is testable without a real filesystem. */
+  readTextFile: (path: string) => string;
 }
 
 const REAL_PLATFORM_DEPS: PlatformDeps = {
@@ -114,6 +117,7 @@ const REAL_PLATFORM_DEPS: PlatformDeps = {
   clearInterval: (handle) => clearInterval(handle),
   setTimeout: (fn, ms) => setTimeout(fn, ms),
   now: () => Date.now(),
+  readTextFile: (path) => readFileSync(path, 'utf8'),
 };
 
 export class UnifiProtectPlatform implements DynamicPlatformPlugin {
@@ -218,17 +222,22 @@ export class UnifiProtectPlatform implements DynamicPlatformPlugin {
         apiKey: config.apiKey,
         trustSelfSignedCert: config.trustSelfSignedCert !== false,
         certificateSha256: config.certificateSha256,
+        // Loaded here rather than inside the client so a bad path is reported before anything
+        // connects, and so the client stays free of filesystem access.
+        caCertificate: loadCaCertificate(config.caCertificate, this.deps.readTextFile),
         realtimeIdleTimeoutMs: Number.isFinite(idleTimeout) && idleTimeout > 0 ? idleTimeout * 1000 : undefined,
       });
     } catch (err) {
-      // e.g. a malformed certificate pin. Stay idle rather than run with weaker TLS than asked for.
+      // A malformed pin, or a CA the plugin cannot read. Stay idle rather than run with weaker TLS
+      // than was asked for — silently downgrading is the failure these checks exist to prevent.
       this.log.error(`${(err as Error).message} Plugin is idle.`);
       return;
     }
 
-    if (!config.certificateSha256 && config.trustSelfSignedCert !== false) {
-      this.log.info('Trusting the console\'s self-signed certificate without pinning; set "certificateSha256" to pin it.');
-    }
+    // Always stated, whatever the posture. A user who believes they are verifying and is not has no
+    // other way to find out; the previous version only spoke up in the one unverified case, so the
+    // stronger postures were indistinguishable from a plugin that had ignored the setting.
+    this.log.info(`TLS: ${this.client.tlsDescription}.`);
 
     this.api.on('didFinishLaunching', () => this.start());
     this.api.on('shutdown', () => this.stop());

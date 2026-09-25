@@ -330,9 +330,26 @@ the platform end to end without a console, a HomeKit controller, or real timers.
   revocable token — if it leaks, revoke it in the UniFi UI. (Note: UniFi API keys are
   currently console-wide, so treat it as sensitive and keep your Homebridge host locked
   down.)
-- UniFi consoles use self-signed certificates; the plugin trusts the configured console
-  only (scoped to the plugin, not a global TLS override). Set `certificateSha256` to pin
-  the exact certificate for the strongest posture.
+- **TLS.** UniFi consoles ship self-signed certificates, so by default the plugin trusts the
+  configured console without verifying it — scoped to this plugin's own connections, never a
+  global TLS override. Whatever posture you end up with is stated in the log at startup, so
+  you can tell at a glance rather than assuming. Three ways to do better, strongest first:
+
+  | Setting | What it does | Upkeep |
+  | --- | --- | --- |
+  | `caCertificate` | Verifies the console's whole chain against your CA, and its hostname | None — survives certificate reissues |
+  | `certificateSha256` | Accepts exactly one certificate, by fingerprint | Must be re-pinned by hand on every reissue |
+  | `trustSelfSignedCert: false` | Verifies against the system trust store | Needs a publicly-trusted certificate |
+
+  **If you run your own CA, use `caCertificate`** — give it the path to your CA certificate on
+  the Homebridge host, or paste the PEM. It is stronger than pinning *and* lower maintenance,
+  because reissuing the console's certificate doesn't change the CA that signed it. The two
+  compose if you want both: set each and the console must satisfy both.
+
+  Because a CA turns on hostname verification, the `host` you configure has to appear in the
+  console certificate's subject-alternative names — a bare IP needs an IP SAN, not just a DNS
+  one. If the CA file can't be read, the plugin stops with an error rather than quietly
+  connecting unverified.
 
 ## License
 

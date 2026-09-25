@@ -37,6 +37,47 @@ test('a malformed pin makes the client refuse to construct', () => {
   );
 });
 
+// The step between "the policy says verify" and "the socket verifies". No test of the pure policy
+// reaches it, and it is exactly where a silent downgrade would sit: the options handed to undici.
+test('the resolved TLS policy is what actually reaches undici', () => {
+  const seen = [];
+  const deps = {
+    fetch: async () => makeResponse({}),
+    now: () => 0,
+    setTimer: (fn) => fn(),
+    setWatchdog: () => () => {},
+    createWebSocket: () => ({ addEventListener() {}, close() {} }),
+    buildConnector: (options) => {
+      seen.push(options);
+      return () => {};
+    },
+  };
+  const PEM = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----';
+
+  new ProtectClient({ host: 'h', apiKey: 'k', caCertificate: PEM }, deps);
+  assert.equal(seen.at(-1).ca, PEM, 'the CA must reach the connector, or nothing is verified against it');
+  assert.equal(seen.at(-1).rejectUnauthorized, true);
+
+  // A CA plus the trust-anything flag: the strong setting has to win all the way down, not just in
+  // the policy object.
+  new ProtectClient({ host: 'h', apiKey: 'k', caCertificate: PEM, trustSelfSignedCert: true }, deps);
+  assert.equal(seen.at(-1).rejectUnauthorized, true);
+  assert.equal(seen.at(-1).ca, PEM);
+
+  // Pinning needs a full handshake every time, or getPeerCertificate() comes back empty.
+  new ProtectClient({ host: 'h', apiKey: 'k', certificateSha256: 'a'.repeat(64) }, deps);
+  assert.equal(seen.at(-1).maxCachedSessions, 0);
+
+  // The plain path must not smuggle a CA in, and must still verify.
+  new ProtectClient({ host: 'h', apiKey: 'k' }, deps);
+  assert.equal(seen.at(-1).ca, undefined);
+  assert.equal(seen.at(-1).rejectUnauthorized, true);
+
+  // And the one case that turns verification off stays reachable, or the setting is a lie.
+  new ProtectClient({ host: 'h', apiKey: 'k', trustSelfSignedCert: true }, deps);
+  assert.equal(seen.at(-1).rejectUnauthorized, false);
+});
+
 // --- Test doubles -----------------------------------------------------------
 
 /** Build a fake undici Response with just the surface the client reads. */
@@ -137,6 +178,9 @@ function makeClient(fetchImpl, options = {}) {
       wsList.push(ws);
       return ws;
     },
+    // These tests exercise request/retry/socket behaviour, never a real handshake, so the connector
+    // is a stub. What the TLS policy hands it is asserted separately, above.
+    buildConnector: () => () => {},
   };
   const client = new ProtectClient({ host: '10.0.0.1', apiKey: 'k', timeoutMs: 100, ...options }, deps);
   return { client, calls, timers, wsList, watchdogs };
